@@ -38,7 +38,7 @@ export class Classifier {
       const source = this.sources.find((entry) => entry.family === type && entry.block.check(address, type));
       if (source) return { client: source.client, method: 'source_ip' };
     }
-    return { client: 'default', method: 'default' };
+    return { client: this.config.scheduler.default_client, method: 'fallback' };
   }
 
   dedupeKey(client, request, parsedBody) {

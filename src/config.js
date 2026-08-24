@@ -33,6 +33,7 @@ const DEFAULTS = {
     priority_aging: true,
     aging_interval: '10s',
     aging_bonus: 5,
+    default_client: 'default',
     unknown_model_policy: 'schedule',
   },
   circuit_breaker: {
@@ -134,6 +135,9 @@ function validate(config) {
   }
   if (!['schedule', 'reject'].includes(config.scheduler.unknown_model_policy)) {
     throw new Error('scheduler.unknown_model_policy must be schedule or reject');
+  }
+  if (!config.clients[config.scheduler.default_client]) {
+    throw new Error(`scheduler.default_client must name a configured client; received ${JSON.stringify(config.scheduler.default_client)}`);
   }
   if (config.model_management.serialize_with_inference !== true) {
     throw new Error('model_management.serialize_with_inference must be true; model-state mutations may not overlap inference');

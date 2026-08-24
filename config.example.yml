@@ -43,9 +43,8 @@ clients:
     request_ttl: 30m
     max_wait: 30s
     overflow_policy: reject
-    # Set this CIDR in secrets.env, or send X-Ollama-Client: odysseus.
-    source_ips:
-      - "${ODYSSEUS_SOURCE:-}"
+    # This is the fallback client, so Odysseus needs no stable Docker IP.
+    source_ips: []
     # Applies to every model Odysseus requests; no model registration is required.
     model_policy:
       group: odysseus
@@ -88,7 +87,9 @@ scheduler:
   priority_aging: true
   aging_interval: 10s
   aging_bonus: 5
-  # schedule = use the default client and conservative one-request batches.
+  # Only Frigate needs a stable source match. Every unmatched request is Odysseus.
+  default_client: odysseus
+  # schedule = accept arbitrary model names using the detected client's policy.
   unknown_model_policy: schedule
 
 circuit_breaker:

@@ -39,7 +39,7 @@ This release installation does not require Node.js, npm, Git, or a local image b
 ```sh
 cp config.example.yml config.yml
 cp secrets.example.env secrets.env
-# Edit secrets.env with the real backend and optional client source CIDRs.
+# Edit secrets.env with the real backend and optional Frigate source CIDR.
 docker compose up -d --build
 curl http://127.0.0.1:11435/readyz
 curl http://127.0.0.1:11435/status
@@ -52,7 +52,7 @@ X-Ollama-Client: odysseus
 X-Ollama-Client: frigate
 ```
 
-The explicit header wins. Without it, the proxy tries optional model mappings, then configured source IP/subnet mappings, then uses `default`. The example intentionally contains no model mappings: every model sent in a request works automatically. Put the application CIDRs in `secrets.env`, configure the header, or use dedicated per-client listeners as described in `server.dedicated_listeners`.
+The explicit header wins. Without it, the proxy tries optional model mappings, then configured source IP/subnet mappings, then `scheduler.default_client`. The supplied configuration sets that fallback to `odysseus`, so Odysseus needs no stable Docker IP. Configure only Frigate's stable host IP/CIDR; every address that does not match Frigate uses the Odysseus policy. The example intentionally contains no model mappings, so every model sent in a request works automatically.
 
 `clients` are workload-policy identities, not model registrations. They let the proxy give interactive Odysseus work higher priority while applying short TTL and overflow rules to Frigate. Each client's `model_policy` applies to every model that client requests. The `models` section is empty by default and exists only for rare exact-model overrides.
 
@@ -136,11 +136,10 @@ Docker Compose loads `secrets.env` into the container. The YAML loader expands `
 
 ```dotenv
 OLLAMA_URL=http://192.0.2.10:11434
-ODYSSEUS_SOURCE=192.0.2.40/32
 FRIGATE_SOURCE=192.0.2.50/32
 ```
 
-Only `OLLAMA_URL` is required. The source values can remain blank when the corresponding application sends `X-Ollama-Client` or uses a dedicated listener. `secrets.env` is ignored by Git and excluded from the Docker build context; `secrets.example.env` documents the expected variables. Although IP addresses are usually configuration rather than secrets, this arrangement also keeps environment-specific values out of the committed YAML.
+Only `OLLAMA_URL` is required. `FRIGATE_SOURCE` can remain blank until Frigate is connected, or when Frigate sends `X-Ollama-Client: frigate`. The supplied `scheduler.default_client: odysseus` setting means an unmatched source automatically receives the Odysseus policy; Odysseus's changing container IP never needs to be configured. `secrets.env` is ignored by Git and excluded from the Docker build context.
 
 The `192.0.2.0/24` addresses above are documentation placeholders. Replace them with addresses valid for your deployment.
 
@@ -227,8 +226,8 @@ After validating that all applications use the proxy, reduce `OLLAMA_MAX_QUEUE` 
 Recommended rollout:
 
 1. Deploy the proxy and confirm `/readyz` and `/status`.
-2. Point Odysseus at it; add `X-Ollama-Client` if supported and verify detection logs.
-3. Point Frigate at it; generate controlled events and verify client identification, image payload size, and queue TTL behavior.
+2. Point Odysseus at it and verify that logs report `detected_client: odysseus` with `identification_method: fallback`.
+3. Set `FRIGATE_SOURCE`, point Frigate at the proxy, generate controlled events, and verify that logs report `identification_method: source_ip`.
 4. Observe response latency, drops, and model switches for at least a day before tuning holds/batches.
 5. Only then reduce Ollama's internal queue.
 

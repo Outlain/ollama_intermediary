@@ -128,13 +128,35 @@ test('model and header client mappings use the documented precedence', () => {
   assert.deepEqual(classifier.identify(request, { model: 'od-model' }), { client: 'odysseus', method: 'model' });
 });
 
-test('unknown models are scheduled as default and can be rejected by policy', () => {
+test('unknown models use the configured fallback client and can be rejected by policy', () => {
   let config = testConfig();
   let classifier = new Classifier(config);
   const request = { headers: {}, socket: { remoteAddress: '127.0.0.1' } };
   assert.equal(classifier.identify(request, { model: 'unknown' }).client, 'default');
+  config = testConfig({ scheduler: { default_client: 'odysseus' } });
+  classifier = new Classifier(config);
+  assert.deepEqual(classifier.identify(request, { model: 'unknown' }), { client: 'odysseus', method: 'fallback' });
   config = testConfig({ scheduler: { unknown_model_policy: 'reject' } });
   assert.equal(config.scheduler.unknown_model_policy, 'reject');
+});
+
+test('Frigate source matching overrides an Odysseus fallback', () => {
+  const config = testConfig({
+    scheduler: { default_client: 'odysseus' },
+    clients: { frigate: { source_ips: ['192.0.2.50/32'] } },
+  });
+  const classifier = new Classifier(config);
+  const request = { headers: {}, socket: { remoteAddress: '192.0.2.50' } };
+  assert.deepEqual(classifier.identify(request, { model: 'any-frigate-model' }), { client: 'frigate', method: 'source_ip' });
+  request.socket.remoteAddress = '172.18.0.5';
+  assert.deepEqual(classifier.identify(request, { model: 'any-odysseus-model' }), { client: 'odysseus', method: 'fallback' });
+});
+
+test('fallback client must name a configured client', () => {
+  assert.throws(
+    () => testConfig({ scheduler: { default_client: 'missing' } }),
+    /scheduler\.default_client must name a configured client/,
+  );
 });
 
 test('backend reconciliation clears stale scheduler model state after restart', () => {

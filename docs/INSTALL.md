@@ -47,11 +47,10 @@ Edit `secrets.env`:
 
 ```dotenv
 OLLAMA_URL=http://YOUR_OLLAMA_HOST:11434
-ODYSSEUS_SOURCE=
 FRIGATE_SOURCE=
 ```
 
-Fill the source CIDRs only when source-IP client classification is needed. Otherwise configure `X-Ollama-Client` headers or dedicated listeners.
+The supplied configuration treats every unmatched request as Odysseus, so Odysseus needs no IP setting. Set `FRIGATE_SOURCE` to Frigate's stable IP or CIDR when Frigate is connected. It can remain blank until then.
 
 Validate and start:
 
