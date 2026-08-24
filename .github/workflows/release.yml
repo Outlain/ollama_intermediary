@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify source and tests
+        run: |
+          npm run check:public
+          npm test
+
+      - name: Compute image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        shell: bash
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Build and publish release image
+        shell: bash
+        run: |
+          docker buildx create --name release-builder --use
+          docker buildx build \
+            --platform linux/amd64 \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.version=${GITHUB_REF_NAME}" \
+            --tag "${{ steps.image.outputs.name }}:${GITHUB_REF_NAME}" \
+            --tag "${{ steps.image.outputs.name }}:latest" \
+            --provenance=mode=max \
+            --sbom=true \
+            --push \
+            .
+
+      - name: Package deployment bundle
+        id: bundle
+        shell: bash
+        run: |
+          bundle_name="ollama-scheduling-proxy-${GITHUB_REF_NAME}-linux-amd64"
+          sh scripts/package-release.sh "${{ steps.image.outputs.name }}" "$GITHUB_REF_NAME" dist
+          echo "archive=dist/${bundle_name}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${bundle_name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "${{ steps.bundle.outputs.archive }}" \
+            "${{ steps.bundle.outputs.checksum }}" \
+            --verify-tag \
+            --generate-notes \
+            --title "Ollama Scheduling Proxy ${GITHUB_REF_NAME}"

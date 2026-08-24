@@ -1,0 +1,26 @@
+services:
+  ollama-scheduler:
+    image: __IMAGE__
+    container_name: ollama-scheduler
+    restart: unless-stopped
+    init: true
+    ports:
+      - "11435:11434"
+    environment:
+      CONFIG_PATH: /app/config.yml
+      LOG_LEVEL: info
+    env_file:
+      - ./secrets.env
+    volumes:
+      - ./config.yml:/app/config.yml:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          memory: 256M

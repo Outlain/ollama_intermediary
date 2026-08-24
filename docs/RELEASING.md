@@ -1,0 +1,59 @@
+# Publishing and releasing
+
+## Before making the repository public
+
+1. Choose and add a `LICENSE`. MIT is simple and permissive; Apache-2.0 adds explicit patent terms. This is an owner decision and is not selected automatically.
+2. Run `npm run check:public` and `npm test`.
+3. Confirm `git check-ignore -v secrets.env config.yml` reports both local files as ignored.
+4. Review `git diff --cached` before the first commit.
+5. Publish privately first, inspect the GitHub file tree, then change the repository to public.
+
+## Repository initialization
+
+```sh
+git init -b main
+git add .
+git status --short
+git diff --cached
+git commit -m "Initial release"
+gh repo create ollama-scheduling-proxy --private --source=. --remote=origin --push
+```
+
+After the private review and license decision, change repository visibility through GitHub settings or the GitHub CLI.
+
+## Create a release
+
+The release workflow runs for semantic version tags matching `v*.*.*`:
+
+```sh
+npm run check:public
+npm test
+git tag -a v1.0.0 -m "Release v1.0.0"
+git push origin v1.0.0
+```
+
+The workflow:
+
+1. Repeats publication checks and tests.
+2. Builds a Linux `amd64` image with SBOM and provenance metadata.
+3. Publishes versioned and `latest` tags to `ghcr.io/OWNER/REPOSITORY` using the workflow's built-in `GITHUB_TOKEN`.
+4. Generates a deployment bundle whose Compose file pins the release image tag.
+5. Creates a GitHub Release with generated notes, the bundle, and its SHA-256 checksum.
+
+## First GHCR release
+
+GitHub Container Registry creates the first package as private by default. After the first workflow publishes it:
+
+1. Open the owner or organization **Packages** page.
+2. Open the `ollama-scheduling-proxy` package.
+3. Open **Package settings**.
+4. Confirm it is connected to the public repository.
+5. Change package visibility to **Public**.
+
+Once public, GHCR permits anonymous pulls and release-bundle users do not need a registry login. GitHub warns that a public package cannot be made private again, so verify the image and metadata before changing visibility.
+
+## Required repository settings
+
+- GitHub Actions must be enabled.
+- Workflow `GITHUB_TOKEN` must be allowed to write packages and releases. The workflow requests only `packages: write` and `contents: write`.
+- Protect `main` and require the CI workflow before merging once the initial repository is established.

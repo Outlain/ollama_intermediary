@@ -1,0 +1,103 @@
+server:
+  listen: 0.0.0.0:11434
+  body_limit_bytes: 67108864
+  shutdown_grace: 2m
+  # Enable only behind a trusted reverse proxy; this permits X-Forwarded-For classification.
+  trusted_proxy: false
+  status_path: /status
+  metrics_path: /metrics
+  # Useful when a client cannot set X-Ollama-Client and source-IP classification is unsuitable.
+  # Add matching port mappings to docker-compose.yml when these are enabled.
+  dedicated_listeners: []
+  # dedicated_listeners:
+  #   - listen: 0.0.0.0:11435
+  #     client: odysseus
+  #   - listen: 0.0.0.0:11436
+  #     client: frigate
+
+ollama:
+  # Supplied by secrets.env; never point this at the proxy itself.
+  url: "${OLLAMA_URL:?Set OLLAMA_URL in secrets.env}"
+  health_interval: 5s
+  health_timeout: 3s
+  # Hard runtime after dispatch; time spent in the proxy queue does not consume this budget.
+  request_timeout: 30m
+
+clients:
+  default:
+    priority: 50
+    queue_limit: 20
+    request_ttl: 10m
+    max_wait: 5m
+    overflow_policy: reject
+    source_ips: []
+    model_policy:
+      idle_hold: 0s
+      max_batch_requests: 1
+      max_batch_time: 60s
+      keep_alive: null
+
+  odysseus:
+    priority: 100
+    queue_limit: 10
+    request_ttl: 30m
+    max_wait: 30s
+    overflow_policy: reject
+    # Set this CIDR in secrets.env, or send X-Ollama-Client: odysseus.
+    source_ips:
+      - "${ODYSSEUS_SOURCE:-}"
+    # Applies to every model Odysseus requests; no model registration is required.
+    model_policy:
+      group: odysseus
+      idle_hold: 20s
+      max_batch_requests: 8
+      max_batch_time: 90s
+      keep_alive: 45s
+
+  frigate:
+    priority: 30
+    queue_limit: 20
+    request_ttl: 2m
+    max_wait: 2m
+    overflow_policy: drop_oldest
+    # Set this CIDR in secrets.env, or send X-Ollama-Client: frigate.
+    source_ips:
+      - "${FRIGATE_SOURCE:-}"
+    # Applies to every model Frigate requests; no model registration is required.
+    model_policy:
+      group: frigate
+      idle_hold: 3s
+      max_batch_requests: 10
+      max_batch_time: 60s
+      keep_alive: 15s
+    # Optional newest-wins coalescing. Leave disabled until the actual Frigate payload/header is known.
+    deduplication:
+      enabled: false
+      headers: []
+      json_fields: []
+      # Examples, only if present and stable in your Frigate requests:
+      # headers: [X-Frigate-Event-ID]
+      # json_fields: [event_id, camera]
+
+# Optional exact-model overrides can be added here, but normal models never need registration.
+models: {}
+
+scheduler:
+  # Version 1 intentionally enforces exactly one GPU inference at a time.
+  max_parallel_generations: 1
+  priority_aging: true
+  aging_interval: 10s
+  aging_bonus: 5
+  # schedule = use the default client and conservative one-request batches.
+  unknown_model_policy: schedule
+
+circuit_breaker:
+  failure_threshold: 3
+  failure_window: 60s
+  open_duration: 30s
+  # hold preserves queued work while probes recover; reject_new returns 503 at admission.
+  queue_behavior: hold
+
+model_management:
+  enabled: true
+  serialize_with_inference: true

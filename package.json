@@ -1,0 +1,20 @@
+{
+  "name": "ollama-scheduling-proxy",
+  "version": "1.0.0",
+  "description": "Model-aware scheduling reverse proxy for a single Ollama backend",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node --check src/index.js",
+    "check:public": "node scripts/publication-check.js",
+    "test": "node --test --test-reporter=spec test/*.test.js",
+    "test:coverage": "node --test --experimental-test-coverage test/*.test.js"
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
+  }
+}
