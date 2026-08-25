@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import http from 'node:http';
 import test from 'node:test';
 import { ProxyService } from '../src/proxy.js';
@@ -229,6 +230,139 @@ test('status and Prometheus endpoints expose scheduler state', async (t) => {
   assert.match(metrics, /proxy_gpu_recovery_required 0/);
   assert.match(metrics, /proxy_upstream_draining 0/);
   assert.equal(service.scheduler.active, null);
+});
+
+test('detailed observability status shows safe active and queued request metadata', async (t) => {
+  const { service, proxyUrl } = await setup(t, {
+    models: { 'od-model': { idle_hold: '0ms' }, 'f-model': { idle_hold: '0ms' } },
+  });
+  const active = requestJson(`${proxyUrl}/api/chat`, {
+    model: 'od-model', id: 'active-observed', messages: [{ role: 'user', content: 'private question' }], delay_ms: 180,
+  }, { 'x-request-id': 'private-request-id' });
+  await waitFor(() => service.scheduler.active?.model === 'od-model');
+  const queued = requestJson(`${proxyUrl}/api/generate`, {
+    model: 'f-model', id: 'queued-observed', prompt: 'another secret', stream: false,
+  });
+  await waitFor(() => service.scheduler.status().queues.frigate === 1);
+
+  const response = await fetch(`${proxyUrl}/_intermediary/v1/status`);
+  const status = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal(status.schema_version, 1);
+  assert.equal(status.service.state, 'ready');
+  assert.equal(status.scheduler.state, 'busy');
+  assert.equal(status.active_request.client, 'odysseus');
+  assert.equal(status.active_request.type, 'chat');
+  assert.equal(status.active_request.request.message_count, 1);
+  assert.equal(status.active_request.request.input_characters, 16);
+  assert.equal(status.queue.total, 1);
+  assert.equal(status.queue.by_client.frigate, 1);
+  assert.equal(status.queue.items[0].type, 'generate');
+  assert.match(status.active_request.id, /^r-\d+$/);
+  assert.doesNotMatch(JSON.stringify(status), /private question|another secret|private-request-id/);
+
+  const legacyStatus = await (await fetch(`${proxyUrl}/status`)).json();
+  assert.match(legacyStatus.active_request_id, /^r-\d+$/);
+  assert.doesNotMatch(JSON.stringify(legacyStatus), /private-request-id/);
+
+  await (await active).text();
+  await (await queued).text();
+});
+
+test('observability bearer authentication rejects missing, query, and incorrect tokens', async (t) => {
+  const { proxyUrl } = await setup(t, { observability: { auth_token: 'correct-token' } });
+  assert.equal((await fetch(`${proxyUrl}/_intermediary/v1/status`)).status, 401);
+  assert.equal((await fetch(`${proxyUrl}/_intermediary/v1/status?token=correct-token`)).status, 401);
+  assert.equal((await fetch(`${proxyUrl}/_intermediary/v1/status`, {
+    headers: { authorization: 'Bearer wrong-token' },
+  })).status, 401);
+  const authorized = await fetch(`${proxyUrl}/_intermediary/v1/status`, {
+    headers: { authorization: 'Bearer correct-token' },
+  });
+  assert.equal(authorized.status, 200);
+  assert.equal((await authorized.json()).schema_version, 1);
+});
+
+test('dashboard assets are same-origin, secured, and contain no external dependencies', async (t) => {
+  const { mock, proxyUrl } = await setup(t);
+  const dashboard = await fetch(`${proxyUrl}/debug`);
+  const html = await dashboard.text();
+  assert.equal(dashboard.status, 200);
+  assert.match(dashboard.headers.get('content-security-policy'), /default-src 'self'/);
+  assert.equal(dashboard.headers.get('x-frame-options'), 'DENY');
+  assert.match(html, /Ollama Intermediary/i);
+  assert.doesNotMatch(html, /https?:\/\//);
+
+  const script = await fetch(`${proxyUrl}/_intermediary/ui/dashboard.js`);
+  assert.equal(script.status, 200);
+  assert.match(script.headers.get('content-type'), /text\/javascript/);
+  assert.doesNotMatch(await script.text(), /https?:\/\//);
+
+  const before = mock.events.length;
+  const reserved = await fetch(`${proxyUrl}/_intermediary/v1/not-real`, { method: 'POST' });
+  assert.equal(reserved.status, 405);
+  assert.equal(mock.events.length, before);
+});
+
+test('history contains bounded lifecycle metadata and Ollama usage without response text', async (t) => {
+  const { service, proxyUrl } = await setup(t, { observability: { history_limit: 8, recent_events: 4 } });
+  const response = await requestJson(`${proxyUrl}/api/generate`, {
+    model: 'od-model', id: 'history-request', prompt: 'never retain this prompt', stream: true,
+  });
+  await response.text();
+  await waitFor(() => service.scheduler.active === null);
+  const historyResponse = await fetch(`${proxyUrl}/_intermediary/v1/history?limit=8`);
+  const history = await historyResponse.json();
+  const completed = history.events.find((event) => event.type === 'request_completed');
+  assert.equal(historyResponse.status, 200);
+  assert.equal(historyResponse.headers.get('cache-control'), 'no-store');
+  assert.ok(history.events.length <= 8);
+  assert.equal(completed.response.prompt_tokens, 12);
+  assert.equal(completed.response.output_tokens, 4);
+  assert.equal(completed.response.output_tokens_per_second, 4);
+  assert.doesNotMatch(JSON.stringify(history), /never retain this prompt|"response":"first"|"response":"second"/);
+});
+
+test('authorized live event stream sends a snapshot and releases its subscriber on close', async (t) => {
+  const { service, proxyUrl } = await setup(t, { observability: { auth_token: 'stream-token' } });
+  const controller = new AbortController();
+  const stream = await fetch(`${proxyUrl}/_intermediary/v1/events`, {
+    headers: { authorization: 'Bearer stream-token' },
+    signal: controller.signal,
+  });
+  assert.equal(stream.status, 200);
+  assert.match(stream.headers.get('content-type'), /text\/event-stream/);
+  const reader = stream.body.getReader();
+  const first = await reader.read();
+  const text = Buffer.from(first.value).toString('utf8');
+  assert.match(text, /event: snapshot/);
+  assert.match(text, /"schema_version":1/);
+  controller.abort();
+  await reader.cancel().catch(() => {});
+  await waitFor(() => service.observability.listeners.size === 0);
+});
+
+test('a backpressured live event stream is destroyed and released from connection limits', () => {
+  const service = new ProxyService(testConfig(), { logger: new SilentLogger() });
+  const request = new EventEmitter();
+  const response = new EventEmitter();
+  response.destroyed = false;
+  response.writableEnded = false;
+  response.writeHead = () => {};
+  response.flushHeaders = () => {};
+  response.write = () => false;
+  response.end = () => { response.writableEnded = true; };
+  response.destroy = () => {
+    response.destroyed = true;
+    response.emit('close');
+  };
+
+  service.handleEventStream(request, response, 'test-request');
+
+  assert.equal(response.destroyed, true);
+  assert.equal(service.eventStreams.size, 0);
+  assert.equal(service.observability.listeners.size, 0);
 });
 
 test('configured keep_alive is normalized before Ollama receives a request', async (t) => {

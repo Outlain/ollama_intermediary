@@ -56,6 +56,8 @@ export class Metrics {
     for (const [client, depth] of Object.entries(dynamic.queueDepth ?? {})) {
       lines.push(`proxy_queue_depth${formatLabels({ client })} ${depth}`);
     }
+    lines.push('# HELP proxy_queue_depth_total Total number of inference requests waiting.', '# TYPE proxy_queue_depth_total gauge');
+    lines.push(`proxy_queue_depth_total ${Object.values(dynamic.queueDepth ?? {}).reduce((total, value) => total + value, 0)}`);
     lines.push('# HELP proxy_oldest_queue_wait_seconds Age of the oldest queued request.', '# TYPE proxy_oldest_queue_wait_seconds gauge');
     for (const [client, age] of Object.entries(dynamic.oldestWait ?? {})) {
       lines.push(`proxy_oldest_queue_wait_seconds${formatLabels({ client })} ${age}`);
@@ -68,6 +70,25 @@ export class Metrics {
     lines.push(`proxy_upstream_draining ${dynamic.upstreamDraining ? 1 : 0}`);
     lines.push('# HELP proxy_current_model Currently selected model.', '# TYPE proxy_current_model gauge');
     if (dynamic.currentModel) lines.push(`proxy_current_model${formatLabels({ model: dynamic.currentModel })} 1`);
+    lines.push('# HELP proxy_active_request Whether an inference request is currently active.', '# TYPE proxy_active_request gauge');
+    if (dynamic.activeRequest) {
+      lines.push(`proxy_active_request${formatLabels({
+        client: dynamic.activeRequest.client,
+        endpoint: dynamic.activeRequest.endpoint,
+        model: dynamic.activeRequest.model,
+        streaming: dynamic.activeRequest.streaming ? 'true' : 'false',
+      })} 1`);
+    } else {
+      lines.push('proxy_active_request 0');
+    }
+    lines.push('# HELP proxy_active_request_duration_seconds Runtime of the active inference request.', '# TYPE proxy_active_request_duration_seconds gauge');
+    lines.push(`proxy_active_request_duration_seconds ${dynamic.activeRequest?.running_seconds ?? 0}`);
+    lines.push('# HELP proxy_ollama_loaded_model_vram_bytes VRAM reported by Ollama for each loaded model.', '# TYPE proxy_ollama_loaded_model_vram_bytes gauge');
+    for (const model of dynamic.loadedModels ?? []) {
+      if (Number.isFinite(model.size_vram)) {
+        lines.push(`proxy_ollama_loaded_model_vram_bytes${formatLabels({ model: model.name })} ${model.size_vram}`);
+      }
+    }
 
     const typeSeen = new Set();
     for (const entry of this.counters.values()) {

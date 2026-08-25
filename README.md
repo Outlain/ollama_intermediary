@@ -4,7 +4,7 @@ A model-aware, streaming reverse proxy for multiple applications sharing one Oll
 
 The supplied defaults target these workloads without tying them to particular model names:
 
-- Odysseus: interactive priority, protected queue, and a 20-second model lease.
+- Odysseus: interactive priority, protected queue, and a one-minute model lease.
 - Frigate: bounded newest-biased queue, short lease, and a two-minute TTL.
 - Ollama: a configurable backend URL, `OLLAMA_NUM_PARALLEL=1`, and `OLLAMA_MAX_LOADED_MODELS=1`.
 
@@ -44,6 +44,8 @@ docker compose up -d --build
 curl http://127.0.0.1:11435/readyz
 curl http://127.0.0.1:11435/status
 ```
+
+Open `http://<docker-host>:11435/debug` for the live read-only dashboard. It uses the same listener and does not require another port.
 
 Then change each application's Ollama base URL to `http://<docker-host>:11435`. If possible, configure one of these headers:
 
@@ -94,10 +96,10 @@ Client-wide policy example:
 clients:
   odysseus:
     model_policy:
-      idle_hold: 20s
+      idle_hold: 1m
       max_batch_requests: 8
       max_batch_time: 90s
-      keep_alive: 45s
+      keep_alive: 60s
 ```
 
 Downloading or selecting a new Odysseus model requires no proxy configuration change. An optional exact override is possible when one unusual model needs different limits:
@@ -184,6 +186,18 @@ The recovery latch is intentionally not cleared by an HTTP health probe: `/api/t
 
 `GET /status` returns backend/circuit/recovery state, current model/group, active request, whether an abandoned request is being drained, per-client and per-model queue depths/oldest ages, last activity, lease remaining, switch count, and shutdown admission state.
 
+The responsive dashboard at `GET /debug` displays the current source client, request type/model/age, privacy-safe request size counts, queue contents, Ollama-reported VRAM/context, recovery state, and the most recent in-memory lifecycle events. Prompts, responses, images, headers, source addresses, and deduplication values are never retained in observability history.
+
+The versioned read-only API is:
+
+- `GET /_intermediary/v1/status` for a complete snapshot
+- `GET /_intermediary/v1/history?limit=50` for bounded in-memory history
+- `GET /_intermediary/v1/events` for live Server-Sent Events
+
+Set `OBSERVABILITY_TOKEN` in `secrets.env` to require a bearer token for these three data endpoints. The static dashboard will request it and retain it only in the browser tab's session storage. A blank token is convenient on a trusted LAN but provides no API authentication. The dashboard and API cannot cancel work or perform model/GPU management.
+
+Home Assistant can turn the shared snapshot into native sensors with one five-second REST poll. See [Home Assistant setup](docs/HOME_ASSISTANT.md).
+
 `GET /metrics` emits Prometheus text including:
 
 - `proxy_queue_depth{client=...}` and `proxy_oldest_queue_wait_seconds`
@@ -191,6 +205,9 @@ The recovery latch is intentionally not cleared by an HTTP health probe: `/api/t
 - `proxy_requests_total`, `proxy_requests_failed_total`, `proxy_requests_dropped_total`
 - `proxy_model_switches_total`
 - `proxy_current_model{model=...}` and `proxy_backend_healthy`
+- `proxy_active_request`, `proxy_active_request_duration_seconds`, and `proxy_queue_depth_total`
+- `proxy_ollama_loaded_model_vram_bytes{model=...}`
+- request/response byte and input/output token histograms when usage is available
 - `proxy_model_load_duration_seconds` (dispatch-to-response-header estimate when a new model is expected)
 - `proxy_active_disconnects_total` and `proxy_upstream_drain_duration_seconds`
 - `proxy_model_unload_duration_seconds`

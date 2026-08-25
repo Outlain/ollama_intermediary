@@ -48,9 +48,12 @@ Edit `secrets.env`:
 ```dotenv
 OLLAMA_URL=http://YOUR_OLLAMA_HOST:11434
 FRIGATE_SOURCE=
+OBSERVABILITY_TOKEN=
 ```
 
 The supplied configuration treats every unmatched request as Odysseus, so Odysseus needs no IP setting. Set `FRIGATE_SOURCE` to Frigate's stable IP or CIDR when Frigate is connected. It can remain blank until then.
+
+`OBSERVABILITY_TOKEN` protects the detailed dashboard data and Home Assistant endpoint. Generate a token with `openssl rand -hex 32`, or leave it blank only when port `11435` is restricted to a trusted LAN/VPN.
 
 Validate and start:
 
@@ -62,6 +65,8 @@ docker compose ps
 curl http://127.0.0.1:11435/readyz
 curl http://127.0.0.1:11435/status
 ```
+
+Open `http://YOUR_UBUNTU_IP:11435/debug` to view the live dashboard. If a token is configured, enter the raw token when prompted. For Home Assistant, follow [HOME_ASSISTANT.md](HOME_ASSISTANT.md).
 
 The image uses `restart: unless-stopped`, so it returns after Docker or host restarts.
 

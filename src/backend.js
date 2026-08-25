@@ -15,6 +15,26 @@ function gpuFaultMessage(status, body, error = null) {
   return summary || `Ollama returned HTTP ${status} with a GPU out-of-memory error`;
 }
 
+function safeText(value, limit = 256) {
+  return typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f]/g, '�').slice(0, limit) : null;
+}
+
+function modelSummary(model) {
+  const details = model?.details && typeof model.details === 'object' ? model.details : {};
+  return {
+    name: safeText(model?.name ?? model?.model),
+    size_bytes: Number.isFinite(model?.size) ? model.size : null,
+    size_vram: Number.isFinite(model?.size_vram) ? model.size_vram : null,
+    context_length: Number.isFinite(model?.context_length) ? model.context_length : null,
+    expires_at: safeText(model?.expires_at, 128),
+    details: {
+      family: safeText(details.family, 128),
+      parameter_size: safeText(details.parameter_size, 128),
+      quantization_level: safeText(details.quantization_level, 128),
+    },
+  };
+}
+
 export class BackendState {
   constructor(config, { logger, metrics, onModel, onChange = () => {}, clock = () => Date.now() }) {
     this.config = config;
@@ -35,6 +55,7 @@ export class BackendState {
     this.recoveryRequired = false;
     this.recoveryReason = null;
     this.recoverySince = null;
+    this.loadedModels = [];
   }
 
   canDispatch(now = this.clock()) {
@@ -118,6 +139,7 @@ export class BackendState {
       if (!ps.ok) throw new Error(`health /api/ps returned HTTP ${ps.status}`);
       const body = await ps.json();
       const models = Array.isArray(body.models) ? body.models : [];
+      this.loadedModels = models.slice(0, 32).map(modelSummary).filter((item) => item.name);
       const model = models[0]?.name ?? models[0]?.model ?? null;
       const wasHealthy = this.canDispatch(now);
       this.reachable = true;
@@ -133,6 +155,7 @@ export class BackendState {
     } catch (error) {
       const wasReachable = this.reachable;
       this.reachable = false;
+      this.loadedModels = [];
       this.lastError = error.message;
       if (wasReachable || this.lastSuccessAt === null) this.logger.error('Ollama health probe failed', { error: error.message });
       this.recordFailure(error, 'health_probe');
@@ -165,6 +188,7 @@ export class BackendState {
       last_probe_at: this.lastProbeAt ? new Date(this.lastProbeAt).toISOString() : null,
       last_success_at: this.lastSuccessAt ? new Date(this.lastSuccessAt).toISOString() : null,
       last_error: this.lastError,
+      loaded_models: this.loadedModels,
     };
   }
 }

@@ -102,7 +102,16 @@ export class MockOllama {
     }
     if (url.pathname === '/api/ps') {
       response.setHeader('content-type', 'application/json');
-      response.end(JSON.stringify({ models: this.loadedModel ? [{ name: this.loadedModel }] : [] }));
+      response.end(JSON.stringify({
+        models: this.loadedModel ? [{
+          name: this.loadedModel,
+          size: 8_000_000_000,
+          size_vram: 7_000_000_000,
+          context_length: 65_536,
+          expires_at: '2030-01-01T00:00:00Z',
+          details: { family: 'mock', parameter_size: '8B', quantization_level: 'Q4_K_M' },
+        }] : [],
+      }));
       return;
     }
     if (url.pathname === '/api/show') {
@@ -142,7 +151,17 @@ export class MockOllama {
       if (body.first_chunk_delay_ms) await new Promise((resolve) => setTimeout(resolve, body.first_chunk_delay_ms));
       response.write(`${JSON.stringify({ response: 'first', done: false })}\n`);
       if (body.delay_ms) await new Promise((resolve) => setTimeout(resolve, body.delay_ms));
-      response.end(`${JSON.stringify({ response: 'second', done: true })}\n`);
+      response.end(`${JSON.stringify({
+        response: 'second',
+        done: true,
+        done_reason: 'stop',
+        total_duration: 2_000_000_000,
+        load_duration: 500_000_000,
+        prompt_eval_count: 12,
+        prompt_eval_duration: 250_000_000,
+        eval_count: 4,
+        eval_duration: 1_000_000_000,
+      })}\n`);
       return;
     }
     const raw = await this.body(request);

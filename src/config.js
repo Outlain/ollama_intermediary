@@ -53,6 +53,15 @@ const DEFAULTS = {
     recovery_on_oom: true,
     error_body_limit_bytes: 65_536,
   },
+  observability: {
+    enabled: true,
+    ui_enabled: true,
+    auth_token: '',
+    history_limit: 100,
+    recent_events: 20,
+    max_event_clients: 10,
+    queue_items_limit: 50,
+  },
   clients: {
     default: {
       priority: 50,
@@ -155,6 +164,21 @@ function validate(config) {
   }
   if (!Number.isInteger(config.gpu_safety.error_body_limit_bytes) || config.gpu_safety.error_body_limit_bytes < 1) {
     throw new Error('gpu_safety.error_body_limit_bytes must be a positive integer');
+  }
+  for (const field of ['enabled', 'ui_enabled']) {
+    if (typeof config.observability[field] !== 'boolean') throw new Error(`observability.${field} must be true or false`);
+  }
+  if (typeof config.observability.auth_token !== 'string') throw new Error('observability.auth_token must be a string');
+  for (const field of ['history_limit', 'recent_events', 'max_event_clients', 'queue_items_limit']) {
+    if (!Number.isInteger(config.observability[field]) || config.observability[field] < 1) {
+      throw new Error(`observability.${field} must be a positive integer`);
+    }
+  }
+  if (config.observability.history_limit > 1_000) throw new Error('observability.history_limit cannot exceed 1000');
+  if (config.observability.max_event_clients > 100) throw new Error('observability.max_event_clients cannot exceed 100');
+  if (config.observability.queue_items_limit > 500) throw new Error('observability.queue_items_limit cannot exceed 500');
+  if (config.observability.recent_events > config.observability.history_limit) {
+    throw new Error('observability.recent_events cannot exceed observability.history_limit');
   }
   new URL(config.ollama.url);
 }

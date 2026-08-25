@@ -67,7 +67,9 @@ function captureChunk(chunks, state, chunk, limit) {
   state.length += captured.length;
 }
 
-export function streamBody(upstream, downstream, { flush = false, drainOnClose = false, captureLimit = 0 } = {}) {
+export function streamBody(upstream, downstream, {
+  flush = false, drainOnClose = false, captureLimit = 0, onChunk = null,
+} = {}) {
   if (typeof upstream.body?.getReader !== 'function') {
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -89,6 +91,7 @@ export function streamBody(upstream, downstream, { flush = false, drainOnClose =
       };
       const onData = (chunk) => {
         captureChunk(captured, captureState, chunk, captureLimit);
+        try { onChunk?.(chunk); } catch { /* Observability must never interrupt proxying. */ }
         if (!downstreamOpen) return;
         if (!downstream.write(chunk)) {
           pausedForBackpressure = true;
@@ -162,6 +165,7 @@ export function streamBody(upstream, downstream, { flush = false, drainOnClose =
           const { done, value } = await reader.read();
           if (done) break;
           captureChunk(captured, captureState, value, captureLimit);
+          try { onChunk?.(value); } catch { /* Observability must never interrupt proxying. */ }
           if (downstreamOpen && !downstream.write(Buffer.from(value))) {
             await new Promise((res, rej) => {
               downstream.once('drain', res);

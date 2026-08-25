@@ -1,3 +1,5 @@
+import { safeDisplay } from './observability.js';
+
 function deferred() {
   let resolve;
   const promise = new Promise((res) => { resolve = res; });
@@ -19,10 +21,11 @@ export function createJob(fields) {
 }
 
 export class Scheduler {
-  constructor(config, { logger, metrics, clock = () => Date.now() }) {
+  constructor(config, { logger, metrics, observability = null, clock = () => Date.now() }) {
     this.config = config;
     this.logger = logger;
     this.metrics = metrics;
+    this.observability = observability;
     this.clock = clock;
     this.jobs = [];
     this.active = null;
@@ -73,8 +76,19 @@ export class Scheduler {
     this.metrics.increment('proxy_requests_total', { client: job.client, endpoint: job.pathname });
     this.logger.info('request queued', {
       request_id: job.id, detected_client: job.client, identification_method: job.identificationMethod,
-      requested_model: job.model, queue_entry_time: new Date(job.enqueuedAt).toISOString(), streaming: job.streaming,
+      requested_model: job.model, endpoint: job.pathname, request_type: job.requestType,
+      request_bytes: job.requestSummary?.body_bytes,
+      queue_entry_time: new Date(job.enqueuedAt).toISOString(), streaming: job.streaming,
     });
+    this.metrics.observe('proxy_request_body_bytes', job.requestSummary?.body_bytes ?? job.body?.length ?? 0, {
+      client: job.client, endpoint: job.pathname,
+    });
+    this.metrics.observe('proxy_request_input_characters', job.requestSummary?.input_characters ?? 0, {
+      client: job.client, endpoint: job.pathname,
+    });
+    this.observability?.record('request_queued', this.eventFields(job, {
+      queued_at: new Date(job.enqueuedAt).toISOString(),
+    }));
     this.wake();
     return { accepted: true };
   }
@@ -90,6 +104,9 @@ export class Scheduler {
       request_id: job.id, detected_client: job.client, requested_model: job.model, reason: code,
       queue_wait: (this.clock() - job.enqueuedAt) / 1000,
     });
+    this.observability?.record('request_dropped', this.eventFields(job, {
+      status, reason: code, queue_wait_seconds: (this.clock() - job.enqueuedAt) / 1000,
+    }));
     return true;
   }
 
@@ -104,6 +121,9 @@ export class Scheduler {
       request_id: job.id, detected_client: job.client, requested_model: job.model,
       queue_wait: (this.clock() - job.enqueuedAt) / 1000,
     });
+    this.observability?.record('request_cancelled', this.eventFields(job, {
+      status: 499, reason: 'client_disconnect', queue_wait_seconds: (this.clock() - job.enqueuedAt) / 1000,
+    }));
     this.wake();
     return true;
   }
@@ -198,6 +218,9 @@ export class Scheduler {
       this.logger.info('model switch selected', {
         request_id: chosen.id, from_model: previousModel, to_model: chosen.model, reason,
       });
+      this.observability?.record('model_switch_selected', this.eventFields(chosen, {
+        from_model: safeDisplay(previousModel), to_model: safeDisplay(chosen.model), reason,
+      }));
     }
     this.currentModel = chosen.model;
     this.currentModelGroup = this.modelPolicy(chosen.model, chosen.client).group;
@@ -205,6 +228,7 @@ export class Scheduler {
     this.batchCount += 1;
     this.jobs.splice(this.jobs.indexOf(chosen), 1);
     chosen.state = 'active';
+    chosen.phase = 'selected';
     chosen.dispatchedAt = now;
     chosen.switching = switching;
     chosen.previousModel = switching ? previousModel : null;
@@ -218,6 +242,11 @@ export class Scheduler {
       queue_wait: queueWait, dispatch_time: new Date(now).toISOString(), streaming: chosen.streaming,
       model_switch_decision: reason,
     });
+    this.observability?.record('request_dispatched', this.eventFields(chosen, {
+      queue_wait_seconds: queueWait,
+      dispatched_at: new Date(now).toISOString(),
+      reason,
+    }));
     return { job: chosen, delayMs: 0, reason };
   }
 
@@ -235,6 +264,10 @@ export class Scheduler {
     const normalized = model || null;
     if (normalized === this.currentModel) return;
     this.logger.info('scheduler model state reconciled', { previous_model: this.currentModel, backend_model: normalized });
+    this.observability?.record('model_reconciled', {
+      previous_model: safeDisplay(this.currentModel),
+      current_model: safeDisplay(normalized),
+    });
     this.currentModel = normalized;
     this.currentModelGroup = normalized ? this.modelPolicy(normalized).group : null;
     this.batchModel = normalized;
@@ -265,7 +298,7 @@ export class Scheduler {
       current_model: this.currentModel,
       current_model_group: this.currentModelGroup,
       active_client: this.active?.client ?? null,
-      active_request_id: this.active?.id ?? null,
+      active_request_id: this.active ? `r-${this.active.sequence}` : null,
       active_request_duration: this.active ? (now - this.active.dispatchedAt) / 1000 : 0,
       active_request_abandoned: this.active?.downstreamDisconnected ?? false,
       upstream_draining: this.active?.downstreamDisconnected ?? false,
@@ -277,6 +310,78 @@ export class Scheduler {
       model_lease_remaining: Math.max(0, this.leaseUntil - now) / 1000,
       model_switches: this.switches,
       accepting: this.accepting,
+    };
+  }
+
+  eventFields(job, extra = {}) {
+    return {
+      request_id: `r-${job.sequence}`,
+      client: job.client,
+      model: safeDisplay(job.model),
+      endpoint: job.pathname,
+      request_type: job.requestType,
+      streaming: job.streaming,
+      request: job.requestSummary,
+      ...extra,
+    };
+  }
+
+  requestDetails(job, now = this.clock()) {
+    const active = job.state === 'active';
+    return {
+      id: `r-${job.sequence}`,
+      client: job.client,
+      classification_method: job.identificationMethod,
+      model: safeDisplay(job.model),
+      type: job.requestType,
+      endpoint: job.pathname,
+      streaming: job.streaming,
+      state: active && job.downstreamDisconnected ? 'draining' : active ? (job.phase ?? 'active') : job.state,
+      queued_at: new Date(job.enqueuedAt).toISOString(),
+      dispatched_at: job.dispatchedAt ? new Date(job.dispatchedAt).toISOString() : null,
+      queue_wait_seconds: job.dispatchedAt ? (job.dispatchedAt - job.enqueuedAt) / 1000 : null,
+      running_seconds: active ? Math.max(0, now - job.dispatchedAt) / 1000 : null,
+      waiting_seconds: active ? null : Math.max(0, now - job.enqueuedAt) / 1000,
+      ttl_remaining_seconds: active ? null : Math.max(0, job.deadline - now) / 1000,
+      max_wait_remaining_seconds: active ? null : Math.max(0, job.maxWaitAt - now) / 1000,
+      effective_priority: active ? null : this.effectivePriority(job, now),
+      schedule_reason: job.scheduleReason ?? null,
+      model_switch_expected: Boolean(job.switching),
+      downstream_connected: !job.downstreamDisconnected,
+      request: job.requestSummary,
+    };
+  }
+
+  details(now = this.clock()) {
+    const status = this.status(now);
+    const queued = this.jobs.filter((job) => job.state === 'queued');
+    const byModel = {};
+    const oldestByModel = {};
+    for (const [model, depth] of Object.entries(status.model_queues)) {
+      const safeModel = safeDisplay(model);
+      byModel[safeModel] = (byModel[safeModel] ?? 0) + depth;
+      oldestByModel[safeModel] = Math.max(oldestByModel[safeModel] ?? 0, status.oldest_model_wait_seconds[model] ?? 0);
+    }
+    return {
+      current_model: safeDisplay(status.current_model),
+      current_model_group: safeDisplay(status.current_model_group),
+      model_lease_remaining: status.model_lease_remaining,
+      model_switches: status.model_switches,
+      upstream_draining: status.upstream_draining,
+      last_activity: status.last_activity,
+      accepting: status.accepting,
+      active_request: this.active ? this.requestDetails(this.active, now) : null,
+      queue: {
+        total: queued.length,
+        by_client: status.queues,
+        by_model: byModel,
+        oldest_wait_seconds: Math.max(0, ...Object.values(status.oldest_wait_seconds)),
+        oldest_wait_by_client: status.oldest_wait_seconds,
+        oldest_wait_by_model: oldestByModel,
+        items: queued.slice(0, this.config.observability.queue_items_limit)
+          .map((job) => this.requestDetails(job, now)),
+        items_truncated: queued.length > this.config.observability.queue_items_limit,
+      },
     };
   }
 

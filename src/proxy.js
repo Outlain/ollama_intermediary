@@ -5,8 +5,13 @@ import { Classifier, classifyEndpoint, isStreaming } from './classifier.js';
 import { copyRequestHeaders, copyResponseHeaders, readBody, sendJson, streamBody } from './http-utils.js';
 import { Logger, requestId } from './logger.js';
 import { Metrics } from './metrics.js';
+import {
+  authorized, minimalRequestSummary, Observability, requestType, ResponseStatsCollector, safeDisplay,
+  summarizeRequest,
+} from './observability.js';
 import { createJob, Scheduler } from './scheduler.js';
 import { parseListen } from './config.js';
+import { DASHBOARD_CSS, DASHBOARD_HTML, DASHBOARD_JS } from './dashboard.js';
 
 function contentHeaders(headers, body) {
   const result = { ...headers };
@@ -46,25 +51,38 @@ async function waitWithTimeout(promise, timeoutMs) {
 export class ProxyService {
   constructor(config, options = {}) {
     this.config = config;
+    this.clock = options.clock ?? (() => Date.now());
     this.logger = options.logger ?? new Logger();
     this.metrics = options.metrics ?? new Metrics();
+    this.observability = options.observability ?? new Observability(config, { clock: this.clock });
     this.classifier = new Classifier(config);
-    this.scheduler = new Scheduler(config, { logger: this.logger, metrics: this.metrics, clock: options.clock });
+    this.scheduler = new Scheduler(config, {
+      logger: this.logger,
+      metrics: this.metrics,
+      observability: this.observability,
+      clock: this.clock,
+    });
     this.backendClient = new BackendClient(config);
     this.gate = new OperationGate(() => this.scheduler.wake());
     this.backend = new BackendState(config, {
       logger: this.logger,
       metrics: this.metrics,
       onModel: (model) => this.scheduler.reconcile(model),
-      onChange: () => this.scheduler.wake(),
-      clock: options.clock,
+      onChange: () => {
+        this.scheduler.wake();
+        this.recordBackendTransition();
+      },
+      clock: this.clock,
     });
+    this.backendSignature = null;
+    this.backendObservation = null;
     this.servers = [];
     this.sequence = 0;
     this.workerController = new AbortController();
     this.running = false;
     this.workerPromise = null;
     this.expiryTimer = null;
+    this.eventStreams = new Set();
   }
 
   async start({ listen = true } = {}) {
@@ -110,6 +128,20 @@ export class ProxyService {
     const id = requestId(request.headers);
     response.setHeader('x-request-id', id);
     const url = new URL(request.url, 'http://proxy.local');
+    if ((url.pathname === '/debug' || url.pathname === '/debug/') && request.method !== 'GET') {
+      response.setHeader('allow', 'GET');
+      return sendJson(response, 405, { error: 'debug dashboard only supports GET', code: 'method_not_allowed' }, id);
+    }
+    if (request.method === 'GET' && (url.pathname === '/debug' || url.pathname === '/debug/')) {
+      return this.handleDashboard(response, id);
+    }
+    if (request.method === 'GET' && url.pathname === '/_intermediary/ui/dashboard.css') {
+      return this.handleDashboardAsset(response, id, 'text/css; charset=utf-8', DASHBOARD_CSS);
+    }
+    if (request.method === 'GET' && url.pathname === '/_intermediary/ui/dashboard.js') {
+      return this.handleDashboardAsset(response, id, 'text/javascript; charset=utf-8', DASHBOARD_JS);
+    }
+    if (url.pathname.startsWith('/_intermediary/')) return this.handleObservability(request, response, url, id);
     if (request.method === 'GET' && url.pathname === this.config.server.status_path) return this.handleStatus(response, id);
     if (request.method === 'GET' && url.pathname === this.config.server.metrics_path) return this.handleMetrics(response);
     if (request.method === 'GET' && url.pathname === '/healthz') return sendJson(response, 200, { status: 'ok' }, id);
@@ -129,8 +161,224 @@ export class ProxyService {
     sendJson(response, 200, { backend: this.backend.status(), ...scheduler }, id);
   }
 
+  recordBackendTransition() {
+    if (!this.backend) return;
+    const status = this.backend.status(this.clock());
+    const signature = JSON.stringify({
+      state: status.state,
+      reachable: status.reachable,
+      recovery_required: status.recovery_required,
+      circuit_open: status.circuit_open,
+      loaded_models: status.loaded_models,
+    });
+    if (signature === this.backendSignature) return;
+    const previous = this.backendObservation;
+    this.backendSignature = signature;
+    this.backendObservation = {
+      state: status.state,
+      reachable: status.reachable,
+      recovery_required: status.recovery_required,
+      circuit_open: status.circuit_open,
+    };
+    if (status.recovery_required && !previous?.recovery_required) {
+      this.observability.record('gpu_recovery_required', {
+        state: status.state,
+        reason: 'Ollama reported a GPU fault; host recovery is required.',
+      });
+    }
+    if (status.circuit_open && !previous?.circuit_open) {
+      this.observability.record('circuit_opened', { state: status.state });
+    } else if (!status.circuit_open && previous?.circuit_open) {
+      this.observability.record('circuit_closed', { state: status.state });
+    }
+    this.observability.record('backend_state_changed', {
+      state: status.state,
+      reachable: status.reachable,
+      recovery_required: status.recovery_required,
+      circuit_open: status.circuit_open,
+      loaded_models: status.loaded_models,
+    });
+  }
+
+  observabilitySnapshot(now = this.clock()) {
+    const backendRaw = this.backend.status(now);
+    const backend = {
+      ...backendRaw,
+      recovery_reason: backendRaw.recovery_required
+        ? 'Ollama reported a GPU fault; host recovery is required.'
+        : null,
+      last_error: backendRaw.last_error ? 'Ollama backend error; inspect intermediary logs for details.' : null,
+    };
+    const scheduler = this.scheduler.details(now);
+    const ready = scheduler.accepting && this.backend.canDispatch(now);
+    let schedulerState = 'idle';
+    if (!scheduler.accepting) schedulerState = 'shutting_down';
+    else if (backend.recovery_required) schedulerState = 'recovery_required';
+    else if (!backend.reachable || backend.circuit_open) schedulerState = 'unavailable';
+    else if (scheduler.upstream_draining) schedulerState = 'draining';
+    else if (scheduler.active_request) schedulerState = 'busy';
+    else if (scheduler.queue.total) schedulerState = 'queued';
+    return {
+      schema_version: 1,
+      generated_at: new Date(now).toISOString(),
+      service: {
+        state: ready ? 'ready' : 'not_ready',
+        ready,
+        instance_id: this.observability.instanceId,
+        uptime_seconds: this.observability.uptimeSeconds(now),
+        accepting: scheduler.accepting,
+        event_clients: this.observability.listeners.size,
+      },
+      backend,
+      scheduler: {
+        state: schedulerState,
+        current_model: scheduler.current_model,
+        current_model_group: scheduler.current_model_group,
+        model_lease_remaining: scheduler.model_lease_remaining,
+        model_switches: scheduler.model_switches,
+        upstream_draining: scheduler.upstream_draining,
+        last_activity: scheduler.last_activity,
+        management_pending: this.gate.managementPending,
+        management_active: this.gate.managementActive,
+      },
+      active_request: scheduler.active_request,
+      queue: scheduler.queue,
+      recent_events: this.observability.recent(),
+    };
+  }
+
+  handleDashboard(response, id) {
+    if (!this.config.observability.enabled || !this.config.observability.ui_enabled) {
+      return sendJson(response, 404, { error: 'debug dashboard is disabled', code: 'not_found' }, id);
+    }
+    response.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'content-length': Buffer.byteLength(DASHBOARD_HTML),
+      'cache-control': 'no-store',
+      'content-security-policy': "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+      'referrer-policy': 'no-referrer',
+      'x-content-type-options': 'nosniff',
+      'x-frame-options': 'DENY',
+      'x-request-id': id,
+    });
+    response.end(DASHBOARD_HTML);
+  }
+
+  handleDashboardAsset(response, id, contentType, body) {
+    if (!this.config.observability.enabled || !this.config.observability.ui_enabled) {
+      return sendJson(response, 404, { error: 'debug dashboard is disabled', code: 'not_found' }, id);
+    }
+    response.writeHead(200, {
+      'content-type': contentType,
+      'content-length': Buffer.byteLength(body),
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+      'x-request-id': id,
+    });
+    response.end(body);
+  }
+
+  handleObservability(request, response, url, id) {
+    if (!this.config.observability.enabled) {
+      return sendJson(response, 404, { error: 'observability API is disabled', code: 'not_found' }, id);
+    }
+    response.setHeader('cache-control', 'no-store');
+    response.setHeader('x-content-type-options', 'nosniff');
+    if (!authorized(request, this.config.observability.auth_token)) {
+      response.setHeader('www-authenticate', 'Bearer realm="ollama-intermediary"');
+      return sendJson(response, 401, { error: 'observability token is required', code: 'unauthorized' }, id);
+    }
+    if (request.method !== 'GET') {
+      response.setHeader('allow', 'GET');
+      return sendJson(response, 405, { error: 'observability endpoints only support GET', code: 'method_not_allowed' }, id);
+    }
+    if (request.method === 'GET' && url.pathname === '/_intermediary/v1/status') {
+      return sendJson(response, 200, this.observabilitySnapshot(), id);
+    }
+    if (request.method === 'GET' && url.pathname === '/_intermediary/v1/history') {
+      const requested = Number(url.searchParams.get('limit') ?? this.config.observability.history_limit);
+      const limit = Number.isInteger(requested) && requested > 0
+        ? Math.min(requested, this.config.observability.history_limit)
+        : this.config.observability.history_limit;
+      return sendJson(response, 200, {
+        schema_version: 1,
+        generated_at: new Date(this.clock()).toISOString(),
+        events: this.observability.recent(limit),
+      }, id);
+    }
+    if (request.method === 'GET' && url.pathname === '/_intermediary/v1/events') {
+      return this.handleEventStream(request, response, id);
+    }
+    return sendJson(response, 404, { error: 'observability endpoint not found', code: 'not_found' }, id);
+  }
+
+  handleEventStream(request, response, id) {
+    let closed = false;
+    let heartbeat;
+    let unsubscribe;
+    const close = (force = false) => {
+      if (closed) return;
+      closed = true;
+      if (heartbeat) clearInterval(heartbeat);
+      unsubscribe?.();
+      this.eventStreams.delete(close);
+      if (force) {
+        if (!response.destroyed) response.destroy();
+      } else if (!response.destroyed && !response.writableEnded) response.end();
+    };
+    const send = (eventName, data, eventId = null) => {
+      if (closed || response.destroyed || response.writableEnded) return false;
+      const lines = [];
+      if (eventId !== null) lines.push(`id: ${eventId}`);
+      lines.push(`event: ${eventName}`, `data: ${JSON.stringify(data)}`, '', '');
+      let writable;
+      try {
+        writable = response.write(lines.join('\n'));
+      } catch {
+        close(true);
+        return false;
+      }
+      if (!writable) close(true);
+      return writable;
+    };
+    unsubscribe = this.observability.subscribe((event) => send('update', event, event.id));
+    if (!unsubscribe) {
+      return sendJson(response, 503, { error: 'too many live dashboard connections', code: 'event_clients_full' }, id);
+    }
+    response.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-store, no-transform',
+      connection: 'keep-alive',
+      'x-accel-buffering': 'no',
+      'x-content-type-options': 'nosniff',
+      'x-request-id': id,
+    });
+    response.flushHeaders();
+    this.eventStreams.add(close);
+    if (!send('snapshot', {
+      schema_version: 1,
+      generated_at: new Date(this.clock()).toISOString(),
+      instance_id: this.observability.instanceId,
+    })) return undefined;
+    heartbeat = setInterval(() => {
+      if (closed) return;
+      try {
+        if (!response.write(': keepalive\n\n')) close(true);
+      } catch {
+        close(true);
+      }
+    }, 15_000);
+    heartbeat.unref?.();
+    request.once('aborted', close);
+    response.once('close', close);
+    return undefined;
+  }
+
   handleMetrics(response) {
-    const status = this.scheduler.status();
+    const now = this.clock();
+    const status = this.scheduler.status(now);
+    const details = this.scheduler.details(now);
+    const backend = this.backend.status(now);
     const body = this.metrics.render({
       queueDepth: status.queues,
       oldestWait: status.oldest_wait_seconds,
@@ -138,6 +386,8 @@ export class ProxyService {
       recoveryRequired: this.backend.recoveryRequired,
       upstreamDraining: status.upstream_draining,
       currentModel: status.current_model,
+      activeRequest: details.active_request,
+      loadedModels: backend.loaded_models,
     });
     response.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'content-length': Buffer.byteLength(body) });
     response.end(body);
@@ -173,8 +423,15 @@ export class ProxyService {
     const identification = this.classifier.identify(request, parsed, forcedClient);
     const client = identification.client;
     const streaming = isStreaming(url.pathname, parsed);
+    const originalBodyBytes = body.length;
     const normalized = applyKeepAlive(url.pathname, parsed, this.scheduler.modelPolicy(parsed.model, client));
     if (normalized.changed) body = Buffer.from(JSON.stringify(normalized.parsed));
+    let requestSummary;
+    try {
+      requestSummary = summarizeRequest(url.pathname, parsed, originalBodyBytes);
+    } catch {
+      requestSummary = minimalRequestSummary(originalBodyBytes);
+    }
 
     const upstreamController = new AbortController();
     const job = createJob({
@@ -189,6 +446,8 @@ export class ProxyService {
       body,
       headers: contentHeaders(copyRequestHeaders(request.headers, this.config.ollama.url, id), body),
       streaming,
+      requestType: requestType(url.pathname),
+      requestSummary,
       signal: upstreamController.signal,
       abortController: upstreamController,
       downstreamDisconnected: false,
@@ -204,6 +463,9 @@ export class ProxyService {
       if (job.state !== 'active') return;
       job.disconnectedAt = Date.now();
       this.metrics.increment('proxy_active_disconnects_total', { client: job.client, model: job.model });
+      this.observability.record('active_client_disconnected', this.scheduler.eventFields(job, {
+        draining: this.config.gpu_safety.drain_active_disconnects,
+      }));
       if (this.config.gpu_safety.drain_active_disconnects) {
         this.logger.warn('active client disconnected; draining upstream Ollama request', {
           request_id: job.id,
@@ -242,6 +504,7 @@ export class ProxyService {
     let streamError = null;
     let status = 499;
     let responseBody = Buffer.alloc(0);
+    const responseStats = new ResponseStatsCollector();
     try {
       const upstream = result.upstream;
       status = upstream.statusCode ?? 502;
@@ -254,6 +517,7 @@ export class ProxyService {
         flush: streaming,
         drainOnClose: this.config.gpu_safety.drain_active_disconnects,
         captureLimit: status >= 500 ? this.config.gpu_safety.error_body_limit_bytes : 0,
+        onChunk: (chunk) => responseStats.push(chunk),
       });
       responseBody = transfer.captured;
       job.downstreamDisconnected ||= transfer.downstreamClosed;
@@ -267,6 +531,9 @@ export class ProxyService {
           detected_client: job.client,
           requested_model: job.model,
         });
+        this.observability.record('upstream_request_drained', this.scheduler.eventFields(job, {
+          drain_duration_seconds: (Date.now() - (job.disconnectedAt ?? job.dispatchedAt)) / 1000,
+        }));
       }
     } catch (error) {
       streamError = error;
@@ -274,7 +541,13 @@ export class ProxyService {
     } finally {
       removeDisconnectListeners();
       result.cleanup?.();
-      job.finish({ status, error: streamError, clientDisconnected: job.downstreamDisconnected, responseBody });
+      job.finish({
+        status,
+        error: streamError,
+        clientDisconnected: job.downstreamDisconnected,
+        responseBody,
+        responseStats: responseStats.finish(),
+      });
     }
   }
 
@@ -345,7 +618,9 @@ export class ProxyService {
         continue;
       }
       const job = selection.job;
+      job.phase = 'waiting_for_gate';
       let release;
+      let finalEvent = null;
       const startedAt = Date.now();
       try {
         release = await this.gate.acquire('inference', job.signal);
@@ -354,12 +629,17 @@ export class ProxyService {
         }
         if (job.signal.aborted) throw job.signal.reason;
         if (job.switching && job.previousModel && this.config.gpu_safety.unload_on_model_switch) {
+          job.phase = 'unloading_model';
           const unloadStartedAt = Date.now();
           this.logger.info('unloading previous Ollama model before switch', {
             request_id: job.id,
             from_model: job.previousModel,
             to_model: job.model,
           });
+          this.observability.record('model_unload_started', this.scheduler.eventFields(job, {
+            from_model: safeDisplay(job.previousModel),
+            to_model: safeDisplay(job.model),
+          }));
           try {
             await this.backendClient.unloadModel(job.previousModel, {
               signal: job.signal,
@@ -382,13 +662,20 @@ export class ProxyService {
             to_model: job.model,
             unload_duration: unloadDuration,
           });
+          this.observability.record('model_unloaded', this.scheduler.eventFields(job, {
+            from_model: safeDisplay(job.previousModel),
+            to_model: safeDisplay(job.model),
+            duration_seconds: unloadDuration,
+          }));
         }
+        job.phase = 'connecting';
         const { response, cleanup } = await this.backendClient.request({
           method: job.method, path: job.path, headers: job.headers, body: job.body, signal: job.signal,
         });
         if (job.modelLoadExpected) {
           this.metrics.observe('proxy_model_load_duration_seconds', (Date.now() - startedAt) / 1000, { model: job.model });
         }
+        job.phase = job.streaming ? 'streaming' : 'running';
         job.settle({ type: 'upstream', upstream: response, cleanup });
         const outcome = await job.finished;
         const backendResult = this.backend.recordGenerationResult(
@@ -401,16 +688,41 @@ export class ProxyService {
         }
         const duration = (Date.now() - job.dispatchedAt) / 1000;
         this.metrics.observe('proxy_request_duration_seconds', duration, { client: job.client, model: job.model });
+        this.metrics.observe('proxy_response_body_bytes', outcome.responseStats?.response_bytes ?? 0, {
+          client: job.client, endpoint: job.pathname,
+        });
+        if (Number.isFinite(outcome.responseStats?.prompt_tokens)) {
+          this.metrics.observe('proxy_prompt_tokens', outcome.responseStats.prompt_tokens, {
+            client: job.client, endpoint: job.pathname,
+          });
+        }
+        if (Number.isFinite(outcome.responseStats?.output_tokens)) {
+          this.metrics.observe('proxy_output_tokens', outcome.responseStats.output_tokens, {
+            client: job.client, endpoint: job.pathname,
+          });
+        }
         this.logger.info('request completed', {
           request_id: job.id, detected_client: job.client, requested_model: job.model,
           queue_wait: (job.dispatchedAt - job.enqueuedAt) / 1000,
           completion_time: new Date().toISOString(), request_duration: duration,
           http_status: outcome.status, streaming: job.streaming,
         });
+        finalEvent = ['request_completed', this.scheduler.eventFields(job, {
+          status: outcome.status,
+          queue_wait_seconds: (job.dispatchedAt - job.enqueuedAt) / 1000,
+          duration_seconds: duration,
+          client_disconnected: outcome.clientDisconnected,
+          response: outcome.responseStats,
+        })];
       } catch (error) {
         const disconnected = job.signal?.aborted;
         if (disconnected) {
           job.settle({ type: 'local_error', status: 499, code: 'client_closed', message: 'client disconnected' });
+          finalEvent = ['request_cancelled', this.scheduler.eventFields(job, {
+            status: 499,
+            reason: 'active_client_disconnect',
+            duration_seconds: (Date.now() - job.dispatchedAt) / 1000,
+          })];
         } else {
           if (error.code === 'model_unload_failed' || error.code === 'model_unload_timeout') {
             this.backend.requireRecovery(error, {
@@ -432,10 +744,18 @@ export class ProxyService {
           this.logger.error('generation dispatch failed', {
             request_id: job.id, detected_client: job.client, requested_model: job.model, error: error.message,
           });
+          finalEvent = ['request_failed', this.scheduler.eventFields(job, {
+            status: this.backend.recoveryRequired ? 503 : timedOut ? 504 : 502,
+            reason: this.backend.recoveryRequired
+              ? 'gpu_recovery_required'
+              : timedOut ? 'backend_timeout' : 'backend_error',
+            duration_seconds: (Date.now() - job.dispatchedAt) / 1000,
+          })];
         }
       } finally {
         release?.();
         this.scheduler.complete(job);
+        if (finalEvent) this.observability.record(finalEvent[0], finalEvent[1]);
       }
     }
   }
@@ -445,6 +765,7 @@ export class ProxyService {
     this.running = false;
     this.scheduler.stop();
     this.backend.stop();
+    for (const close of [...this.eventStreams]) close();
     if (this.expiryTimer) clearInterval(this.expiryTimer);
     const closes = this.servers.map(({ server }) => once(server, 'close').catch(() => {}));
     for (const { server } of this.servers) server.close();
