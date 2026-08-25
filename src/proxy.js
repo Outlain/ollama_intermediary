@@ -135,6 +135,8 @@ export class ProxyService {
       queueDepth: status.queues,
       oldestWait: status.oldest_wait_seconds,
       backendHealthy: this.backend.canDispatch(),
+      recoveryRequired: this.backend.recoveryRequired,
+      upstreamDraining: status.upstream_draining,
       currentModel: status.current_model,
     });
     response.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'content-length': Buffer.byteLength(body) });
@@ -143,6 +145,13 @@ export class ProxyService {
 
   async handleGeneration(request, response, url, id, forcedClient) {
     if (!this.scheduler.accepting) return sendJson(response, 503, { error: 'proxy is shutting down', code: 'shutting_down' }, id);
+    if (this.backend.recoveryRequired) {
+      return sendJson(response, 503, {
+        error: 'GPU recovery is required before inference can resume',
+        code: 'gpu_recovery_required',
+        detail: this.backend.recoveryReason,
+      }, id);
+    }
     if (this.config.circuit_breaker.queue_behavior === 'reject_new' && !this.backend.canDispatch()) {
       return sendJson(response, 503, { error: 'Ollama backend is unavailable', code: 'backend_unavailable' }, id);
     }
@@ -167,12 +176,7 @@ export class ProxyService {
     const normalized = applyKeepAlive(url.pathname, parsed, this.scheduler.modelPolicy(parsed.model, client));
     if (normalized.changed) body = Buffer.from(JSON.stringify(normalized.parsed));
 
-    const controller = new AbortController();
-    const abort = () => {
-      if (!response.writableEnded) controller.abort(new Error('client disconnected'));
-    };
-    request.once('aborted', abort);
-    response.once('close', abort);
+    const upstreamController = new AbortController();
     const job = createJob({
       id,
       sequence: ++this.sequence,
@@ -185,39 +189,92 @@ export class ProxyService {
       body,
       headers: contentHeaders(copyRequestHeaders(request.headers, this.config.ollama.url, id), body),
       streaming,
-      signal: controller.signal,
-      abortController: controller,
+      signal: upstreamController.signal,
+      abortController: upstreamController,
+      downstreamDisconnected: false,
       dedupeKey: this.classifier.dedupeKey(client, request, parsed),
     });
+    const disconnect = () => {
+      if (response.writableEnded || job.downstreamDisconnected) return;
+      job.downstreamDisconnected = true;
+      if (job.state === 'queued') {
+        this.scheduler.cancel(job);
+        return;
+      }
+      if (job.state !== 'active') return;
+      job.disconnectedAt = Date.now();
+      this.metrics.increment('proxy_active_disconnects_total', { client: job.client, model: job.model });
+      if (this.config.gpu_safety.drain_active_disconnects) {
+        this.logger.warn('active client disconnected; draining upstream Ollama request', {
+          request_id: job.id,
+          detected_client: job.client,
+          requested_model: job.model,
+        });
+      } else {
+        this.logger.warn('active client disconnected; aborting upstream Ollama request', {
+          request_id: job.id,
+          detected_client: job.client,
+          requested_model: job.model,
+        });
+        upstreamController.abort(new Error('client disconnected'));
+      }
+      this.scheduler.wake();
+    };
+    request.once('aborted', disconnect);
+    response.once('close', disconnect);
+    const removeDisconnectListeners = () => {
+      request.removeListener('aborted', disconnect);
+      response.removeListener('close', disconnect);
+    };
     const admission = this.scheduler.enqueue(job);
     if (!admission.accepted) {
-      response.removeListener('close', abort);
+      removeDisconnectListeners();
       return sendJson(response, admission.status, { error: admission.message, code: admission.code }, id);
     }
+    if (request.aborted || response.destroyed) disconnect();
 
-    controller.signal.addEventListener('abort', () => this.scheduler.cancel(job), { once: true });
     const result = await job.result;
     if (result.type === 'local_error') {
-      response.removeListener('close', abort);
+      removeDisconnectListeners();
       return sendJson(response, result.status, { error: result.message, code: result.code }, id);
     }
 
     let streamError = null;
     let status = 499;
+    let responseBody = Buffer.alloc(0);
     try {
       const upstream = result.upstream;
       status = upstream.statusCode ?? 502;
-      copyResponseHeaders(upstream.headers, response);
-      response.statusCode = status;
-      response.flushHeaders();
-      await streamBody(upstream, response, { flush: streaming });
+      if (!job.downstreamDisconnected && !response.destroyed) {
+        copyResponseHeaders(upstream.headers, response);
+        response.statusCode = status;
+        response.flushHeaders();
+      }
+      const transfer = await streamBody(upstream, response, {
+        flush: streaming,
+        drainOnClose: this.config.gpu_safety.drain_active_disconnects,
+        captureLimit: status >= 500 ? this.config.gpu_safety.error_body_limit_bytes : 0,
+      });
+      responseBody = transfer.captured;
+      job.downstreamDisconnected ||= transfer.downstreamClosed;
+      if (job.downstreamDisconnected && this.config.gpu_safety.drain_active_disconnects) {
+        this.metrics.observe('proxy_upstream_drain_duration_seconds', (Date.now() - (job.disconnectedAt ?? job.dispatchedAt)) / 1000, {
+          client: job.client,
+          model: job.model,
+        });
+        this.logger.info('upstream Ollama request drained after client disconnect', {
+          request_id: job.id,
+          detected_client: job.client,
+          requested_model: job.model,
+        });
+      }
     } catch (error) {
       streamError = error;
-      if (!controller.signal.aborted) this.logger.warn('response stream failed', { request_id: id, error: error.message });
+      if (!upstreamController.signal.aborted) this.logger.warn('response stream failed', { request_id: id, error: error.message });
     } finally {
-      response.removeListener('close', abort);
+      removeDisconnectListeners();
       result.cleanup?.();
-      job.finish({ status, error: streamError, clientDisconnected: controller.signal.aborted });
+      job.finish({ status, error: streamError, clientDisconnected: job.downstreamDisconnected, responseBody });
     }
   }
 
@@ -296,16 +353,52 @@ export class ProxyService {
           await this.scheduler.waitForChange(Math.min(1_000, this.config.ollama.healthIntervalMs), job.signal);
         }
         if (job.signal.aborted) throw job.signal.reason;
+        if (job.switching && job.previousModel && this.config.gpu_safety.unload_on_model_switch) {
+          const unloadStartedAt = Date.now();
+          this.logger.info('unloading previous Ollama model before switch', {
+            request_id: job.id,
+            from_model: job.previousModel,
+            to_model: job.model,
+          });
+          try {
+            await this.backendClient.unloadModel(job.previousModel, {
+              signal: job.signal,
+              timeoutMs: this.config.gpu_safety.unloadTimeoutMs,
+            });
+          } catch (error) {
+            if (job.signal.aborted) throw error;
+            const wrapped = new Error(`failed to unload ${job.previousModel} before switching to ${job.model}: ${error.message}`, { cause: error });
+            wrapped.code = error.code === 'model_unload_timeout' ? error.code : 'model_unload_failed';
+            throw wrapped;
+          }
+          const unloadDuration = (Date.now() - unloadStartedAt) / 1000;
+          this.metrics.observe('proxy_model_unload_duration_seconds', unloadDuration, {
+            from: job.previousModel,
+            to: job.model,
+          });
+          this.logger.info('previous Ollama model unload confirmed', {
+            request_id: job.id,
+            from_model: job.previousModel,
+            to_model: job.model,
+            unload_duration: unloadDuration,
+          });
+        }
         const { response, cleanup } = await this.backendClient.request({
           method: job.method, path: job.path, headers: job.headers, body: job.body, signal: job.signal,
         });
         if (job.modelLoadExpected) {
           this.metrics.observe('proxy_model_load_duration_seconds', (Date.now() - startedAt) / 1000, { model: job.model });
         }
-        this.backend.recordHttpStatus(response.statusCode ?? 502);
         job.settle({ type: 'upstream', upstream: response, cleanup });
         const outcome = await job.finished;
-        if (outcome.error && !outcome.clientDisconnected) this.backend.recordFailure(outcome.error, 'response_stream');
+        const backendResult = this.backend.recordGenerationResult(
+          outcome.status,
+          outcome.responseBody,
+          outcome.clientDisconnected ? null : outcome.error,
+        );
+        if (backendResult.recoveryRequired) {
+          this.scheduler.failQueued(503, 'gpu_recovery_required', 'GPU recovery is required before inference can resume');
+        }
         const duration = (Date.now() - job.dispatchedAt) / 1000;
         this.metrics.observe('proxy_request_duration_seconds', duration, { client: job.client, model: job.model });
         this.logger.info('request completed', {
@@ -319,12 +412,22 @@ export class ProxyService {
         if (disconnected) {
           job.settle({ type: 'local_error', status: 499, code: 'client_closed', message: 'client disconnected' });
         } else {
-          this.backend.recordFailure(error);
+          if (error.code === 'model_unload_failed' || error.code === 'model_unload_timeout') {
+            this.backend.requireRecovery(error, {
+              from_model: job.previousModel,
+              to_model: job.model,
+            });
+            this.scheduler.failQueued(503, 'gpu_recovery_required', 'GPU recovery is required before inference can resume');
+          } else {
+            this.backend.recordFailure(error);
+          }
           const timedOut = /timeout/i.test(`${error.message ?? ''} ${error.cause?.message ?? ''}`);
           job.settle({
-            type: 'local_error', status: timedOut ? 504 : 502,
-            code: timedOut ? 'backend_timeout' : 'backend_error',
-            message: timedOut ? 'Ollama request exceeded the configured hard runtime' : 'Ollama backend request failed',
+            type: 'local_error', status: this.backend.recoveryRequired ? 503 : timedOut ? 504 : 502,
+            code: this.backend.recoveryRequired ? 'gpu_recovery_required' : timedOut ? 'backend_timeout' : 'backend_error',
+            message: this.backend.recoveryRequired
+              ? 'GPU recovery is required before inference can resume'
+              : timedOut ? 'Ollama request exceeded the configured hard runtime' : 'Ollama backend request failed',
           });
           this.logger.error('generation dispatch failed', {
             request_id: job.id, detected_client: job.client, requested_model: job.model, error: error.message,

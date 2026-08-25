@@ -86,7 +86,7 @@ These controls are related but different:
 - `idle_hold` is a scheduling decision: leave the dispatcher idle briefly instead of choosing another model.
 - `keep_alive` is written into native Ollama generation request bodies: ask Ollama to retain that model for the configured duration.
 
-The proxy never sends a separate preload request. The selected real request loads whatever model its JSON body names. OpenAI-compatible request bodies are not modified with native `keep_alive` fields.
+The proxy never sends a separate preload request. The selected real request loads whatever model its JSON body names. OpenAI-compatible request bodies are not modified with native `keep_alive` fields. Once the scheduler has actually chosen a different model, the default GPU-safety policy sends a native `keep_alive: 0` cleanup request for the previous model and waits for `/api/ps` to confirm its unload before dispatching the replacement.
 
 Client-wide policy example:
 
@@ -148,16 +148,41 @@ The `192.0.2.0/24` addresses above are documentation placeholders. Replace them 
 - Odysseus defaults to a protected 10-request queue. Overflow returns a JSON HTTP 429; interactive jobs are never silently discarded.
 - Frigate defaults to 20 queued requests and `drop_oldest`. An evicted caller receives JSON HTTP 429. Jobs older than two minutes receive HTTP 408 and are never dispatched.
 - Optional coalescing is newest-wins and only activates when at least one configured header or scalar JSON field yields a key. Do not enable it until the real Frigate identifiers are confirmed.
-- A queued disconnect removes the job. A running disconnect aborts the Ollama socket.
+- A queued disconnect removes the job immediately. By default, a running disconnect stops downstream delivery but drains Ollama to a normal completion while holding the single-inference gate. This deliberately trades some otherwise-wasted GPU time for safer ROCm cleanup.
 - Generation requests are not retried. Even a connection failure before response headers is ambiguous—the backend may have started work—so version 1 chooses duplicate safety.
 - Three failures in the configured window open the circuit. With `queue_behavior: hold`, queued jobs remain subject to their normal TTL while health probes run; `reject_new` returns 503 for new inference.
+- A response containing a recognized ROCm/GPU out-of-memory signature bypasses the ordinary failure threshold and latches `recovery_required`. Queued work is failed with 503, new inference is rejected, and `/readyz` remains 503 until the proxy process is restarted after Ollama or the host has been recovered.
 - `/api/tags` and `/api/ps` are probed periodically. `/api/ps` reconciles the scheduler's model state when no request is active, covering Ollama restarts and external unloads.
 
-The proxy intentionally does not kill `llama-server`, run `amd-smi`, reboot the VM, or attempt GPU recovery. An API-unreachable backend is marked unhealthy and circuit-broken. The ambiguous condition “`/api/ps` empty while VRAM is busy” requires a separate, optional host/GPU metric source; no container privilege for that is requested here.
+The proxy intentionally does not kill `llama-server`, run `amd-smi`, or reboot the host. It contains a suspected GPU fault instead of claiming to repair kernel/driver state. The ambiguous condition “`/api/ps` empty while VRAM is busy” still requires a host-side `rocm-smi` check; no GPU devices or host privileges are granted to this container.
+
+### GPU safety and recovery
+
+The defaults are designed for the cancellation failure mode seen with large ROCm model loads:
+
+```yaml
+gpu_safety:
+  drain_active_disconnects: true
+  unload_on_model_switch: true
+  unload_timeout: 30s
+  recovery_on_oom: true
+  error_body_limit_bytes: 65536
+```
+
+`drain_active_disconnects` applies only after dispatch. Callers that disappear while queued are still removed immediately. `unload_on_model_switch` runs only after normal lease/priority/batch scheduling has selected a different model, so it does not shorten `idle_hold`. The error-body limit bounds how much of an HTTP 5xx body is retained for fault classification; successful and streaming response bodies are not buffered.
+
+When `/status` reports `backend.state: recovery_required`:
+
+1. Check `ollama ps` and `sudo rocm-smi --showmeminfo vram --showpids` on the host.
+2. Restart Ollama. If an `UNKNOWN` KFD PID still owns substantial VRAM, reboot the host to reset the driver.
+3. Restart the intermediary container after the backend is clean: `docker compose restart ollama-scheduler`.
+4. Confirm `/readyz` returns 200 before sending inference again.
+
+The recovery latch is intentionally not cleared by an HTTP health probe: `/api/tags` can succeed while ROCm still holds orphaned VRAM.
 
 ## Observability
 
-`GET /status` returns backend/circuit state, current model/group, active request, per-client and per-model queue depths/oldest ages, last activity, lease remaining, switch count, and shutdown admission state.
+`GET /status` returns backend/circuit/recovery state, current model/group, active request, whether an abandoned request is being drained, per-client and per-model queue depths/oldest ages, last activity, lease remaining, switch count, and shutdown admission state.
 
 `GET /metrics` emits Prometheus text including:
 
@@ -167,11 +192,15 @@ The proxy intentionally does not kill `llama-server`, run `amd-smi`, reboot the 
 - `proxy_model_switches_total`
 - `proxy_current_model{model=...}` and `proxy_backend_healthy`
 - `proxy_model_load_duration_seconds` (dispatch-to-response-header estimate when a new model is expected)
+- `proxy_active_disconnects_total` and `proxy_upstream_drain_duration_seconds`
+- `proxy_model_unload_duration_seconds`
+- `proxy_gpu_recovery_required` and `proxy_gpu_recovery_required_total`
+- `proxy_upstream_draining`
 - `proxy_circuit_breaker_opens_total`
 
 All application logs are newline-delimited JSON. Scheduling lifecycle entries include request ID, detected client, model, queue/dispatch/completion times, wait/duration, streaming flag, status, and switch reason. Supply `X-Request-ID` to correlate an existing trace; otherwise the proxy creates one.
 
-Alert at minimum on `proxy_backend_healthy == 0`, circuit openings, elevated queue age, drops, and the rate of `proxy_model_switches_total`. The last metric is the central before/after measure for GPU churn.
+Alert at minimum on `proxy_backend_healthy == 0`, `proxy_gpu_recovery_required == 1`, circuit openings, elevated queue age, drops, and the rate of `proxy_model_switches_total`. The last metric is the central before/after measure for GPU churn.
 
 ## Long HTTP timeouts
 
@@ -241,4 +270,4 @@ npm test
 npm run test:coverage
 ```
 
-The tests use Node's built-in test runner and a real HTTP mock Ollama. They cover FIFO, priority, aging/max-wait fairness, affinity batching, lease behavior, bounded batches, TTL, overflow, disconnect cancellation, streaming latency, single upstream generation concurrency, circuit breaking, metadata bypass, exclusive model management, mappings, unknown models, keep-alive normalization, status/metrics, graceful shutdown, the `O O O F F` scenario, and post-restart model reconciliation.
+The tests use Node's built-in test runner and a real HTTP mock Ollama. They cover FIFO, priority, aging/max-wait fairness, affinity batching, lease behavior, bounded batches, TTL, overflow, queued cancellation, active and streaming disconnect draining, unload-before-switch confirmation, ROCm OOM recovery latching, streaming latency, single upstream generation concurrency, circuit breaking, metadata bypass, exclusive model management, mappings, unknown models, keep-alive normalization, status/metrics, graceful shutdown, the `O O O F F` scenario, and post-restart model reconciliation.

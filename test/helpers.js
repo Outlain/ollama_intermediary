@@ -68,6 +68,8 @@ export class MockOllama {
     this.maxActive = 0;
     this.loadedModel = null;
     this.failuresRemaining = 0;
+    this.failureMessage = 'mock failure';
+    this.unloadFailuresRemaining = 0;
     this.server = http.createServer((request, response) => this.handle(request, response));
   }
 
@@ -111,6 +113,19 @@ export class MockOllama {
     if (url.pathname === '/api/chat' || url.pathname === '/api/generate' || url.pathname === '/api/embed' || url.pathname === '/v1/chat/completions') {
       const raw = await this.body(request);
       const body = JSON.parse(raw.toString() || '{}');
+      if (url.pathname === '/api/generate' && body.keep_alive === 0 && !body.id && !body.prompt) {
+        this.events.push(`unload:${body.model}`);
+        if (this.unloadFailuresRemaining > 0) {
+          this.unloadFailuresRemaining -= 1;
+          response.statusCode = 500;
+          response.end(JSON.stringify({ error: 'mock unload failure' }));
+          return;
+        }
+        this.loadedModel = null;
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({ done: true }));
+        return;
+      }
       this.active += 1;
       this.maxActive = Math.max(this.maxActive, this.active);
       this.order.push(body.id ?? body.prompt ?? body.model);
@@ -120,7 +135,7 @@ export class MockOllama {
       if (this.failuresRemaining > 0) {
         this.failuresRemaining -= 1;
         response.statusCode = 500;
-        response.end(JSON.stringify({ error: 'mock failure' }));
+        response.end(JSON.stringify({ error: this.failureMessage }));
         return;
       }
       response.setHeader('content-type', 'application/x-ndjson');

@@ -116,6 +116,10 @@ export class Scheduler {
     }
   }
 
+  failQueued(status, code, message) {
+    for (const job of [...this.jobs]) this.drop(job, status, code, message);
+  }
+
   effectivePriority(job, now) {
     const client = this.config.clients[job.client];
     if (!this.config.scheduler.priority_aging) return client.priority;
@@ -203,6 +207,7 @@ export class Scheduler {
     chosen.state = 'active';
     chosen.dispatchedAt = now;
     chosen.switching = switching;
+    chosen.previousModel = switching ? previousModel : null;
     chosen.modelLoadExpected = modelLoadExpected;
     chosen.scheduleReason = reason;
     this.active = chosen;
@@ -262,6 +267,8 @@ export class Scheduler {
       active_client: this.active?.client ?? null,
       active_request_id: this.active?.id ?? null,
       active_request_duration: this.active ? (now - this.active.dispatchedAt) / 1000 : 0,
+      active_request_abandoned: this.active?.downstreamDisconnected ?? false,
+      upstream_draining: this.active?.downstreamDisconnected ?? false,
       queues,
       oldest_wait_seconds: oldestWait,
       model_queues: modelQueues,

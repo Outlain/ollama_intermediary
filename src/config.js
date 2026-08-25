@@ -46,6 +46,13 @@ const DEFAULTS = {
     enabled: true,
     serialize_with_inference: true,
   },
+  gpu_safety: {
+    drain_active_disconnects: true,
+    unload_on_model_switch: true,
+    unload_timeout: '30s',
+    recovery_on_oom: true,
+    error_body_limit_bytes: 65_536,
+  },
   clients: {
     default: {
       priority: 50,
@@ -89,6 +96,7 @@ function durationFields(config) {
   config.scheduler.agingIntervalMs = parseDuration(config.scheduler.aging_interval, 'scheduler.aging_interval');
   config.circuit_breaker.failureWindowMs = parseDuration(config.circuit_breaker.failure_window, 'circuit_breaker.failure_window');
   config.circuit_breaker.openDurationMs = parseDuration(config.circuit_breaker.open_duration, 'circuit_breaker.open_duration');
+  config.gpu_safety.unloadTimeoutMs = parseDuration(config.gpu_safety.unload_timeout, 'gpu_safety.unload_timeout');
 
   for (const [name, client] of Object.entries(config.clients)) {
     client.requestTtlMs = parseDuration(client.request_ttl, `clients.${name}.request_ttl`);
@@ -141,6 +149,12 @@ function validate(config) {
   }
   if (config.model_management.serialize_with_inference !== true) {
     throw new Error('model_management.serialize_with_inference must be true; model-state mutations may not overlap inference');
+  }
+  for (const field of ['drain_active_disconnects', 'unload_on_model_switch', 'recovery_on_oom']) {
+    if (typeof config.gpu_safety[field] !== 'boolean') throw new Error(`gpu_safety.${field} must be true or false`);
+  }
+  if (!Number.isInteger(config.gpu_safety.error_body_limit_bytes) || config.gpu_safety.error_body_limit_bytes < 1) {
+    throw new Error('gpu_safety.error_body_limit_bytes must be a positive integer');
   }
   new URL(config.ollama.url);
 }

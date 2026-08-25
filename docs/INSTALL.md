@@ -88,6 +88,23 @@ docker compose pull
 docker compose up -d
 ```
 
+The supplied configuration enables GPU-safety draining, unload-before-switch, and latched ROCm OOM recovery. Keep the `gpu_safety` section enabled unless you are deliberately diagnosing one of those mechanisms.
+
+If `/readyz` later reports `recovery_required`, inspect the host with:
+
+```sh
+ollama ps
+sudo rocm-smi --showmeminfo vram --showpids
+```
+
+Restart Ollama first. If `rocm-smi` still shows an `UNKNOWN` process retaining substantial VRAM, reboot the host. Once GPU memory is clean, restart the intermediary so it clears its deliberate recovery latch:
+
+```sh
+cd /opt/ollama_intermediary
+docker compose restart ollama-scheduler
+curl http://127.0.0.1:11435/readyz
+```
+
 ## Install from source instead
 
 ```sh

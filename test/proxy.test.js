@@ -114,6 +114,110 @@ test('queued HTTP client disconnect is removed before dispatch', async (t) => {
   assert.equal(mock.order.includes('disconnected'), false);
 });
 
+test('active client disconnect drains Ollama before the next request dispatches', async (t) => {
+  const { mock, service, proxyUrl } = await setup(t, {
+    models: { 'od-model': { idle_hold: '0ms' }, 'f-model': { idle_hold: '0ms' } },
+  });
+  const target = new URL('/api/generate', proxyUrl);
+  const abandoned = http.request(target, { method: 'POST', headers: { 'content-type': 'application/json' } });
+  abandoned.on('error', () => {});
+  abandoned.end(JSON.stringify({ model: 'od-model', id: 'abandoned', first_chunk_delay_ms: 80, delay_ms: 120 }));
+  await waitFor(() => mock.active === 1);
+  abandoned.destroy();
+  await waitFor(() => service.scheduler.status().upstream_draining === true);
+
+  const nextPromise = requestJson(`${proxyUrl}/api/generate`, { model: 'f-model', id: 'after-drain' });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(mock.order.includes('after-drain'), false);
+
+  const next = await nextPromise;
+  await next.text();
+  await waitFor(() => service.scheduler.active === null);
+  assert.deepEqual(mock.order, ['abandoned', 'after-drain']);
+  assert.ok(mock.events.includes('unload:od-model'));
+  assert.equal(mock.maxActive, 1);
+  assert.equal(service.scheduler.status().upstream_draining, false);
+});
+
+test('streaming client disconnect drains the remaining upstream response', async (t) => {
+  const { mock, service, proxyUrl } = await setup(t);
+  const target = new URL('/api/generate', proxyUrl);
+  let markDisconnected;
+  const disconnected = new Promise((resolve) => { markDisconnected = resolve; });
+  const abandoned = http.request(target, { method: 'POST', headers: { 'content-type': 'application/json' } });
+  abandoned.on('error', () => {});
+  abandoned.on('response', (incoming) => {
+    incoming.once('data', () => {
+      incoming.destroy();
+      markDisconnected();
+    });
+  });
+  abandoned.end(JSON.stringify({ model: 'od-model', id: 'stream-abandoned', delay_ms: 140, stream: true }));
+  await disconnected;
+  await waitFor(() => service.scheduler.status().upstream_draining === true);
+
+  const nextPromise = requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'after-stream-drain' });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(mock.order.includes('after-stream-drain'), false);
+  const next = await nextPromise;
+  await next.text();
+  assert.deepEqual(mock.order, ['stream-abandoned', 'after-stream-drain']);
+  assert.equal(mock.maxActive, 1);
+});
+
+test('a model switch unloads and confirms the previous model before dispatch', async (t) => {
+  const { mock, proxyUrl } = await setup(t, {
+    models: { 'od-model': { idle_hold: '0ms' }, 'f-model': { idle_hold: '0ms' } },
+  });
+  const first = await requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'first-model' });
+  await first.text();
+  const second = await requestJson(`${proxyUrl}/api/generate`, { model: 'f-model', id: 'second-model' });
+  await second.text();
+  assert.ok(mock.events.indexOf('unload:od-model') > mock.events.indexOf('first-model'));
+  assert.ok(mock.events.indexOf('unload:od-model') < mock.events.indexOf('second-model'));
+});
+
+test('one ROCm OOM latches recovery and rejects subsequent inference', async (t) => {
+  const { mock, service, proxyUrl } = await setup(t);
+  mock.failureMessage = 'ROCm error: out of memory';
+  mock.failuresRemaining = 1;
+  const failed = await requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'gpu-oom' });
+  assert.equal(failed.status, 500);
+  await failed.text();
+  await waitFor(() => service.backend.recoveryRequired);
+
+  const ready = await fetch(`${proxyUrl}/readyz`);
+  const readyBody = await ready.json();
+  assert.equal(ready.status, 503);
+  assert.equal(readyBody.backend.state, 'recovery_required');
+
+  const rejected = await requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'must-not-dispatch' });
+  assert.equal(rejected.status, 503);
+  assert.equal((await rejected.json()).code, 'gpu_recovery_required');
+  assert.equal(mock.order.includes('must-not-dispatch'), false);
+
+  const status = await (await fetch(`${proxyUrl}/status`)).json();
+  assert.equal(status.backend.recovery_required, true);
+  assert.match(status.backend.recovery_reason, /ROCm error: out of memory/i);
+  const metrics = await (await fetch(`${proxyUrl}/metrics`)).text();
+  assert.match(metrics, /proxy_gpu_recovery_required 1/);
+  assert.match(metrics, /proxy_gpu_recovery_required_total 1/);
+});
+
+test('an unconfirmed model unload suspends inference instead of risking overlap', async (t) => {
+  const { mock, service, proxyUrl } = await setup(t, {
+    models: { 'od-model': { idle_hold: '0ms' }, 'f-model': { idle_hold: '0ms' } },
+  });
+  const first = await requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'before-unload-failure' });
+  await first.text();
+  mock.unloadFailuresRemaining = 1;
+  const second = await requestJson(`${proxyUrl}/api/generate`, { model: 'f-model', id: 'blocked-switch' });
+  assert.equal(second.status, 503);
+  assert.equal((await second.json()).code, 'gpu_recovery_required');
+  assert.equal(mock.order.includes('blocked-switch'), false);
+  assert.equal(service.backend.recoveryRequired, true);
+});
+
 test('status and Prometheus endpoints expose scheduler state', async (t) => {
   const { service, proxyUrl } = await setup(t);
   const status = await (await fetch(`${proxyUrl}/status`)).json();
@@ -122,6 +226,8 @@ test('status and Prometheus endpoints expose scheduler state', async (t) => {
   const metrics = await (await fetch(`${proxyUrl}/metrics`)).text();
   assert.match(metrics, /proxy_queue_depth\{client="odysseus"\} 0/);
   assert.match(metrics, /proxy_backend_healthy 1/);
+  assert.match(metrics, /proxy_gpu_recovery_required 0/);
+  assert.match(metrics, /proxy_upstream_draining 0/);
   assert.equal(service.scheduler.active, null);
 });
 

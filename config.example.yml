@@ -102,3 +102,15 @@ circuit_breaker:
 model_management:
   enabled: true
   serialize_with_inference: true
+
+gpu_safety:
+  # Once Ollama has accepted a request, finish reading it even if its caller disconnects.
+  # This avoids aborting a ROCm model load and stranding a large GPU allocation.
+  drain_active_disconnects: true
+  # After the scheduler has chosen a different model, unload the prior model first.
+  unload_on_model_switch: true
+  unload_timeout: 30s
+  # A single ROCm/GPU OOM latches the proxy into recovery_required instead of
+  # dispatching more inference into a potentially poisoned driver state.
+  recovery_on_oom: true
+  error_body_limit_bytes: 65536

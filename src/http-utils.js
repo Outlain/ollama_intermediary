@@ -58,46 +58,102 @@ export function clientIp(request, trustedProxy = false) {
   return request.socket.remoteAddress?.replace(/^::ffff:/, '') ?? '';
 }
 
-export function streamBody(upstream, downstream, { flush = false } = {}) {
+function captureChunk(chunks, state, chunk, limit) {
+  if (!limit || state.length >= limit) return;
+  const buffer = Buffer.from(chunk);
+  const remaining = limit - state.length;
+  const captured = buffer.length <= remaining ? buffer : buffer.subarray(0, remaining);
+  chunks.push(captured);
+  state.length += captured.length;
+}
+
+export function streamBody(upstream, downstream, { flush = false, drainOnClose = false, captureLimit = 0 } = {}) {
   if (typeof upstream.body?.getReader !== 'function') {
     return new Promise((resolve, reject) => {
       let settled = false;
+      let downstreamOpen = !downstream.destroyed;
+      let pausedForBackpressure = false;
+      const captured = [];
+      const captureState = { length: 0 };
       const finish = (error) => {
         if (settled) return;
         settled = true;
-        upstream.removeListener('error', finish);
-        downstream.removeListener('error', finish);
-        if (error) reject(error); else resolve();
+        upstream.removeListener('data', onData);
+        upstream.removeListener('end', onEnd);
+        upstream.removeListener('error', onUpstreamError);
+        downstream.removeListener('drain', onDrain);
+        downstream.removeListener('error', onDownstreamError);
+        downstream.removeListener('close', onDownstreamClose);
+        if (error) reject(error);
+        else resolve({ captured: Buffer.concat(captured), downstreamClosed: !downstreamOpen });
       };
-      upstream.on('data', (chunk) => {
-        if (!downstream.write(chunk)) upstream.pause();
+      const onData = (chunk) => {
+        captureChunk(captured, captureState, chunk, captureLimit);
+        if (!downstreamOpen) return;
+        if (!downstream.write(chunk)) {
+          pausedForBackpressure = true;
+          upstream.pause();
+        }
         if (flush && typeof downstream.flushHeaders === 'function') downstream.flushHeaders();
-      });
-      downstream.on('drain', () => upstream.resume());
-      upstream.once('end', () => { downstream.end(); finish(); });
-      upstream.once('error', finish);
-      downstream.once('error', finish);
-      downstream.once('close', () => {
-        if (!downstream.writableEnded) upstream.destroy(new Error('downstream closed'));
-      });
+      };
+      const onDrain = () => {
+        pausedForBackpressure = false;
+        upstream.resume();
+      };
+      const onEnd = () => {
+        if (downstreamOpen && !downstream.writableEnded) downstream.end();
+        finish();
+      };
+      const onUpstreamError = (error) => finish(error);
+      const stopWriting = () => {
+        downstreamOpen = false;
+        if (pausedForBackpressure) {
+          pausedForBackpressure = false;
+          upstream.resume();
+        }
+      };
+      const onDownstreamError = (error) => {
+        if (drainOnClose) stopWriting();
+        else finish(error);
+      };
+      const onDownstreamClose = () => {
+        if (downstream.writableEnded) return;
+        if (drainOnClose) stopWriting();
+        else upstream.destroy(new Error('downstream closed'));
+      };
+      upstream.on('data', onData);
+      upstream.once('end', onEnd);
+      upstream.once('error', onUpstreamError);
+      downstream.on('drain', onDrain);
+      downstream.once('error', onDownstreamError);
+      downstream.once('close', onDownstreamClose);
     });
   }
   return new Promise((resolve, reject) => {
     const reader = upstream.body?.getReader();
     if (!reader) {
-      downstream.end();
-      resolve();
+      if (!downstream.destroyed) downstream.end();
+      resolve({ captured: Buffer.alloc(0), downstreamClosed: downstream.destroyed });
       return;
     }
     let settled = false;
+    let downstreamOpen = !downstream.destroyed;
+    const captured = [];
+    const captureState = { length: 0 };
     const finish = (error) => {
       if (settled) return;
       settled = true;
-      if (error) reject(error); else resolve();
+      if (error) reject(error);
+      else resolve({ captured: Buffer.concat(captured), downstreamClosed: !downstreamOpen });
     };
-    downstream.once('error', finish);
+    downstream.once('error', (error) => {
+      if (drainOnClose) downstreamOpen = false;
+      else finish(error);
+    });
     downstream.once('close', () => {
-      if (!downstream.writableEnded) reader.cancel('downstream closed').catch(() => {});
+      if (downstream.writableEnded) return;
+      downstreamOpen = false;
+      if (!drainOnClose) reader.cancel('downstream closed').catch(() => {});
     });
 
     const pump = async () => {
@@ -105,18 +161,20 @@ export function streamBody(upstream, downstream, { flush = false } = {}) {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
-          if (!downstream.write(Buffer.from(value))) {
+          captureChunk(captured, captureState, value, captureLimit);
+          if (downstreamOpen && !downstream.write(Buffer.from(value))) {
             await new Promise((res, rej) => {
               downstream.once('drain', res);
-              downstream.once('error', rej);
+              downstream.once('close', res);
+              downstream.once('error', drainOnClose ? res : rej);
             });
           }
-          if (flush && typeof downstream.flushHeaders === 'function') downstream.flushHeaders();
+          if (downstreamOpen && flush && typeof downstream.flushHeaders === 'function') downstream.flushHeaders();
         }
-        downstream.end();
+        if (downstreamOpen && !downstream.writableEnded) downstream.end();
         finish();
       } catch (error) {
-        downstream.destroy(error);
+        if (downstreamOpen) downstream.destroy(error);
         finish(error);
       }
     };

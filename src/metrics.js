@@ -62,6 +62,10 @@ export class Metrics {
     }
     lines.push('# HELP proxy_backend_healthy Whether the Ollama backend is accepting inference work.', '# TYPE proxy_backend_healthy gauge');
     lines.push(`proxy_backend_healthy ${dynamic.backendHealthy ? 1 : 0}`);
+    lines.push('# HELP proxy_gpu_recovery_required Whether inference is latched off after a hard GPU fault.', '# TYPE proxy_gpu_recovery_required gauge');
+    lines.push(`proxy_gpu_recovery_required ${dynamic.recoveryRequired ? 1 : 0}`);
+    lines.push('# HELP proxy_upstream_draining Whether an abandoned active request is being drained from Ollama.', '# TYPE proxy_upstream_draining gauge');
+    lines.push(`proxy_upstream_draining ${dynamic.upstreamDraining ? 1 : 0}`);
     lines.push('# HELP proxy_current_model Currently selected model.', '# TYPE proxy_current_model gauge');
     if (dynamic.currentModel) lines.push(`proxy_current_model${formatLabels({ model: dynamic.currentModel })} 1`);
 
