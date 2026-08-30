@@ -1,6 +1,6 @@
 # Home Assistant quick-view dashboard
 
-The intermediary exposes one stable JSON snapshot for Home Assistant:
+The intermediary exposes one stable JSON snapshot for Home Assistant, plus authenticated pause/resume controls for planned exclusive GPU work:
 
 ```text
 http://UBUNTU_IP:11435/_intermediary/v1/status
@@ -8,15 +8,16 @@ http://UBUNTU_IP:11435/_intermediary/v1/status
 
 Use the Ubuntu host's LAN address. `127.0.0.1` is correct only when Home Assistant shares the intermediary's network namespace. The configuration below uses one shared REST request every five seconds for all entities.
 
-## 1. Store the bearer token
+## 1. Store the bearer tokens
 
-If `OBSERVABILITY_TOKEN` is set in the intermediary's `secrets.env`, add the same value to Home Assistant's `/config/secrets.yaml`:
+Add the configured tokens from the intermediary's `secrets.env` to Home Assistant's `/config/secrets.yaml`:
 
 ```yaml
 ollama_intermediary_authorization: "Bearer PASTE_THE_TOKEN_HERE"
+ollama_intermediary_maintenance_authorization: "Bearer PASTE_THE_DIFFERENT_MAINTENANCE_TOKEN_HERE"
 ```
 
-The word `Bearer` is required. If the intermediary token is blank, omit the `Authorization` header below. Home Assistant secrets prevent accidental publication but are not encrypted at rest.
+The word `Bearer` is required. The first value is `OBSERVABILITY_TOKEN`; if that intermediary token is blank, omit the `Authorization` header from the REST snapshot below. The second value is the required, separate `MAINTENANCE_TOKEN`. Never reuse the read-only observability credential for administrative control. Home Assistant secrets prevent accidental publication but are not encrypted at rest.
 
 ## 2. Add the REST entities
 
@@ -39,6 +40,23 @@ rest:
         value_template: >-
           {{ (value_json.get('scheduler') or {}).get('state')
              | default('unknown', true) }}
+
+      - name: "Ollama Maintenance State"
+        unique_id: ollama_maintenance_state
+        icon: mdi:pause-circle-outline
+        value_template: >-
+          {{ (value_json.get('maintenance') or {}).get('state')
+             | default('unknown', true) }}
+
+      - name: "Ollama Maintenance Remaining"
+        unique_id: ollama_maintenance_remaining
+        icon: mdi:timer-pause-outline
+        device_class: duration
+        unit_of_measurement: "s"
+        state_class: measurement
+        value_template: >-
+          {{ (((value_json.get('maintenance') or {}).get('remaining_seconds'))
+              or 0) | float(0) | round(1) }}
 
       - name: "Ollama Backend State"
         unique_id: ollama_backend_state
@@ -158,9 +176,63 @@ rest:
         value_template: >-
           {{ ((value_json.get('scheduler') or {}).get('upstream_draining', false))
              | bool(false) }}
+
+      - name: "Ollama Maintenance Paused"
+        unique_id: ollama_maintenance_paused
+        icon: mdi:pause-octagon
+        value_template: >-
+          {{ ((value_json.get('maintenance') or {}).get('paused', false))
+             | bool(false) }}
+
+      - name: "Ollama GPU Released For Maintenance"
+        unique_id: ollama_gpu_released_for_maintenance
+        icon: mdi:memory-arrow-down
+        value_template: >-
+          {{ ((value_json.get('maintenance') or {}).get('gpu_released', false))
+             | bool(false) }}
 ```
 
-## 3. Validate and restart Home Assistant
+## 3. Add pause/resume actions
+
+Add this separate top-level block to `/config/configuration.yaml`, replacing `UBUNTU_IP`. If `rest_command:` already exists, add these three entries beneath it instead of creating a second key.
+
+```yaml
+rest_command:
+  ollama_intermediary_pause:
+    url: "http://UBUNTU_IP:11435/_intermediary/v1/maintenance/pause"
+    method: POST
+    headers:
+      Authorization: !secret ollama_intermediary_maintenance_authorization
+    content_type: "application/json"
+    payload: '{"reason":"Home Assistant manual pause"}'
+    timeout: 30
+
+  ollama_intermediary_pause_4h:
+    url: "http://UBUNTU_IP:11435/_intermediary/v1/maintenance/pause"
+    method: POST
+    headers:
+      Authorization: !secret ollama_intermediary_maintenance_authorization
+    content_type: "application/json"
+    payload: '{"duration":"4h","reason":"Home Assistant timed pause"}'
+    timeout: 30
+
+  ollama_intermediary_resume:
+    url: "http://UBUNTU_IP:11435/_intermediary/v1/maintenance/resume"
+    method: POST
+    headers:
+      Authorization: !secret ollama_intermediary_maintenance_authorization
+    content_type: "application/json"
+    payload: '{}'
+    timeout: 30
+```
+
+The pause command returns HTTP 202 after the pause record is safely stored; draining and unload continue in the background. The timed interval begins only after the intermediary confirms GPU release. A manual pause has no expiry; use it when the external task's duration is uncertain. New inference receives HTTP 503 while paused, so Home Assistant/Frigate may record unavailable descriptions during that period instead of accumulating an in-memory backlog.
+
+Before starting the other GPU task, require `sensor.ollama_maintenance_state` to read `paused` and `binary_sensor.ollama_gpu_released_for_maintenance` to be `on`. An `error` state or a released sensor that remains off means the unload was not confirmed.
+
+Keep these REST commands and their dashboard buttons limited to trusted Home Assistant administrators. The button confirmation prevents an accidental tap, but it is not an authorization boundary; Home Assistant holds the administrative token and sends it on the user's behalf.
+
+## 4. Validate and restart Home Assistant
 
 In Home Assistant, use **Settings → Tools → YAML → Check configuration**, then restart Home Assistant. For Home Assistant OS CLI:
 
@@ -183,7 +255,7 @@ curl -H "Authorization: Bearer PASTE_THE_TOKEN_HERE" \
   http://UBUNTU_IP:11435/_intermediary/v1/status
 ```
 
-## 4. Add the mobile dashboard card
+## 5. Add the mobile dashboard card
 
 Edit a Home Assistant dashboard, add a **Manual** card, and paste:
 
@@ -224,6 +296,12 @@ cards:
       - type: tile
         entity: sensor.ollama_oldest_queue_wait
         name: Oldest wait
+      - type: tile
+        entity: sensor.ollama_maintenance_state
+        name: Maintenance
+      - type: tile
+        entity: binary_sensor.ollama_gpu_released_for_maintenance
+        name: GPU released
 
   - type: entities
     title: Current inference
@@ -235,11 +313,42 @@ cards:
       - sensor.ollama_active_request_runtime
       - binary_sensor.ollama_upstream_draining
 
+  - type: horizontal-stack
+    cards:
+      - type: button
+        name: Pause manually
+        icon: mdi:pause
+        tap_action:
+          action: perform-action
+          perform_action: rest_command.ollama_intermediary_pause
+          confirmation:
+            text: "Pause Ollama scheduling and release the GPU?"
+      - type: button
+        name: Pause 4 hours
+        icon: mdi:timer-pause
+        tap_action:
+          action: perform-action
+          perform_action: rest_command.ollama_intermediary_pause_4h
+          confirmation:
+            text: "Pause Ollama scheduling for four hours after GPU release?"
+      - type: button
+        name: Resume
+        icon: mdi:play
+        tap_action:
+          action: perform-action
+          perform_action: rest_command.ollama_intermediary_resume
+          confirmation:
+            text: "Allow Ollama inference requests again?"
+
   - type: entities
     title: Scheduler
     show_header_toggle: false
     entities:
       - sensor.ollama_intermediary_state
+      - sensor.ollama_maintenance_state
+      - sensor.ollama_maintenance_remaining
+      - binary_sensor.ollama_maintenance_paused
+      - binary_sensor.ollama_gpu_released_for_maintenance
       - sensor.ollama_backend_state
       - sensor.ollama_current_model
       - sensor.ollama_queued_requests
@@ -251,4 +360,4 @@ cards:
 
 Home Assistant may append `_2` to an entity ID if that ID already exists. Check the actual IDs under **Settings → Tools → States** and adjust the card if necessary.
 
-References: [RESTful integration](https://www.home-assistant.io/integrations/rest/), [secrets](https://www.home-assistant.io/docs/configuration/secrets/), [dashboard cards](https://www.home-assistant.io/dashboards/cards/), and [conditional cards](https://www.home-assistant.io/dashboards/conditional/).
+References: [RESTful integration](https://www.home-assistant.io/integrations/rest/), [RESTful Command](https://www.home-assistant.io/integrations/rest_command/), [secrets](https://www.home-assistant.io/docs/configuration/secrets/), [dashboard actions](https://www.home-assistant.io/dashboards/actions/), [dashboard cards](https://www.home-assistant.io/dashboards/cards/), and [conditional cards](https://www.home-assistant.io/dashboards/conditional/).

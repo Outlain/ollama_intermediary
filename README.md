@@ -139,9 +139,11 @@ Docker Compose loads `secrets.env` into the container. The YAML loader expands `
 ```dotenv
 OLLAMA_URL=http://192.0.2.10:11434
 FRIGATE_SOURCE=192.0.2.50/32
+OBSERVABILITY_TOKEN=
+MAINTENANCE_TOKEN=
 ```
 
-Only `OLLAMA_URL` is required. `FRIGATE_SOURCE` can remain blank until Frigate is connected, or when Frigate sends `X-Ollama-Client: frigate`. The supplied `scheduler.default_client: odysseus` setting means an unmatched source automatically receives the Odysseus policy; Odysseus's changing container IP never needs to be configured. `secrets.env` is ignored by Git and excluded from the Docker build context.
+`OLLAMA_URL` and a non-empty `MAINTENANCE_TOKEN` are required by the supplied configuration. Generate the maintenance token with `openssl rand -hex 32`; it authorizes state-changing administrative operations and must not be reused as `OBSERVABILITY_TOKEN`. `FRIGATE_SOURCE` can remain blank until Frigate is connected, or when Frigate sends `X-Ollama-Client: frigate`. The supplied `scheduler.default_client: odysseus` setting means an unmatched source automatically receives the Odysseus policy; Odysseus's changing container IP never needs to be configured. `secrets.env` is ignored by Git and excluded from the Docker build context.
 
 The `192.0.2.0/24` addresses above are documentation placeholders. Replace them with addresses valid for your deployment.
 
@@ -182,6 +184,81 @@ When `/status` reports `backend.state: recovery_required`:
 
 The recovery latch is intentionally not cleared by an HTTP health probe: `/api/tags` can succeed while ROCm still holds orphaned VRAM.
 
+## Planned maintenance pause
+
+Use maintenance pause when another application needs exclusive use of the GPU. It is safer and more informative than stopping the intermediary: callers receive a deliberate JSON HTTP 503 with code `maintenance_paused`, while the dashboard, status API, and pause state remain available.
+
+Pausing is a safe transition rather than an abrupt cancellation:
+
+1. New scheduled inference is rejected immediately with HTTP 503.
+2. Queued inference is failed with the same status instead of being retained for hours.
+3. If Ollama is already processing a request, the intermediary drains it to completion to avoid the ROCm cancellation/ghost-VRAM failure mode.
+4. The loaded model is explicitly unloaded, and `/api/ps` must confirm that it is gone before `gpu_released` becomes true.
+
+Model-management and other unsafe pass-through operations also receive the maintenance 503. Safe metadata reads such as `/api/tags`, `/api/ps`, `/api/show`, and `/v1/models` continue to work because they do not schedule GPU inference.
+
+The pause endpoint returns HTTP 202 as soon as the pause record is safely persisted. Drain and unload then continue in the background; accepting the command is not yet proof that the GPU is free.
+
+The simplest control surface is the **Pause mode** card at `http://<docker-host>:11435/debug`. Enter the separate maintenance token, choose **Manual** or a duration, and wait for the card to report both **Paused** and **GPU released: Yes**. The dashboard retains that credential only in the current browser tab's session storage.
+
+For a manual pause with no automatic expiry:
+
+```sh
+read -rsp 'Maintenance token: ' MAINTENANCE_TOKEN; printf '\n'
+curl -fsS -X POST http://127.0.0.1:11435/_intermediary/v1/maintenance/pause \
+  -H "Authorization: Bearer ${MAINTENANCE_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  --data '{"reason":"exclusive GPU task"}'
+```
+
+For a timed pause, include a duration string. The supplied maximum is seven days (`168h`):
+
+```sh
+curl -fsS -X POST http://127.0.0.1:11435/_intermediary/v1/maintenance/pause \
+  -H "Authorization: Bearer ${MAINTENANCE_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  --data '{"duration":"4h","reason":"exclusive GPU task"}'
+```
+
+The timed interval begins only after the active request has drained and model-unload confirmation has released the GPU. Use a manual pause for work whose end time is uncertain; a timed pause deliberately admits Ollama work again when it expires.
+
+Before starting the other GPU task, inspect `GET /_intermediary/v1/status` or `/debug` and require all of these conditions:
+
+```text
+maintenance.state = paused
+maintenance.gpu_released = true
+maintenance.unload_error = null
+```
+
+`gpu_released` specifically means Ollama's `/api/ps` reports no loaded models. For a workload that needs virtually all VRAM—especially after a prior ROCm failure—also run `sudo rocm-smi --showmeminfo vram --showpids` on the host before starting it; the container cannot certify driver-level ghost allocations.
+
+Resume manually when the exclusive task is finished:
+
+```sh
+curl -fsS -X POST http://127.0.0.1:11435/_intermediary/v1/maintenance/resume \
+  -H "Authorization: Bearer ${MAINTENANCE_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  --data '{}'
+unset MAINTENANCE_TOKEN
+```
+
+The pause record is stored in the Compose volume mounted at `/app/state`, so manual and timed pauses survive intermediary container restarts. `maintenance.max_pause` limits only timed pauses; a manual pause remains until resumed.
+
+Normally Ollama can remain running: after confirmed model unload it has no loaded model consuming a large VRAM allocation, and the paused intermediary prevents its clients from starting another inference request. If any application can bypass the intermediary, or the external workload requires absolute process-level isolation, stop only Ollama after `gpu_released` is true:
+
+```sh
+sudo systemctl stop ollama
+```
+
+Leave the intermediary running so clients receive the intentional 503 and operators retain status and control. Before resuming the intermediary, restart and verify Ollama:
+
+```sh
+sudo systemctl start ollama
+curl -fsS http://127.0.0.1:11434/api/tags >/dev/null
+```
+
+If `maintenance.state` is `error` or `gpu_released` is false, do not assume the GPU is free. Read `maintenance.unload_error`, check `ollama ps` and `rocm-smi`, and resolve the host-side condition first.
+
 ## Observability
 
 `GET /status` returns backend/circuit/recovery state, current model/group, active request, whether an abandoned request is being drained, per-client and per-model queue depths/oldest ages, last activity, lease remaining, switch count, and shutdown admission state.
@@ -194,7 +271,7 @@ The versioned read-only API is:
 - `GET /_intermediary/v1/history?limit=50` for bounded in-memory history
 - `GET /_intermediary/v1/events` for live Server-Sent Events
 
-Set `OBSERVABILITY_TOKEN` in `secrets.env` to require a bearer token for these three data endpoints. The static dashboard will request it and retain it only in the browser tab's session storage. A blank token is convenient on a trusted LAN but provides no API authentication. The dashboard and API cannot cancel work or perform model/GPU management.
+Set `OBSERVABILITY_TOKEN` in `secrets.env` to require a bearer token for these three data endpoints. The static dashboard will request it and retain it only in the browser tab's session storage. A blank token is convenient on a trusted LAN but provides no read-API authentication. Pause and resume are separate administrative operations and always require the non-empty `MAINTENANCE_TOKEN`; an observability token cannot mutate state.
 
 Home Assistant can turn the shared snapshot into native sensors with one five-second REST poll. See [Home Assistant setup](docs/HOME_ASSISTANT.md).
 
@@ -212,6 +289,8 @@ Home Assistant can turn the shared snapshot into native sensors with one five-se
 - `proxy_active_disconnects_total` and `proxy_upstream_drain_duration_seconds`
 - `proxy_model_unload_duration_seconds`
 - `proxy_gpu_recovery_required` and `proxy_gpu_recovery_required_total`
+- `proxy_maintenance_paused`, `proxy_maintenance_gpu_released`, and `proxy_maintenance_remaining_seconds`
+- `proxy_maintenance_pauses_total`, `proxy_maintenance_resumes_total`, and `proxy_maintenance_gpu_releases_total`
 - `proxy_upstream_draining`
 - `proxy_circuit_breaker_opens_total`
 
@@ -287,4 +366,4 @@ npm test
 npm run test:coverage
 ```
 
-The tests use Node's built-in test runner and a real HTTP mock Ollama. They cover FIFO, priority, aging/max-wait fairness, affinity batching, lease behavior, bounded batches, TTL, overflow, queued cancellation, active and streaming disconnect draining, unload-before-switch confirmation, ROCm OOM recovery latching, streaming latency, single upstream generation concurrency, circuit breaking, metadata bypass, exclusive model management, mappings, unknown models, keep-alive normalization, status/metrics, graceful shutdown, the `O O O F F` scenario, and post-restart model reconciliation.
+The tests use Node's built-in test runner and a real HTTP mock Ollama. They cover FIFO, priority, aging/max-wait fairness, affinity batching, lease behavior, bounded batches, TTL, overflow, queued cancellation, active and streaming disconnect draining, unload-before-switch confirmation, ROCm OOM recovery latching, maintenance admission/drain/unload/state restoration, streaming latency, single upstream generation concurrency, circuit breaking, metadata bypass, exclusive model management, mappings, unknown models, keep-alive normalization, status/metrics, graceful shutdown, the `O O O F F` scenario, and post-restart model reconciliation.

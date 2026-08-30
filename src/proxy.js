@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { once } from 'node:events';
 import { BackendClient, BackendState, OperationGate } from './backend.js';
-import { Classifier, classifyEndpoint, isStreaming } from './classifier.js';
+import { Classifier, classifyEndpoint, isSafeMetadataEndpoint, isStreaming } from './classifier.js';
 import { copyRequestHeaders, copyResponseHeaders, readBody, sendJson, streamBody } from './http-utils.js';
 import { Logger, requestId } from './logger.js';
 import { Metrics } from './metrics.js';
@@ -10,6 +10,7 @@ import {
   summarizeRequest,
 } from './observability.js';
 import { createJob, Scheduler } from './scheduler.js';
+import { MaintenanceState } from './maintenance.js';
 import { parseListen } from './config.js';
 import { DASHBOARD_CSS, DASHBOARD_HTML, DASHBOARD_JS } from './dashboard.js';
 
@@ -71,6 +72,7 @@ export class ProxyService {
       onChange: () => {
         this.scheduler.wake();
         this.recordBackendTransition();
+        if (this.maintenance?.paused) this.kickMaintenanceQuiescence();
       },
       clock: this.clock,
     });
@@ -83,6 +85,15 @@ export class ProxyService {
     this.workerPromise = null;
     this.expiryTimer = null;
     this.eventStreams = new Set();
+    this.maintenanceTask = null;
+    this.maintenanceRetryTimer = null;
+    this.maintenance = options.maintenance ?? new MaintenanceState(config, {
+      clock: this.clock,
+      logger: this.logger,
+      onChange: () => this.scheduler.wake(),
+      onAutoResume: () => this.resumeMaintenance('timer'),
+    });
+    if (this.maintenance.paused) this.scheduler.pause();
   }
 
   async start({ listen = true } = {}) {
@@ -92,6 +103,10 @@ export class ProxyService {
     this.workerPromise = this.dispatchLoop();
     this.expiryTimer = setInterval(() => this.scheduler.expire(), Math.min(1_000, this.config.ollama.healthIntervalMs));
     this.expiryTimer.unref?.();
+    if (this.maintenance.paused) {
+      this.observability.record('maintenance_pause_restored', this.maintenance.status());
+      this.kickMaintenanceQuiescence();
+    }
     if (listen) {
       await this.startServer(this.config.server.listen, null);
       for (const listener of this.config.server.dedicated_listeners) {
@@ -141,24 +156,34 @@ export class ProxyService {
     if (request.method === 'GET' && url.pathname === '/_intermediary/ui/dashboard.js') {
       return this.handleDashboardAsset(response, id, 'text/javascript; charset=utf-8', DASHBOARD_JS);
     }
+    if (url.pathname.startsWith('/_intermediary/v1/maintenance/')) {
+      return this.handleMaintenanceControl(request, response, url, id);
+    }
     if (url.pathname.startsWith('/_intermediary/')) return this.handleObservability(request, response, url, id);
     if (request.method === 'GET' && url.pathname === this.config.server.status_path) return this.handleStatus(response, id);
     if (request.method === 'GET' && url.pathname === this.config.server.metrics_path) return this.handleMetrics(response);
     if (request.method === 'GET' && url.pathname === '/healthz') return sendJson(response, 200, { status: 'ok' }, id);
     if (request.method === 'GET' && url.pathname === '/readyz') {
-      const ready = this.backend.canDispatch();
-      return sendJson(response, ready ? 200 : 503, { status: ready ? 'ready' : 'not_ready', backend: this.backend.status() }, id);
+      const ready = !this.maintenance.paused && this.backend.canDispatch();
+      return sendJson(response, ready ? 200 : 503, {
+        status: ready ? 'ready' : 'not_ready',
+        backend: this.backend.status(),
+        maintenance: this.maintenance.status(),
+      }, id);
     }
 
     const endpointClass = classifyEndpoint(request.method, url.pathname);
     if (endpointClass === 'generation') return this.handleGeneration(request, response, url, id, forcedClient);
     if (endpointClass === 'management') return this.handleManagement(request, response, url, id);
+    if (this.maintenance.paused && !isSafeMetadataEndpoint(request.method, url.pathname)) {
+      return this.sendMaintenancePaused(response, id);
+    }
     return this.handlePassthrough(request, response, url, id);
   }
 
   handleStatus(response, id) {
     const scheduler = this.scheduler.status();
-    sendJson(response, 200, { backend: this.backend.status(), ...scheduler }, id);
+    sendJson(response, 200, { backend: this.backend.status(), maintenance: this.maintenance.status(), ...scheduler }, id);
   }
 
   recordBackendTransition() {
@@ -210,9 +235,11 @@ export class ProxyService {
       last_error: backendRaw.last_error ? 'Ollama backend error; inspect intermediary logs for details.' : null,
     };
     const scheduler = this.scheduler.details(now);
-    const ready = scheduler.accepting && this.backend.canDispatch(now);
+    const maintenance = this.maintenance.status(now);
+    const ready = !maintenance.paused && scheduler.accepting && this.backend.canDispatch(now);
     let schedulerState = 'idle';
     if (!scheduler.accepting) schedulerState = 'shutting_down';
+    if (maintenance.paused) schedulerState = `maintenance_${maintenance.state}`;
     else if (backend.recovery_required) schedulerState = 'recovery_required';
     else if (!backend.reachable || backend.circuit_open) schedulerState = 'unavailable';
     else if (scheduler.upstream_draining) schedulerState = 'draining';
@@ -230,6 +257,7 @@ export class ProxyService {
         event_clients: this.observability.listeners.size,
       },
       backend,
+      maintenance,
       scheduler: {
         state: schedulerState,
         current_model: scheduler.current_model,
@@ -312,6 +340,221 @@ export class ProxyService {
     return sendJson(response, 404, { error: 'observability endpoint not found', code: 'not_found' }, id);
   }
 
+  async handleMaintenanceControl(request, response, url, id) {
+    response.setHeader('cache-control', 'no-store');
+    response.setHeader('x-content-type-options', 'nosniff');
+    if (!this.config.maintenance.enabled) {
+      return sendJson(response, 404, { error: 'maintenance controls are disabled', code: 'not_found' }, id);
+    }
+    if (!this.config.maintenance.auth_token) {
+      return sendJson(response, 503, {
+        error: 'set MAINTENANCE_TOKEN before using state-changing maintenance controls',
+        code: 'maintenance_auth_not_configured',
+      }, id);
+    }
+    if (!authorized(request, this.config.maintenance.auth_token)) {
+      response.setHeader('www-authenticate', 'Bearer realm="ollama-intermediary-maintenance"');
+      return sendJson(response, 401, { error: 'maintenance token is required', code: 'unauthorized' }, id);
+    }
+    if (request.method !== 'POST') {
+      response.setHeader('allow', 'POST');
+      return sendJson(response, 405, { error: 'maintenance controls only support POST', code: 'method_not_allowed' }, id);
+    }
+
+    if (url.pathname === '/_intermediary/v1/maintenance/pause') {
+      let body;
+      try {
+        const raw = await readBody(request, 4_096);
+        body = raw.length ? parseJson(raw) : {};
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+          const error = new Error('maintenance pause body must be a JSON object');
+          error.statusCode = 400;
+          throw error;
+        }
+        const status = await this.pauseMaintenance({ duration: body.duration, reason: body.reason }, 'api');
+        return sendJson(response, 202, { maintenance: status }, id);
+      } catch (error) {
+        return sendJson(response, error.statusCode ?? 500, {
+          error: error.statusCode ? error.message : 'maintenance pause could not be persisted',
+          code: error.statusCode ? 'invalid_maintenance_request' : 'maintenance_state_error',
+        }, id);
+      }
+    }
+    if (url.pathname === '/_intermediary/v1/maintenance/resume') {
+      try {
+        const status = await this.resumeMaintenance('api');
+        return sendJson(response, 200, { maintenance: status }, id);
+      } catch (error) {
+        return sendJson(response, 500, {
+          error: 'maintenance resume could not be persisted; inference remains paused',
+          code: 'maintenance_state_error',
+        }, id);
+      }
+    }
+    return sendJson(response, 404, { error: 'maintenance endpoint not found', code: 'not_found' }, id);
+  }
+
+  sendMaintenancePaused(response, id) {
+    const maintenance = this.maintenance.status();
+    if (maintenance.remaining_seconds !== null) {
+      response.setHeader('retry-after', String(Math.max(1, Math.ceil(maintenance.remaining_seconds))));
+    }
+    return sendJson(response, 503, {
+      error: 'Ollama inference is paused for exclusive GPU maintenance',
+      code: 'maintenance_paused',
+      state: maintenance.state,
+      reason: maintenance.reason,
+      resume_at: maintenance.resume_at,
+      remaining_seconds: maintenance.remaining_seconds,
+      gpu_released: maintenance.gpu_released,
+    }, id);
+  }
+
+  async pauseMaintenance(options = {}, source = 'api') {
+    let admission = { changed: false, queuedDropped: 0 };
+    const result = await this.maintenance.begin(options, {
+      onPersisted: () => { admission = this.scheduler.pause(); },
+    });
+    this.metrics.increment('proxy_maintenance_pauses_total', { source });
+    this.logger.warn('maintenance pause requested; inference admission stopped', {
+      source,
+      reason: result.status.reason,
+      duration_seconds: result.status.remaining_seconds,
+      queued_requests_failed: admission.queuedDropped,
+      active_request_draining: Boolean(this.scheduler.active),
+    });
+    this.observability.record('maintenance_pause_requested', {
+      source,
+      reason: result.status.reason,
+      timed: options.duration !== undefined && options.duration !== null && options.duration !== '',
+      queued_requests_failed: admission.queuedDropped,
+      active_request_draining: Boolean(this.scheduler.active),
+    });
+    this.kickMaintenanceQuiescence();
+    return result.status;
+  }
+
+  async resumeMaintenance(source = 'manual') {
+    const previous = this.maintenance.status();
+    const result = await this.maintenance.resume(source);
+    this.clearMaintenanceRetry();
+    this.scheduler.resume();
+    if (result.changed) {
+      this.metrics.increment('proxy_maintenance_resumes_total', { source });
+      this.logger.info('maintenance pause ended; inference admission resumed', { source });
+      this.observability.record('maintenance_resumed', {
+        source,
+        paused_seconds: previous.requested_at
+          ? Math.max(0, this.clock() - Date.parse(previous.requested_at)) / 1000
+          : null,
+      });
+    }
+    return result.status;
+  }
+
+  kickMaintenanceQuiescence() {
+    if (!this.running || !this.maintenance.paused || this.maintenanceTask) return;
+    const status = this.maintenance.status();
+    if (status.gpu_released && this.backend.loadedModels.length === 0) return;
+    const revision = this.maintenance.currentRevision;
+    const signal = this.maintenance.signal;
+    this.maintenanceTask = this.runMaintenanceQuiescence(revision, signal)
+      .catch((error) => {
+        if (!signal?.aborted) this.logger.error('maintenance GPU release task failed', { error: error.message });
+      })
+      .finally(() => {
+        this.maintenanceTask = null;
+        const latest = this.maintenance.status();
+        if (this.running && latest.paused && !latest.gpu_released) this.scheduleMaintenanceRetry();
+      });
+  }
+
+  async runMaintenanceQuiescence(revision, signal) {
+    let release;
+    try {
+      await this.maintenance.markReleasing(revision);
+      if (signal?.aborted || !this.maintenance.paused || revision !== this.maintenance.currentRevision) return;
+      const active = this.scheduler.active;
+      if (active) {
+        this.logger.warn('maintenance pause is waiting for the active Ollama request to drain', {
+          request_id: active.id,
+          detected_client: active.client,
+          requested_model: active.model,
+        });
+        this.observability.record('maintenance_waiting_for_active_request', this.scheduler.eventFields(active));
+        while (this.scheduler.active === active && !signal?.aborted) {
+          await this.scheduler.waitForChange(100, signal);
+        }
+      }
+      if (signal?.aborted || !this.maintenance.paused || revision !== this.maintenance.currentRevision) return;
+
+      release = await this.gate.acquire('maintenance', signal);
+      if (signal?.aborted || !this.maintenance.paused || revision !== this.maintenance.currentRevision) return;
+      this.observability.record('maintenance_gpu_release_started', {});
+      const models = [...new Set(await this.backendClient.loadedModels(
+        signal,
+        this.config.gpu_safety.unloadTimeoutMs,
+      ))];
+      for (const model of models) {
+        if (signal?.aborted) return;
+        this.logger.info('unloading Ollama model for maintenance pause', { model });
+        this.observability.record('maintenance_model_unload_started', { model: safeDisplay(model) });
+        await this.backendClient.unloadModel(model, {
+          signal,
+          timeoutMs: this.config.gpu_safety.unloadTimeoutMs,
+        });
+        this.observability.record('maintenance_model_unloaded', { model: safeDisplay(model) });
+      }
+      const remaining = await this.backendClient.loadedModels(signal, this.config.gpu_safety.unloadTimeoutMs);
+      if (remaining.length) {
+        const error = new Error(`Ollama still reports ${remaining.length} loaded model(s) after maintenance unload`);
+        error.code = 'maintenance_unload_unconfirmed';
+        throw error;
+      }
+      this.backend.loadedModels = [];
+      this.scheduler.reconcile(null);
+      const result = await this.maintenance.markReleased(revision);
+      if (!result.changed) return;
+      this.metrics.increment('proxy_maintenance_gpu_releases_total');
+      this.logger.info('maintenance pause is quiescent; Ollama reports no loaded models', {
+        resume_at: result.status.resume_at,
+      });
+      this.observability.record('maintenance_gpu_released', {
+        models_unloaded: models.length,
+        resume_at: result.status.resume_at,
+      });
+    } catch (error) {
+      if (signal?.aborted || !this.maintenance.paused || revision !== this.maintenance.currentRevision) return;
+      try {
+        await this.maintenance.markError(revision, error);
+      } catch (stateError) {
+        this.maintenance.failClosed(`cannot persist maintenance failure: ${stateError.message}`);
+      }
+      this.logger.error('maintenance pause could not confirm GPU release; inference remains blocked', {
+        error: error.message,
+      });
+      this.observability.record('maintenance_gpu_release_failed', {
+        reason: 'model_unload_unconfirmed',
+      });
+    } finally {
+      release?.();
+    }
+  }
+
+  scheduleMaintenanceRetry() {
+    if (this.maintenanceRetryTimer || !this.running) return;
+    this.maintenanceRetryTimer = setTimeout(() => {
+      this.maintenanceRetryTimer = null;
+      this.kickMaintenanceQuiescence();
+    }, this.config.ollama.healthIntervalMs);
+    this.maintenanceRetryTimer.unref?.();
+  }
+
+  clearMaintenanceRetry() {
+    if (this.maintenanceRetryTimer) clearTimeout(this.maintenanceRetryTimer);
+    this.maintenanceRetryTimer = null;
+  }
+
   handleEventStream(request, response, id) {
     let closed = false;
     let heartbeat;
@@ -388,12 +631,14 @@ export class ProxyService {
       currentModel: status.current_model,
       activeRequest: details.active_request,
       loadedModels: backend.loaded_models,
+      maintenance: this.maintenance.status(now),
     });
     response.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8', 'content-length': Buffer.byteLength(body) });
     response.end(body);
   }
 
   async handleGeneration(request, response, url, id, forcedClient) {
+    if (this.maintenance.paused) return this.sendMaintenancePaused(response, id);
     if (!this.scheduler.accepting) return sendJson(response, 503, { error: 'proxy is shutting down', code: 'shutting_down' }, id);
     if (this.backend.recoveryRequired) {
       return sendJson(response, 503, {
@@ -585,6 +830,7 @@ export class ProxyService {
   }
 
   async handleManagement(request, response, url, id) {
+    if (this.maintenance.paused) return this.sendMaintenancePaused(response, id);
     if (!this.config.model_management.enabled) {
       return sendJson(response, 403, { error: 'model-management endpoints are disabled', code: 'management_disabled' }, id);
     }
@@ -597,6 +843,10 @@ export class ProxyService {
     } catch {
       return;
     }
+    if (this.maintenance.paused) {
+      release();
+      return this.sendMaintenancePaused(response, id);
+    }
     response.removeListener('close', abort);
     return this.handlePassthrough(request, response, url, id, release);
   }
@@ -608,7 +858,8 @@ export class ProxyService {
         await this.scheduler.waitForChange(Math.min(1_000, this.config.ollama.healthIntervalMs), signal);
         continue;
       }
-      if (this.gate.managementPending || this.gate.managementActive) {
+      if (this.gate.managementPending || this.gate.managementActive
+        || this.gate.maintenancePending || this.gate.maintenanceActive) {
         await this.scheduler.waitForChange(100, signal);
         continue;
       }
@@ -765,6 +1016,8 @@ export class ProxyService {
     this.running = false;
     this.scheduler.stop();
     this.backend.stop();
+    this.maintenance.stop();
+    this.clearMaintenanceRetry();
     for (const close of [...this.eventStreams]) close();
     if (this.expiryTimer) clearInterval(this.expiryTimer);
     const closes = this.servers.map(({ server }) => once(server, 'close').catch(() => {}));

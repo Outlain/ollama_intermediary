@@ -119,6 +119,26 @@ test('queued disconnect cancels and removes work', async () => {
   assert.equal(scheduler.jobs.length, 0);
 });
 
+test('maintenance pause fails queued work and blocks admission until resume', async () => {
+  const { scheduler, add } = harness();
+  const queued = add('O1', 'odysseus', 'od-model');
+  const paused = scheduler.pause();
+  assert.equal(paused.queuedDropped, 1);
+  assert.equal((await queued.result).code, 'maintenance_paused');
+  assert.equal(scheduler.status().accepting, false);
+  assert.equal(scheduler.take().job, null);
+
+  const controller = new AbortController();
+  const rejected = createJob({
+    id: 'O2', client: 'odysseus', model: 'od-model', pathname: '/api/chat',
+    streaming: true, sequence: 2, signal: controller.signal, enqueuedAt: 0,
+  });
+  assert.equal(scheduler.enqueue(rejected).code, 'maintenance_paused');
+  scheduler.resume();
+  assert.equal(scheduler.status().accepting, true);
+  assert.equal(scheduler.enqueue(rejected).accepted, true);
+});
+
 test('model and header client mappings use the documented precedence', () => {
   const config = testConfig();
   const classifier = new Classifier(config);

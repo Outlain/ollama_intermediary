@@ -329,8 +329,8 @@ export class OperationGate {
 
   dispatch() {
     if (this.active || !this.waiters.length) return;
-    const managementIndex = this.waiters.findIndex((waiter) => waiter.kind === 'management');
-    const index = managementIndex >= 0 ? managementIndex : 0;
+    const exclusiveIndex = this.waiters.findIndex((waiter) => waiter.kind === 'maintenance' || waiter.kind === 'management');
+    const index = exclusiveIndex >= 0 ? exclusiveIndex : 0;
     const [waiter] = this.waiters.splice(index, 1);
     waiter.signal?.removeEventListener('abort', waiter.abort);
     this.active = true;
@@ -353,5 +353,13 @@ export class OperationGate {
 
   get managementActive() {
     return this.activeKind === 'management';
+  }
+
+  get maintenancePending() {
+    return this.waiters.some((waiter) => waiter.kind === 'maintenance');
+  }
+
+  get maintenanceActive() {
+    return this.activeKind === 'maintenance';
   }
 }

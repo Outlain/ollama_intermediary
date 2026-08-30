@@ -39,6 +39,7 @@ export class Scheduler {
     this.batchCount = 0;
     this.switches = 0;
     this.accepting = true;
+    this.paused = false;
     this.waiters = new Set();
   }
 
@@ -50,6 +51,7 @@ export class Scheduler {
 
   enqueue(job) {
     if (!this.accepting) return { accepted: false, status: 503, code: 'shutting_down', message: 'proxy is shutting down' };
+    if (this.paused) return { accepted: false, status: 503, code: 'maintenance_paused', message: 'inference is paused for GPU maintenance' };
     const clientPolicy = this.config.clients[job.client];
     let sameClient = this.jobs.filter((item) => item.client === job.client && item.state === 'queued');
 
@@ -168,7 +170,7 @@ export class Scheduler {
   }
 
   take(now = this.clock()) {
-    if (this.active || !this.accepting) return { job: null, delayMs: null };
+    if (this.active || !this.accepting || this.paused) return { job: null, delayMs: null };
     this.expire(now);
     const candidates = this.candidates();
     if (!candidates.length) return { job: null, delayMs: null };
@@ -309,7 +311,8 @@ export class Scheduler {
       last_activity: this.lastActivity ? new Date(this.lastActivity).toISOString() : null,
       model_lease_remaining: Math.max(0, this.leaseUntil - now) / 1000,
       model_switches: this.switches,
-      accepting: this.accepting,
+      accepting: this.accepting && !this.paused,
+      paused: this.paused,
     };
   }
 
@@ -389,6 +392,22 @@ export class Scheduler {
     this.accepting = false;
     for (const job of [...this.jobs]) this.drop(job, 503, 'shutting_down', 'proxy is shutting down');
     this.wake();
+  }
+
+  pause() {
+    const changed = !this.paused;
+    this.paused = true;
+    const queued = this.jobs.filter((job) => job.state === 'queued').length;
+    this.failQueued(503, 'maintenance_paused', 'inference is paused for GPU maintenance');
+    this.wake();
+    return { changed, queuedDropped: queued };
+  }
+
+  resume() {
+    const changed = this.paused;
+    this.paused = false;
+    this.wake();
+    return changed;
   }
 
   wake() {

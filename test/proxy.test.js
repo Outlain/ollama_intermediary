@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import { ProxyService } from '../src/proxy.js';
 import { MockOllama, requestJson, SilentLogger, testConfig, waitFor } from './helpers.js';
@@ -98,6 +101,92 @@ test('model management runs exclusively at the next inference boundary', async (
   await Promise.all(responses.map((response) => response.text()));
   assert.ok(mock.events.indexOf('/api/pull') > mock.events.indexOf('O1'));
   assert.ok(mock.events.indexOf('/api/pull') < mock.events.indexOf('O2'));
+});
+
+test('maintenance pause drains active work, fails queues, unloads models, and resumes safely', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ollama-intermediary-proxy-pause-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const { mock, service, proxyUrl } = await setup(t, {
+    models: { 'od-model': { idle_hold: '0ms' }, 'f-model': { idle_hold: '0ms' } },
+    maintenance: {
+      enabled: true,
+      auth_token: 'maintenance-secret',
+      max_pause: '2h',
+      state_path: path.join(directory, 'maintenance.json'),
+    },
+  });
+
+  const active = requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'active-before-pause', delay_ms: 160 });
+  await waitFor(() => service.scheduler.active?.model === 'od-model');
+  const queued = requestJson(`${proxyUrl}/api/generate`, { model: 'f-model', id: 'queued-before-pause' });
+  await waitFor(() => service.scheduler.status().queues.frigate === 1);
+
+  assert.equal((await fetch(`${proxyUrl}/_intermediary/v1/maintenance/pause`, { method: 'POST' })).status, 401);
+  const invalidPause = await fetch(`${proxyUrl}/_intermediary/v1/maintenance/pause`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer maintenance-secret', 'content-type': 'application/json' },
+    body: JSON.stringify({ duration: '0s' }),
+  });
+  assert.equal(invalidPause.status, 400);
+  assert.equal(service.scheduler.status().queues.frigate, 1);
+  assert.equal(service.maintenance.status().state, 'running');
+
+  const persist = service.maintenance.persist.bind(service.maintenance);
+  service.maintenance.persist = async () => { throw new Error('mock state volume failure'); };
+  const failedPause = await fetch(`${proxyUrl}/_intermediary/v1/maintenance/pause`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer maintenance-secret', 'content-type': 'application/json' },
+    body: JSON.stringify({ reason: 'must not mutate admission' }),
+  });
+  service.maintenance.persist = persist;
+  assert.equal(failedPause.status, 500);
+  assert.equal(service.scheduler.status().queues.frigate, 1);
+  assert.equal(service.maintenance.status().state, 'running');
+
+  const pause = await fetch(`${proxyUrl}/_intermediary/v1/maintenance/pause`, {
+    method: 'POST',
+    headers: { authorization: 'Bearer maintenance-secret', 'content-type': 'application/json' },
+    body: JSON.stringify({ duration: '1h', reason: 'exclusive renderer' }),
+  });
+  const pauseBody = await pause.json();
+  assert.equal(pause.status, 202);
+  assert.equal(pauseBody.maintenance.state, 'pausing');
+  assert.equal(pauseBody.maintenance.gpu_released, false);
+
+  const queuedResponse = await queued;
+  assert.equal(queuedResponse.status, 503);
+  assert.equal((await queuedResponse.json()).code, 'maintenance_paused');
+  const rejected = await requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'rejected-during-pause' });
+  assert.equal(rejected.status, 503);
+  assert.equal((await rejected.json()).code, 'maintenance_paused');
+  assert.equal(mock.order.includes('rejected-during-pause'), false);
+
+  assert.equal((await fetch(`${proxyUrl}/api/tags`)).status, 200);
+  assert.equal((await fetch(`${proxyUrl}/api/pull`, { method: 'POST', body: '{}' })).status, 503);
+  assert.equal((await fetch(`${proxyUrl}/api/future-gpu-endpoint`, { method: 'POST', body: '{}' })).status, 503);
+
+  await (await active).text();
+  await waitFor(() => service.maintenance.status().state === 'paused');
+  const maintenance = service.maintenance.status();
+  assert.equal(maintenance.gpu_released, true);
+  assert.equal(mock.loadedModel, null);
+  assert.ok(maintenance.resume_at);
+  assert.equal((await fetch(`${proxyUrl}/readyz`)).status, 503);
+
+  const stillPaused = await requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'retry-later' });
+  assert.equal(stillPaused.status, 503);
+  assert.ok(Number(stillPaused.headers.get('retry-after')) > 0);
+  await stillPaused.text();
+
+  assert.equal((await fetch(`${proxyUrl}/_intermediary/v1/maintenance/resume`, { method: 'POST' })).status, 401);
+  const resume = await fetch(`${proxyUrl}/_intermediary/v1/maintenance/resume`, {
+    method: 'POST', headers: { authorization: 'Bearer maintenance-secret' },
+  });
+  assert.equal(resume.status, 200);
+  assert.equal((await resume.json()).maintenance.state, 'running');
+  const after = await requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'after-maintenance' });
+  assert.equal(after.status, 200);
+  await after.text();
 });
 
 test('queued HTTP client disconnect is removed before dispatch', async (t) => {
@@ -229,6 +318,8 @@ test('status and Prometheus endpoints expose scheduler state', async (t) => {
   assert.match(metrics, /proxy_backend_healthy 1/);
   assert.match(metrics, /proxy_gpu_recovery_required 0/);
   assert.match(metrics, /proxy_upstream_draining 0/);
+  assert.match(metrics, /proxy_maintenance_paused 0/);
+  assert.match(metrics, /proxy_maintenance_gpu_released 0/);
   assert.equal(service.scheduler.active, null);
 });
 

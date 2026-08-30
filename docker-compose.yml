@@ -5,6 +5,8 @@ services:
     container_name: ollama-scheduler
     restart: unless-stopped
     init: true
+    # Slightly longer than server.shutdown_grace so Node can finish cleanup.
+    stop_grace_period: 3m
     ports:
       - "11435:11434"
     environment:
@@ -14,6 +16,7 @@ services:
       - ./secrets.env
     volumes:
       - ./config.yml:/app/config.yml:ro
+      - ollama-scheduler-state:/app/state
     read_only: true
     tmpfs:
       - /tmp:size=16m,mode=1777
@@ -25,3 +28,6 @@ services:
       resources:
         limits:
           memory: 256M
+
+volumes:
+  ollama-scheduler-state:

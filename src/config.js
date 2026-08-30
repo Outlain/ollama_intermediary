@@ -62,6 +62,12 @@ const DEFAULTS = {
     max_event_clients: 10,
     queue_items_limit: 50,
   },
+  maintenance: {
+    enabled: true,
+    auth_token: '',
+    max_pause: '168h',
+    state_path: '/app/state/maintenance.json',
+  },
   clients: {
     default: {
       priority: 50,
@@ -106,6 +112,7 @@ function durationFields(config) {
   config.circuit_breaker.failureWindowMs = parseDuration(config.circuit_breaker.failure_window, 'circuit_breaker.failure_window');
   config.circuit_breaker.openDurationMs = parseDuration(config.circuit_breaker.open_duration, 'circuit_breaker.open_duration');
   config.gpu_safety.unloadTimeoutMs = parseDuration(config.gpu_safety.unload_timeout, 'gpu_safety.unload_timeout');
+  config.maintenance.maxPauseMs = parseDuration(config.maintenance.max_pause, 'maintenance.max_pause');
 
   for (const [name, client] of Object.entries(config.clients)) {
     client.requestTtlMs = parseDuration(client.request_ttl, `clients.${name}.request_ttl`);
@@ -179,6 +186,14 @@ function validate(config) {
   if (config.observability.queue_items_limit > 500) throw new Error('observability.queue_items_limit cannot exceed 500');
   if (config.observability.recent_events > config.observability.history_limit) {
     throw new Error('observability.recent_events cannot exceed observability.history_limit');
+  }
+  if (typeof config.maintenance.enabled !== 'boolean') throw new Error('maintenance.enabled must be true or false');
+  if (typeof config.maintenance.auth_token !== 'string') throw new Error('maintenance.auth_token must be a string');
+  if (!Number.isFinite(config.maintenance.maxPauseMs) || config.maintenance.maxPauseMs <= 0) {
+    throw new Error('maintenance.max_pause must be greater than zero');
+  }
+  if (typeof config.maintenance.state_path !== 'string' || !config.maintenance.state_path.startsWith('/')) {
+    throw new Error('maintenance.state_path must be an absolute path');
   }
   new URL(config.ollama.url);
 }

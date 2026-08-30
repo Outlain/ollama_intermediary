@@ -15,7 +15,7 @@ export const DASHBOARD_HTML = String.raw`<!doctype html>
       <div class="brand">
         <span class="brand-mark" aria-hidden="true">OI</span>
         <div>
-          <p class="eyebrow">Read-only monitor</p>
+          <p class="eyebrow">Operations monitor</p>
           <h1>Ollama Intermediary</h1>
         </div>
       </div>
@@ -68,6 +68,67 @@ export const DASHBOARD_HTML = String.raw`<!doctype html>
     </section>
 
     <div class="dashboard-grid">
+      <section class="card maintenance-card" aria-labelledby="maintenance-heading">
+        <div class="card-header">
+          <div>
+            <p class="eyebrow">GPU reservation</p>
+            <h2 id="maintenance-heading">Pause mode</h2>
+          </div>
+          <span id="maintenance-state" class="tag tag-neutral" role="status" aria-live="polite">Unknown</span>
+        </div>
+
+        <div class="maintenance-layout">
+          <div class="maintenance-status-panel">
+            <h3 id="maintenance-title">Waiting for status…</h3>
+            <p id="maintenance-detail" class="muted">Pause mode can temporarily reserve the GPU for work outside Ollama.</p>
+            <dl class="maintenance-details">
+              <div><dt>Automatic resume</dt><dd id="maintenance-resume-at">—</dd></div>
+              <div><dt>Time remaining</dt><dd id="maintenance-countdown">—</dd></div>
+              <div><dt>GPU released</dt><dd id="maintenance-gpu-released">—</dd></div>
+              <div><dt>Paused at</dt><dd id="maintenance-paused-at">—</dd></div>
+            </dl>
+          </div>
+
+          <div class="maintenance-controls-panel">
+            <form id="maintenance-token-form" class="maintenance-token-form">
+              <label for="maintenance-token-input">Maintenance control token</label>
+              <div class="maintenance-token-row">
+                <input id="maintenance-token-input" name="maintenance-token" type="password" autocomplete="off" spellcheck="false" aria-describedby="maintenance-token-state" required>
+                <button id="maintenance-token-submit" class="control-button control-button-secondary" type="submit">Use token</button>
+                <button id="forget-maintenance-token" class="quiet-button" type="button" hidden>Forget</button>
+              </div>
+              <p id="maintenance-token-state" class="form-help">Enter the separate maintenance token to enable controls.</p>
+            </form>
+
+            <div class="maintenance-action-row">
+              <div class="duration-control">
+                <label for="pause-duration">Pause duration</label>
+                <select id="pause-duration" name="pause-duration" aria-describedby="maintenance-warning">
+                  <option value="" selected>Until manually resumed</option>
+                  <option value="30m">30 minutes</option>
+                  <option value="1h">1 hour</option>
+                  <option value="2h">2 hours</option>
+                  <option value="4h">4 hours</option>
+                  <option value="8h">8 hours</option>
+                </select>
+              </div>
+              <div class="maintenance-buttons">
+                <button id="pause-button" class="control-button control-button-warning" type="button" aria-describedby="maintenance-warning" disabled>Pause inference</button>
+                <button id="resume-button" class="control-button control-button-primary" type="button" disabled>Resume inference</button>
+              </div>
+            </div>
+
+            <p id="maintenance-control-availability" class="form-help">Checking whether maintenance controls are configured…</p>
+            <p id="maintenance-action-status" class="action-status" role="status" aria-live="polite"></p>
+          </div>
+        </div>
+
+        <div id="maintenance-warning" class="notice notice-warning maintenance-warning" role="note">
+          <strong>What happens when pause mode starts</strong>
+          <span>The active inference request is allowed to drain. Queued and newly submitted inference requests receive HTTP 503 until inference is resumed.</span>
+        </div>
+      </section>
+
       <section class="card current-card" aria-labelledby="current-heading">
         <div class="card-header">
           <div>
@@ -372,10 +433,11 @@ main { padding-block: 28px 16px; }
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.16);
 }
 .card-header { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 20px; }
-.current-card { grid-column: 1; }
-.queue-card { grid-column: 2; grid-row: 1; }
-.backend-card { grid-column: 1; }
-.events-card { grid-column: 2; grid-row: 2; }
+.maintenance-card { grid-column: 1 / -1; grid-row: 1; }
+.current-card { grid-column: 1; grid-row: 2; }
+.queue-card { grid-column: 2; grid-row: 2; }
+.backend-card { grid-column: 1; grid-row: 3; }
+.events-card { grid-column: 2; grid-row: 3; }
 
 .tag { padding: 5px 9px; color: var(--accent); border-color: rgba(100, 220, 165, 0.26); background: var(--accent-soft); font-size: 0.69rem; font-weight: 750; text-transform: uppercase; letter-spacing: 0.055em; }
 .tag-neutral { color: var(--muted); border-color: var(--border); background: rgba(145, 160, 180, 0.06); }
@@ -383,7 +445,61 @@ main { padding-block: 28px 16px; }
 .tag[data-client="odysseus"] { color: var(--purple); border-color: rgba(180, 155, 255, 0.28); background: var(--purple-soft); }
 .tag.tag-danger { color: var(--danger); border-color: rgba(255, 116, 125, 0.28); background: var(--danger-soft); }
 .tag.tag-good { color: var(--accent); border-color: rgba(100, 220, 165, 0.28); background: var(--accent-soft); }
+.tag.tag-warning { color: var(--warning); border-color: rgba(243, 186, 98, 0.3); background: var(--warning-soft); }
 .tag-row { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 13px; }
+
+.maintenance-layout { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(380px, 1.1fr); gap: 18px; }
+.maintenance-status-panel, .maintenance-controls-panel {
+  min-width: 0;
+  padding: 17px;
+  border: 1px solid var(--border-soft);
+  border-radius: 13px;
+  background: var(--surface-soft);
+}
+.maintenance-status-panel h3 { margin-bottom: 6px; font-size: 1.02rem; }
+.maintenance-status-panel > p { min-height: 2.5em; margin-bottom: 14px; font-size: 0.8rem; }
+.maintenance-details { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 0; }
+.maintenance-details div { min-width: 0; padding: 10px; border: 1px solid var(--border-soft); border-radius: 9px; background: rgba(8, 12, 19, 0.5); }
+.maintenance-details dt, .duration-control label, .maintenance-token-form label {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.maintenance-details dd { margin: 0; overflow-wrap: anywhere; font-size: 0.8rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.maintenance-token-form { padding-bottom: 14px; border-bottom: 1px solid var(--border-soft); }
+.maintenance-token-row { display: grid; grid-template-columns: minmax(120px, 1fr) auto auto; gap: 8px; }
+.maintenance-token-row input, .duration-control select {
+  min-width: 0;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--text);
+  background: var(--background);
+  outline: none;
+}
+.maintenance-token-row input:focus, .duration-control select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.maintenance-action-row { display: grid; grid-template-columns: minmax(190px, 1fr) auto; align-items: end; gap: 12px; padding-top: 14px; }
+.duration-control select { width: 100%; }
+.maintenance-buttons { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.control-button {
+  padding: 9px 13px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  font-size: 0.75rem;
+  font-weight: 750;
+}
+.control-button-primary { color: #04120c; border-color: var(--accent-strong); background: var(--accent); }
+.control-button-warning { color: #211404; border-color: #d89a3e; background: var(--warning); }
+.control-button-secondary { color: var(--text); background: var(--surface-raised); }
+.control-button:disabled, .maintenance-token-row input:disabled, .duration-control select:disabled { cursor: not-allowed; opacity: 0.5; }
+.action-status { min-height: 1.3em; margin: 8px 0 0; color: var(--muted); font-size: 0.72rem; }
+.action-status.is-error { color: var(--danger); }
+.action-status.is-success { color: var(--accent); }
+.maintenance-warning { margin: 16px 0 0; }
 
 .empty-state { display: flex; align-items: center; gap: 14px; min-height: 140px; padding: 24px; border: 1px dashed var(--border); border-radius: 14px; background: var(--surface-soft); }
 .empty-state p { margin: 4px 0 0; color: var(--muted); font-size: 0.84rem; }
@@ -472,10 +588,13 @@ main { padding-block: 28px 16px; }
 
 @media (max-width: 900px) {
   .dashboard-grid { grid-template-columns: 1fr; }
-  .current-card, .queue-card, .backend-card, .events-card { grid-column: 1; grid-row: auto; }
-  .queue-card { order: 2; }
-  .backend-card { order: 3; }
-  .events-card { order: 4; }
+  .maintenance-card, .current-card, .queue-card, .backend-card, .events-card { grid-column: 1; grid-row: auto; }
+  .maintenance-card { order: 1; }
+  .current-card { order: 2; }
+  .queue-card { order: 3; }
+  .backend-card { order: 4; }
+  .events-card { order: 5; }
+  .maintenance-layout { grid-template-columns: 1fr; }
   .metadata-strip { grid-template-columns: repeat(4, minmax(70px, 1fr)); }
 }
 
@@ -486,7 +605,7 @@ main { padding-block: 28px 16px; }
   .brand .eyebrow { display: none; }
   .brand-mark { width: 36px; height: 36px; border-radius: 10px; }
   .connection-badge { padding: 7px 9px; }
-  .quiet-button { display: none; }
+  .header-actions .quiet-button { display: none; }
   main { padding-top: 16px; }
   .health-banner { grid-template-columns: auto 1fr; padding: 18px; }
   .health-stats { grid-column: 1 / -1; width: 100%; padding-top: 14px; border-top: 1px solid var(--border-soft); justify-content: space-between; }
@@ -509,6 +628,11 @@ main { padding-block: 28px 16px; }
   .backend-details div:nth-child(3), .backend-details div:nth-child(5) { padding-left: 0; }
   .auth-panel { grid-template-columns: 1fr; gap: 18px; }
   .token-row { display: grid; }
+  .maintenance-token-row { grid-template-columns: 1fr auto; }
+  .maintenance-token-row input { grid-column: 1 / -1; }
+  .maintenance-action-row { grid-template-columns: 1fr; }
+  .maintenance-buttons { justify-content: stretch; }
+  .maintenance-buttons .control-button { flex: 1; }
   .site-footer { display: grid; gap: 7px; }
 }
 
@@ -527,14 +651,20 @@ export const DASHBOARD_JS = String.raw`(function () {
 
   var STATUS_URL = '/_intermediary/v1/status';
   var EVENTS_URL = '/_intermediary/v1/events';
+  var MAINTENANCE_PAUSE_URL = '/_intermediary/v1/maintenance/pause';
+  var MAINTENANCE_RESUME_URL = '/_intermediary/v1/maintenance/resume';
   var TOKEN_KEY = 'ollama-intermediary-observability-token';
+  var MAINTENANCE_TOKEN_KEY = 'ollama-intermediary-maintenance-token';
   var POLL_INTERVAL_MS = 2000;
   var STREAM_RETRY_MS = 10000;
 
   var snapshot = null;
   var snapshotReceivedAt = 0;
   var activeClock = null;
+  var maintenanceClock = null;
   var memoryToken = '';
+  var memoryMaintenanceToken = '';
+  var maintenanceActionPending = false;
   var refreshPromise = null;
   var pollTimer = null;
   var retryTimer = null;
@@ -625,9 +755,31 @@ export const DASHBOARD_JS = String.raw`(function () {
     } catch (_) { /* Session storage may be disabled; memory is still tab-scoped. */ }
     setHidden('forget-token', !memoryToken);
   }
+  function getMaintenanceToken() {
+    try { return sessionStorage.getItem(MAINTENANCE_TOKEN_KEY) || memoryMaintenanceToken; }
+    catch (_) { return memoryMaintenanceToken; }
+  }
+  function setMaintenanceToken(value) {
+    memoryMaintenanceToken = value || '';
+    try {
+      if (memoryMaintenanceToken) sessionStorage.setItem(MAINTENANCE_TOKEN_KEY, memoryMaintenanceToken);
+      else sessionStorage.removeItem(MAINTENANCE_TOKEN_KEY);
+    } catch (_) { /* Session storage may be disabled; memory is still tab-scoped. */ }
+    setHidden('forget-maintenance-token', !memoryMaintenanceToken);
+    setText('maintenance-token-state', memoryMaintenanceToken
+      ? 'Control token saved for this browser tab.'
+      : 'Enter the separate maintenance token to enable controls.');
+    syncMaintenanceControls();
+  }
   function requestHeaders() {
     var headers = { accept: 'application/json' };
     var token = getToken();
+    if (token) headers.authorization = 'Bearer ' + token;
+    return headers;
+  }
+  function maintenanceHeaders() {
+    var headers = { accept: 'application/json', 'content-type': 'application/json' };
+    var token = getMaintenanceToken();
     if (token) headers.authorization = 'Bearer ' + token;
     return headers;
   }
@@ -661,9 +813,20 @@ export const DASHBOARD_JS = String.raw`(function () {
     var backend = data.backend || {};
     var service = data.service || {};
     var scheduler = data.scheduler || {};
+    var maintenance = data.maintenance || {};
+    var maintenanceState = String(maintenance.state || (maintenance.paused ? 'paused' : 'running')).toLowerCase();
     var ready = typeof service.ready === 'boolean' ? service.ready : service.state === 'ready';
     if (backend.recovery_required) {
       return { css: 'health-danger', title: 'GPU recovery required', detail: backend.recovery_reason || 'Inference is paused to protect the GPU.' };
+    }
+    if (maintenanceState === 'error') {
+      return { css: 'health-danger', title: 'Pause mode needs attention', detail: maintenance.unload_error || maintenance.reason || 'The intermediary could not complete the maintenance transition.' };
+    }
+    if (maintenanceState === 'pausing') {
+      return { css: 'health-warning', title: 'Preparing the GPU for maintenance', detail: 'The active request is draining; queued and new inference requests receive HTTP 503.' };
+    }
+    if (maintenanceState === 'paused' || maintenance.paused) {
+      return { css: 'health-warning', title: 'GPU reserved by pause mode', detail: maintenance.resume_at ? 'Inference will resume automatically when the timer expires.' : 'Inference remains paused until it is manually resumed.' };
     }
     if (!backend.reachable || backend.state === 'unhealthy' || backend.state === 'offline') {
       return { css: 'health-danger', title: 'Ollama is unavailable', detail: 'The intermediary cannot currently reach the Ollama backend.' };
@@ -692,6 +855,95 @@ export const DASHBOARD_JS = String.raw`(function () {
     setText('service-uptime', formatDuration(service.uptime_seconds));
     setText('snapshot-age', formatRelativeDate(data.generated_at));
     setText('schema-version', 'Schema ' + (data.schema_version || '—'));
+  }
+
+  function setMaintenanceActionStatus(message, kind) {
+    var element = byId('maintenance-action-status');
+    element.className = 'action-status';
+    if (kind === 'error') element.classList.add('is-error');
+    if (kind === 'success') element.classList.add('is-success');
+    element.textContent = message || '';
+  }
+
+  function syncMaintenanceControls() {
+    var maintenance = snapshot && snapshot.maintenance ? snapshot.maintenance : {};
+    var state = String(maintenance.state || (maintenance.paused ? 'paused' : 'running')).toLowerCase();
+    var controlAvailable = maintenance.control_available === true;
+    var hasToken = Boolean(getMaintenanceToken());
+    var canAct = controlAvailable && hasToken && !maintenanceActionPending;
+    var tokenInput = byId('maintenance-token-input');
+    var tokenSubmit = byId('maintenance-token-submit');
+    var duration = byId('pause-duration');
+    var pause = byId('pause-button');
+    var resume = byId('resume-button');
+
+    if (tokenInput) tokenInput.disabled = !controlAvailable;
+    if (tokenSubmit) tokenSubmit.disabled = !controlAvailable;
+    if (duration) duration.disabled = !canAct || state !== 'running';
+    if (pause) pause.disabled = !canAct || state !== 'running';
+    if (resume) resume.disabled = !canAct || (state !== 'paused' && state !== 'pausing' && state !== 'error');
+
+    if (!snapshot) {
+      setText('maintenance-control-availability', 'Waiting for maintenance status…');
+    } else if (!controlAvailable) {
+      setText('maintenance-control-availability', 'Maintenance controls are unavailable because no server-side maintenance token is configured.');
+    } else if (!hasToken) {
+      setText('maintenance-control-availability', 'Control API is available. Enter its separate token above to pause or resume inference.');
+    } else if (maintenanceActionPending) {
+      setText('maintenance-control-availability', 'A maintenance request is in progress…');
+    } else {
+      setText('maintenance-control-availability', 'Maintenance controls are ready. This token is used only for pause and resume requests.');
+    }
+  }
+
+  function renderMaintenance(data) {
+    var maintenance = data.maintenance || {};
+    var state = String(maintenance.state || (maintenance.paused ? 'paused' : 'running')).toLowerCase();
+    var stateTag = byId('maintenance-state');
+    stateTag.className = 'tag tag-neutral';
+    if (state === 'running') stateTag.className = 'tag tag-good';
+    if (state === 'pausing' || state === 'paused') stateTag.className = 'tag tag-warning';
+    if (state === 'error') stateTag.className = 'tag tag-danger';
+    setText('maintenance-state', titleCase(state));
+
+    var reasonPrefix = maintenance.reason ? 'Reason: ' + maintenance.reason + '. ' : '';
+    if (state === 'pausing') {
+      setText('maintenance-title', 'Finishing the active request');
+      setText('maintenance-detail', reasonPrefix + 'No additional inference will start while the active upstream request drains.');
+    } else if (state === 'error') {
+      setText('maintenance-title', 'Pause mode needs attention');
+      setText('maintenance-detail', maintenance.unload_error || maintenance.reason || 'The intermediary could not complete the requested transition.');
+    } else if (state === 'paused' || maintenance.paused) {
+      setText('maintenance-title', 'Inference is paused');
+      setText('maintenance-detail', reasonPrefix + (maintenance.resume_at
+        ? 'The intermediary will resume inference automatically when the timer expires.'
+        : 'Inference will remain paused until it is manually resumed.'));
+    } else {
+      setText('maintenance-title', 'Inference is running normally');
+      setText('maintenance-detail', 'Ollama requests are being accepted and scheduled. Pause mode is ready when you need the GPU elsewhere.');
+    }
+
+    var resumeTimestamp = maintenance.resume_at ? new Date(maintenance.resume_at).getTime() : NaN;
+    var hasCountdown = (state === 'paused' || state === 'pausing') && (Number.isFinite(resumeTimestamp) || maintenance.remaining_seconds != null);
+    if (hasCountdown) {
+      maintenanceClock = {
+        seconds: positiveNumber(maintenance.remaining_seconds),
+        at: performance.now(),
+        resumeAt: Number.isFinite(resumeTimestamp) ? resumeTimestamp : null
+      };
+      setText('maintenance-resume-at', Number.isFinite(resumeTimestamp) ? formatDate(maintenance.resume_at) : 'Timer active');
+    } else {
+      maintenanceClock = null;
+      setText('maintenance-resume-at', (state === 'paused' || state === 'pausing') ? 'Manual' : '—');
+      setText('maintenance-countdown', (state === 'paused' || state === 'pausing') ? 'Manual' : '—');
+    }
+    if (maintenance.gpu_released === true) setText('maintenance-gpu-released', 'Yes');
+    else if (state === 'pausing') setText('maintenance-gpu-released', 'Waiting for drain');
+    else if (state === 'paused' || state === 'error') setText('maintenance-gpu-released', 'No');
+    else setText('maintenance-gpu-released', 'Available to Ollama');
+    setText('maintenance-paused-at', formatDate(maintenance.paused_at));
+    updateLiveClocks();
+    syncMaintenanceControls();
   }
 
   function renderActive(data) {
@@ -823,8 +1075,8 @@ export const DASHBOARD_JS = String.raw`(function () {
     var type = String(event.type || '').toLowerCase();
     var status = String(event.status || '').toLowerCase();
     if (status === 'error' || status === 'failed' || type.includes('recovery') || type.includes('circuit_open')) return 'event-danger';
-    if (status === 'completed' || status === 'success' || type.includes('completed') || type.includes('healthy')) return 'event-good';
-    if (type.includes('drop') || type.includes('cancel') || type.includes('disconnect') || type.includes('unload')) return 'event-warning';
+    if (status === 'completed' || status === 'success' || type.includes('completed') || type.includes('healthy') || type.includes('resum')) return 'event-good';
+    if (type.includes('drop') || type.includes('cancel') || type.includes('disconnect') || type.includes('unload') || type.includes('paus')) return 'event-warning';
     return '';
   }
   function eventTitle(event) {
@@ -866,6 +1118,7 @@ export const DASHBOARD_JS = String.raw`(function () {
     snapshot = data;
     snapshotReceivedAt = performance.now();
     renderHealth(data);
+    renderMaintenance(data);
     renderActive(data);
     renderQueue(data);
     renderBackend(data);
@@ -876,6 +1129,12 @@ export const DASHBOARD_JS = String.raw`(function () {
     if (activeClock) {
       var elapsed = activeClock.seconds + ((performance.now() - activeClock.at) / 1000);
       setText('active-running', formatDuration(elapsed));
+    }
+    if (maintenanceClock) {
+      var remaining = maintenanceClock.resumeAt == null
+        ? maintenanceClock.seconds - ((performance.now() - maintenanceClock.at) / 1000)
+        : (maintenanceClock.resumeAt - Date.now()) / 1000;
+      setText('maintenance-countdown', remaining > 0 ? formatDuration(remaining) : 'Resuming…');
     }
     if (snapshot) {
       var generatedAt = new Date(snapshot.generated_at).getTime();
@@ -915,6 +1174,62 @@ export const DASHBOARD_JS = String.raw`(function () {
       }
     })();
     return refreshPromise;
+  }
+
+  async function performMaintenanceAction(action) {
+    var token = getMaintenanceToken();
+    if (!token) {
+      setMaintenanceActionStatus('Enter the separate maintenance control token first.', 'error');
+      byId('maintenance-token-input').focus();
+      return;
+    }
+    var maintenance = snapshot && snapshot.maintenance ? snapshot.maintenance : {};
+    if (maintenance.control_available !== true) {
+      setMaintenanceActionStatus('Maintenance controls are not configured on this intermediary.', 'error');
+      return;
+    }
+
+    maintenanceActionPending = true;
+    syncMaintenanceControls();
+    setMaintenanceActionStatus(action === 'pause' ? 'Requesting pause mode…' : 'Requesting inference resume…', '');
+    try {
+      var url = action === 'pause' ? MAINTENANCE_PAUSE_URL : MAINTENANCE_RESUME_URL;
+      var options = {
+        method: 'POST',
+        headers: maintenanceHeaders(),
+        cache: 'no-store',
+        credentials: 'same-origin'
+      };
+      if (action === 'pause') {
+        var payload = { reason: 'Dashboard pause' };
+        var duration = byId('pause-duration').value;
+        if (duration) payload.duration = duration;
+        options.body = JSON.stringify(payload);
+      }
+      var response = await fetch(url, options);
+      var responseText = await response.text();
+      var responseBody = {};
+      if (responseText) {
+        try { responseBody = JSON.parse(responseText); }
+        catch (_) { responseBody = {}; }
+      }
+      if (response.status === 401 || response.status === 403) {
+        setMaintenanceToken('');
+        throw new Error('The maintenance control token was rejected. Enter it again.');
+      }
+      if (!response.ok) {
+        throw new Error(responseBody.error || ('Maintenance request failed with HTTP ' + response.status));
+      }
+      setMaintenanceActionStatus(action === 'pause'
+        ? 'Pause mode requested. The dashboard will update as the active request drains.'
+        : 'Inference resume requested.', 'success');
+      await refreshSnapshot();
+    } catch (error) {
+      setMaintenanceActionStatus(error.message || String(error), 'error');
+    } finally {
+      maintenanceActionPending = false;
+      syncMaintenanceControls();
+    }
   }
 
   function scheduleRefresh() {
@@ -1027,9 +1342,28 @@ export const DASHBOARD_JS = String.raw`(function () {
     reconnect();
   });
 
+  byId('maintenance-token-form').addEventListener('submit', function (event) {
+    event.preventDefault();
+    var value = byId('maintenance-token-input').value.trim();
+    if (!value) return;
+    setMaintenanceToken(value);
+    byId('maintenance-token-input').value = '';
+    setMaintenanceActionStatus('Maintenance control token saved for this browser tab.', 'success');
+  });
+
+  byId('forget-maintenance-token').addEventListener('click', function () {
+    setMaintenanceToken('');
+    byId('maintenance-token-input').value = '';
+    setMaintenanceActionStatus('Maintenance control token forgotten.', '');
+  });
+
+  byId('pause-button').addEventListener('click', function () { performMaintenanceAction('pause'); });
+  byId('resume-button').addEventListener('click', function () { performMaintenanceAction('resume'); });
+
   window.addEventListener('pagehide', stopConnections);
   window.setInterval(updateLiveClocks, 1000);
   setToken(getToken());
+  setMaintenanceToken(getMaintenanceToken());
   reconnect();
 })();
 `;

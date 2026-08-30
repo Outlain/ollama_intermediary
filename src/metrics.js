@@ -66,6 +66,12 @@ export class Metrics {
     lines.push(`proxy_backend_healthy ${dynamic.backendHealthy ? 1 : 0}`);
     lines.push('# HELP proxy_gpu_recovery_required Whether inference is latched off after a hard GPU fault.', '# TYPE proxy_gpu_recovery_required gauge');
     lines.push(`proxy_gpu_recovery_required ${dynamic.recoveryRequired ? 1 : 0}`);
+    lines.push('# HELP proxy_maintenance_paused Whether inference admission is disabled for GPU maintenance.', '# TYPE proxy_maintenance_paused gauge');
+    lines.push(`proxy_maintenance_paused ${dynamic.maintenance?.paused ? 1 : 0}`);
+    lines.push('# HELP proxy_maintenance_gpu_released Whether maintenance has confirmed that Ollama reports no loaded models.', '# TYPE proxy_maintenance_gpu_released gauge');
+    lines.push(`proxy_maintenance_gpu_released ${dynamic.maintenance?.gpu_released ? 1 : 0}`);
+    lines.push('# HELP proxy_maintenance_remaining_seconds Seconds until automatic maintenance resume, or zero for manual/pausing states.', '# TYPE proxy_maintenance_remaining_seconds gauge');
+    lines.push(`proxy_maintenance_remaining_seconds ${dynamic.maintenance?.remaining_seconds ?? 0}`);
     lines.push('# HELP proxy_upstream_draining Whether an abandoned active request is being drained from Ollama.', '# TYPE proxy_upstream_draining gauge');
     lines.push(`proxy_upstream_draining ${dynamic.upstreamDraining ? 1 : 0}`);
     lines.push('# HELP proxy_current_model Currently selected model.', '# TYPE proxy_current_model gauge');

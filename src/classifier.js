@@ -66,6 +66,13 @@ export function classifyEndpoint(method, pathname) {
   return 'metadata';
 }
 
+export function isSafeMetadataEndpoint(method, pathname) {
+  if (method === 'GET' && ['/api/tags', '/api/ps', '/api/version', '/v1/models'].includes(pathname)) return true;
+  if (method === 'POST' && pathname === '/api/show') return true;
+  if (method === 'HEAD' && pathname.startsWith('/api/blobs/')) return true;
+  return false;
+}
+
 export function isStreaming(pathname, body) {
   if (pathname === '/api/embed' || pathname === '/api/embeddings' || pathname === '/v1/embeddings') return false;
   if (pathname.startsWith('/v1/')) return body?.stream === true;
