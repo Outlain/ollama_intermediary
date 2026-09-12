@@ -47,6 +47,8 @@ curl http://127.0.0.1:11435/status
 
 Open `http://<docker-host>:11435/debug` for the live read-only dashboard. It uses the same listener and does not require another port.
 
+Open `http://<docker-host>:11435/settings` for protected, structured configuration. Enter the separate `SETTINGS_TOKEN` from `secrets.env`; the browser keeps it only in that tab's session storage.
+
 Then change each application's Ollama base URL to `http://<docker-host>:11435`. If possible, configure one of these headers:
 
 ```text
@@ -140,12 +142,31 @@ Docker Compose loads `secrets.env` into the container. The YAML loader expands `
 OLLAMA_URL=http://192.0.2.10:11434
 FRIGATE_SOURCE=192.0.2.50/32
 OBSERVABILITY_TOKEN=
+SETTINGS_TOKEN=
 MAINTENANCE_TOKEN=
 ```
 
-`OLLAMA_URL` and a non-empty `MAINTENANCE_TOKEN` are required by the supplied configuration. Generate the maintenance token with `openssl rand -hex 32`; it authorizes state-changing administrative operations and must not be reused as `OBSERVABILITY_TOKEN`. `FRIGATE_SOURCE` can remain blank until Frigate is connected, or when Frigate sends `X-Ollama-Client: frigate`. The supplied `scheduler.default_client: odysseus` setting means an unmatched source automatically receives the Odysseus policy; Odysseus's changing container IP never needs to be configured. `secrets.env` is ignored by Git and excluded from the Docker build context.
+`OLLAMA_URL` and `MAINTENANCE_TOKEN` are required by the supplied base configuration, and `SETTINGS_TOKEN` is required to use the settings page/API. Generate each administrative token independently with `openssl rand -hex 32`. `SETTINGS_TOKEN` protects configuration reads and changes; `MAINTENANCE_TOKEN` authorizes pause/resume. Neither should be reused as the optional read-only `OBSERVABILITY_TOKEN`. `FRIGATE_SOURCE` can remain blank until Frigate is connected, or when Frigate sends `X-Ollama-Client: frigate`. The supplied `scheduler.default_client: odysseus` setting means an unmatched source automatically receives the Odysseus policy; Odysseus's changing container IP never needs to be configured. `secrets.env` is ignored by Git and excluded from the Docker build context.
 
 The `192.0.2.0/24` addresses above are documentation placeholders. Replace them with addresses valid for your deployment.
+
+## Settings page, persistence, and recovery
+
+The settings page edits an allowlisted set of application settings such as the Ollama URL, client classification, queue limits, scheduling, circuit-breaker behavior, GPU safeguards, maintenance limits, and observability limits. It does not expose a raw YAML editor.
+
+Configuration has three deliberately separate owners:
+
+- `config.yml` is the read-only base configuration managed on the host.
+- `/app/state/settings.json` contains validated, versioned browser overrides. It lives in the existing `ollama-scheduler-state` volume and takes precedence over matching base values.
+- `secrets.env` remains host-only. The page reports only whether a token is configured; it never returns or changes token values.
+
+Docker Compose is also host-only. The container has neither the Compose file nor the Docker socket mounted for writing, so the page cannot change ports, mounts, restart policy, image tags, memory limits, or Docker networking. Keep machine-specific Compose changes in the ignored `docker-compose.override.yml`, not in the tracked base file.
+
+Use **Validate changes** before **Apply settings**. Apply atomically saves the override plus one last-known-good revision, stops admitting new inference, lets an already-dispatched Ollama request drain during graceful shutdown, and exits with status 75. The supplied Compose `restart: unless-stopped` policy starts it again with the new values. A systemd installation needs `Restart=on-failure`; a foreground `node` process must be started again manually.
+
+If a safely editable setting prevents normal startup, the service enters a restricted configuration-recovery mode on the same container listener. `/settings` and `/healthz` remain available, `/readyz` and `/status` return HTTP 503 with `configuration_invalid`, and inference receives HTTP 503 until a valid configuration is applied and the supervisor restarts the service. Invalid YAML, a missing host-managed token, a bad volume mount, or a listener/Compose problem still requires a host-side fix. `SETTINGS_TOKEN` must be present in `secrets.env` even in recovery mode; without it, the static page loads but the settings API remains locked.
+
+Because saved overrides take precedence, later edits to an overridden field in `config.yml` will not change that field until its saved override is reset. The page always displays the effective values, their revision, validation diagnostics, and whether the service is running normally or in configuration recovery.
 
 ## Queue and failure behavior
 
@@ -271,7 +292,7 @@ The versioned read-only API is:
 - `GET /_intermediary/v1/history?limit=50` for bounded in-memory history
 - `GET /_intermediary/v1/events` for live Server-Sent Events
 
-Set `OBSERVABILITY_TOKEN` in `secrets.env` to require a bearer token for these three data endpoints. The static dashboard will request it and retain it only in the browser tab's session storage. A blank token is convenient on a trusted LAN but provides no read-API authentication. Pause and resume are separate administrative operations and always require the non-empty `MAINTENANCE_TOKEN`; an observability token cannot mutate state.
+Set `OBSERVABILITY_TOKEN` in `secrets.env` to require a bearer token for these three data endpoints. The static dashboard will request it and retain it only in the browser tab's session storage. A blank token is convenient on a trusted LAN but provides no read-API authentication. Pause/resume and settings are separate administrative operations protected by their own non-empty `MAINTENANCE_TOKEN` and `SETTINGS_TOKEN`; an observability token cannot mutate state.
 
 Home Assistant can turn the shared snapshot into native sensors with one five-second REST poll. See [Home Assistant setup](docs/HOME_ASSISTANT.md).
 
@@ -356,7 +377,7 @@ Recommended rollout:
 4. Observe response latency, drops, and model switches for at least a day before tuning holds/batches.
 5. Only then reduce Ollama's internal queue.
 
-The service has no authentication layer, matching Ollama's local API model. Bind/publish it only on a trusted LAN or protect it with an authenticated reverse proxy/firewall. Do not expose model-management endpoints to untrusted callers.
+The Ollama-compatible inference and model-management surface has no authentication layer, matching Ollama's local API model. Bind/publish it only on a trusted LAN or protect it with an authenticated reverse proxy/firewall. The settings and maintenance mutation APIs have their own bearer tokens, but those tokens do not protect ordinary Ollama routes. Do not expose model-management endpoints to untrusted callers.
 
 ## Development and tests
 

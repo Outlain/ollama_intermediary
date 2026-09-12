@@ -1,6 +1,7 @@
 node_modules/
 config.yml
 secrets.env
+docker-compose.override.yml
 coverage/
 dist/
 *.log

@@ -25,8 +25,13 @@ async function setup(t, overlay = {}) {
 }
 
 test('O1 F1 O2 F2 O3 is grouped by current model instead of global FIFO', async (t) => {
-  const { mock, proxyUrl } = await setup(t, { models: { 'od-model': { idle_hold: '0ms' } } });
-  const first = requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'O1', delay_ms: 80 });
+  const { mock, proxyUrl } = await setup(t, {
+    models: { 'od-model': { idle_hold: '0ms' } },
+    clients: { odysseus: { max_wait: '5s' }, frigate: { max_wait: '5s' } },
+  });
+  // Keep O1 active long enough for all four concurrent HTTP connections to be
+  // admitted even on a loaded CI worker.
+  const first = requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'O1', delay_ms: 500 });
   await waitFor(() => mock.order.includes('O1'));
   const requests = [
     requestJson(`${proxyUrl}/api/generate`, { model: 'f-model', id: 'F1' }),
@@ -116,7 +121,9 @@ test('maintenance pause drains active work, fails queues, unloads models, and re
     },
   });
 
-  const active = requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'active-before-pause', delay_ms: 160 });
+  // Leave enough margin for the negative/auth/persistence checks below while
+  // keeping a real upstream request active for the eventual pause transition.
+  const active = requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'active-before-pause', delay_ms: 1_200 });
   await waitFor(() => service.scheduler.active?.model === 'od-model');
   const queued = requestJson(`${proxyUrl}/api/generate`, { model: 'f-model', id: 'queued-before-pause' });
   await waitFor(() => service.scheduler.status().queues.frigate === 1);

@@ -1,0 +1,351 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import {
+  SECRET_MASK,
+  SETTINGS_SCHEMA_VERSION,
+  SettingsStore,
+  SettingsValidationError,
+  maskSettings,
+  mergeSettingsOverrides,
+  validateSettingsDraft,
+} from '../src/settings.js';
+
+function fixture(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ollama-intermediary-settings-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  return {
+    directory,
+    statePath: path.join(directory, 'settings.json'),
+    environment: {
+      OLLAMA_URL: 'http://192.0.2.10:11434',
+      OBSERVABILITY_TOKEN: 'read-only-super-secret',
+      MAINTENANCE_TOKEN: 'control-super-secret',
+    },
+    baseRaw: {
+      ollama: {
+        url: '${OLLAMA_URL:?missing OLLAMA_URL}',
+        health_interval: '5s',
+        health_timeout: '3s',
+        request_timeout: '30m',
+      },
+      scheduler: { default_client: 'odysseus' },
+      observability: {
+        enabled: true,
+        ui_enabled: true,
+        auth_token: '${OBSERVABILITY_TOKEN:-}',
+      },
+      maintenance: {
+        enabled: true,
+        auth_token: '${MAINTENANCE_TOKEN:?missing maintenance token}',
+      },
+      clients: {
+        default: {
+          priority: 50,
+          queue_limit: 20,
+          request_ttl: '10m',
+          max_wait: '5m',
+          overflow_policy: 'reject',
+          source_ips: [],
+          model_policy: {
+            idle_hold: '0s',
+            max_batch_requests: 1,
+            max_batch_time: '60s',
+            keep_alive: null,
+          },
+        },
+        odysseus: {
+          priority: 100,
+          queue_limit: 10,
+          request_ttl: '30m',
+          max_wait: '0s',
+          overflow_policy: 'reject',
+          source_ips: [],
+          model_policy: { group: 'odysseus', idle_hold: '1m' },
+        },
+        frigate: {
+          priority: 30,
+          queue_limit: 20,
+          request_ttl: '2m',
+          max_wait: '2m',
+          overflow_policy: 'drop_oldest',
+          source_ips: ['192.0.2.20/32'],
+          model_policy: { group: 'frigate', idle_hold: '3s' },
+        },
+      },
+    },
+  };
+}
+
+test('structured draft merges editable fields, expands the base environment, and masks secrets', (t) => {
+  const { baseRaw, environment } = fixture(t);
+  const result = validateSettingsDraft({
+    baseRaw,
+    environment,
+    draft: {
+      ollama: { health_timeout: '8s' },
+      scheduler: { aging_bonus: 9 },
+      clients: {
+        frigate: {
+          request_ttl: '8h',
+          source_ips: ['198.51.100.7/32'],
+        },
+      },
+    },
+  });
+
+  assert.equal(result.valid, true);
+  assert.equal(result.effectiveConfig.ollama.url, 'http://192.0.2.10:11434');
+  assert.equal(result.effectiveConfig.ollama.healthTimeoutMs, 8_000);
+  assert.equal(result.effectiveConfig.clients.frigate.requestTtlMs, 8 * 60 * 60 * 1_000);
+  assert.deepEqual(result.effectiveConfig.clients.frigate.source_ips, ['198.51.100.7/32']);
+  assert.equal(result.effectiveConfig.observability.auth_token, environment.OBSERVABILITY_TOKEN);
+  assert.equal(result.settings.observability.auth_token, undefined);
+  assert.equal(JSON.stringify(result).includes(environment.OBSERVABILITY_TOKEN), false);
+  assert.equal(JSON.stringify(result).includes(environment.MAINTENANCE_TOKEN), false);
+  assert.deepEqual(result.overrides, {
+    ollama: { health_timeout: '8s' },
+    scheduler: { aging_bonus: 9 },
+    clients: {
+      frigate: { request_ttl: '8h', source_ips: ['198.51.100.7/32'] },
+    },
+  });
+});
+
+test('auth tokens, listener, state path, and Docker fields are read-only', (t) => {
+  const { baseRaw, environment } = fixture(t);
+  const result = validateSettingsDraft({
+    baseRaw,
+    environment,
+    draft: {
+      server: { listen: '0.0.0.0:9999' },
+      observability: { auth_token: 'steal-me' },
+      maintenance: { state_path: '/tmp/evil', auth_token: 'replace-me' },
+      docker: { socket: '/var/run/docker.sock' },
+    },
+  });
+
+  assert.equal(result.valid, false);
+  assert.deepEqual(
+    result.diagnostics.filter((item) => item.severity === 'error').map((item) => item.path).sort(),
+    ['docker', 'maintenance.auth_token', 'maintenance.state_path', 'observability.auth_token', 'server.listen'],
+  );
+  assert.equal(JSON.stringify(result).includes('steal-me'), false);
+  assert.equal(result.overrides.server?.listen, undefined);
+  assert.equal(result.overrides.docker, undefined);
+});
+
+test('validation returns field-level diagnostics for independent and cross-field errors', (t) => {
+  const { baseRaw, environment } = fixture(t);
+  const result = validateSettingsDraft({
+    baseRaw,
+    environment,
+    draft: {
+      ollama: { url: 'not-a-url', health_interval: 'soon' },
+      observability: { history_limit: 4, recent_events: 5 },
+      clients: { frigate: { queue_limit: 0, overflow_policy: 'wait' } },
+    },
+  });
+
+  assert.equal(result.valid, false);
+  const byPath = new Map(result.diagnostics.map((item) => [item.path, item]));
+  assert.equal(byPath.get('ollama.url').code, 'invalid_url');
+  assert.equal(byPath.get('ollama.health_interval').code, 'invalid_duration');
+  assert.equal(byPath.get('clients.frigate.queue_limit').code, 'out_of_range');
+  assert.equal(byPath.get('clients.frigate.overflow_policy').code, 'invalid_choice');
+
+  const crossField = validateSettingsDraft({
+    baseRaw,
+    environment,
+    draft: { observability: { history_limit: 4, recent_events: 5 } },
+  });
+  assert.equal(crossField.valid, false);
+  assert.equal(crossField.diagnostics.at(-1).path, 'observability.recent_events');
+});
+
+test('maskSettings does not expose bearer tokens while retaining safe editable values', (t) => {
+  const { baseRaw, environment } = fixture(t);
+  const effectiveRaw = mergeSettingsOverrides(baseRaw, {
+    ollama: { request_timeout: '1h' },
+  }, environment);
+  const masked = maskSettings(effectiveRaw);
+  assert.equal(masked.ollama.url, 'http://192.0.2.10:11434');
+  assert.equal(masked.ollama.request_timeout, '1h');
+  assert.equal(masked.observability.auth_token, undefined);
+  assert.equal(JSON.stringify(masked).includes('super-secret'), false);
+  assert.equal(SECRET_MASK, '********');
+
+  const unsafeBase = structuredClone(effectiveRaw);
+  unsafeBase.ollama.url = 'http://operator:never-return-this@192.0.2.10:11434';
+  const redacted = maskSettings(unsafeBase);
+  assert.equal(redacted.ollama.url, 'http://192.0.2.10:11434/');
+  assert.equal(JSON.stringify(redacted).includes('never-return-this'), false);
+});
+
+test('store atomically persists only sanitized overrides with restrictive permissions', async (t) => {
+  const { baseRaw, environment, statePath, directory } = fixture(t);
+  const store = new SettingsStore({
+    statePath,
+    baseRaw,
+    environment,
+    clock: () => Date.parse('2026-08-31T12:00:00.000Z'),
+  });
+  const initial = await store.load();
+  assert.equal(initial.valid, true);
+  assert.equal(initial.revision, 0);
+  assert.equal(initial.source, 'base');
+
+  const saved = await store.save({
+    ollama: { url: 'http://198.51.100.40:11434', request_timeout: '45m' },
+    clients: { frigate: { max_wait: '12m' } },
+  });
+  assert.equal(saved.revision, 1);
+  assert.equal(saved.settings.ollama.url, 'http://198.51.100.40:11434');
+  assert.equal(saved.secrets.maintenance_token_configured, true);
+  assert.equal(store.getEffectiveConfig().clients.frigate.maxWaitMs, 12 * 60_000);
+  assert.equal(store.getEffectiveRaw().observability.auth_token, environment.OBSERVABILITY_TOKEN);
+
+  const document = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  assert.equal(document.schema_version, SETTINGS_SCHEMA_VERSION);
+  assert.equal(document.revision, 1);
+  assert.deepEqual(document.overrides, {
+    ollama: { url: 'http://198.51.100.40:11434', request_timeout: '45m' },
+    clients: { frigate: { max_wait: '12m' } },
+  });
+  assert.equal(JSON.stringify(document).includes('super-secret'), false);
+  assert.equal(fs.statSync(statePath).mode & 0o777, 0o600);
+  assert.deepEqual(fs.readdirSync(directory).filter((name) => name.includes('.tmp')), []);
+
+  const restored = new SettingsStore({ statePath, baseRaw, environment });
+  const restoredSnapshot = await restored.load();
+  assert.equal(restoredSnapshot.source, 'persisted');
+  assert.equal(restoredSnapshot.settings.ollama.request_timeout, '45m');
+  assert.equal(restored.getEffectiveConfig().ollama.requestTimeoutMs, 45 * 60_000);
+});
+
+test('submitting the full effective UI document persists only values that differ from the base', async (t) => {
+  const { baseRaw, environment, statePath } = fixture(t);
+  const store = new SettingsStore({ statePath, baseRaw, environment });
+  const initial = await store.load();
+  const fullDocument = structuredClone(initial.settings);
+  fullDocument.ollama.health_timeout = '9s';
+
+  await store.save(fullDocument);
+  const persisted = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  assert.deepEqual(persisted.overrides, { ollama: { health_timeout: '9s' } });
+  assert.equal(store.snapshot().settings.server.body_limit_bytes, 64 * 1024 * 1024);
+});
+
+test('invalid drafts never replace the active last-known-good settings', async (t) => {
+  const { baseRaw, environment, statePath } = fixture(t);
+  const store = new SettingsStore({ statePath, baseRaw, environment });
+  await store.load();
+  await store.save({ clients: { frigate: { max_wait: '20m' } } });
+  const before = fs.readFileSync(statePath, 'utf8');
+
+  await assert.rejects(
+    store.save({ clients: { frigate: { queue_limit: -1 } } }),
+    (error) => {
+      assert.ok(error instanceof SettingsValidationError);
+      assert.equal(error.statusCode, 400);
+      assert.equal(error.diagnostics[0].path, 'clients.frigate.queue_limit');
+      return true;
+    },
+  );
+  assert.equal(store.snapshot().revision, 1);
+  assert.equal(store.getEffectiveConfig().clients.frigate.maxWaitMs, 20 * 60_000);
+  assert.equal(fs.readFileSync(statePath, 'utf8'), before);
+});
+
+test('load falls back to the persisted previous version when the newest override is invalid', async (t) => {
+  const { baseRaw, environment, statePath } = fixture(t);
+  fs.writeFileSync(statePath, `${JSON.stringify({
+    schema_version: SETTINGS_SCHEMA_VERSION,
+    revision: 8,
+    updated_at: '2026-08-31T12:00:00.000Z',
+    overrides: { clients: { frigate: { queue_limit: 0 } } },
+    previous_overrides: { clients: { frigate: { max_wait: '90m' } } },
+  })}\n`, { mode: 0o600 });
+
+  const store = new SettingsStore({ statePath, baseRaw, environment });
+  const snapshot = await store.load();
+  assert.equal(snapshot.source, 'last_known_good');
+  assert.equal(snapshot.settings.clients.frigate.max_wait, '90m');
+  assert.equal(store.getEffectiveConfig().clients.frigate.maxWaitMs, 90 * 60_000);
+  assert.ok(snapshot.diagnostics.some((item) => item.code === 'settings_rolled_back'));
+  assert.ok(snapshot.diagnostics.some((item) => item.path === 'clients.frigate.queue_limit'));
+});
+
+test('corrupt state fails visibly but keeps a valid base configuration available for recovery', async (t) => {
+  const { baseRaw, environment, statePath } = fixture(t);
+  fs.writeFileSync(statePath, '{bad-json', { mode: 0o600 });
+  const store = new SettingsStore({ statePath, baseRaw, environment });
+  const snapshot = await store.load();
+
+  assert.equal(snapshot.source, 'base');
+  assert.equal(snapshot.valid, false);
+  assert.equal(snapshot.diagnostics[0].code, 'settings_state_unreadable');
+  assert.equal(store.getEffectiveConfig().ollama.url, environment.OLLAMA_URL);
+
+  const repaired = await store.save({ ollama: { health_timeout: '6s' } });
+  assert.equal(repaired.valid, true);
+  assert.equal(repaired.revision, 1);
+  assert.equal(store.getEffectiveConfig().ollama.healthTimeoutMs, 6_000);
+});
+
+test('secret presence remains accurate when an unrelated setting forces recovery', async (t) => {
+  const { baseRaw, environment, statePath } = fixture(t);
+  baseRaw.ollama.url = 'not-a-url';
+  const store = new SettingsStore({ statePath, baseRaw, environment });
+  const snapshot = await store.load();
+
+  assert.equal(snapshot.valid, false);
+  assert.equal(snapshot.secrets.observability_token_configured, true);
+  assert.equal(snapshot.secrets.maintenance_token_configured, true);
+  assert.equal(JSON.stringify(snapshot).includes(environment.OBSERVABILITY_TOKEN), false);
+  assert.equal(JSON.stringify(snapshot).includes(environment.MAINTENANCE_TOKEN), false);
+});
+
+test('storage writability follows the parent directory required for atomic rename', async (t) => {
+  const { baseRaw, environment, directory } = fixture(t);
+  const stateDirectory = path.join(directory, 'atomic-state');
+  const statePath = path.join(stateDirectory, 'settings.json');
+  fs.mkdirSync(stateDirectory, { mode: 0o700 });
+  fs.writeFileSync(statePath, '{}', { mode: 0o400 });
+  const store = new SettingsStore({ statePath, baseRaw, environment });
+
+  assert.equal(store.storageStatus().writable, true);
+  fs.chmodSync(stateDirectory, 0o500);
+  try {
+    assert.equal(store.storageStatus().writable, false);
+  } finally {
+    fs.chmodSync(stateDirectory, 0o700);
+  }
+});
+
+test('rollback swaps the current and previous validated settings revisions', async (t) => {
+  const { baseRaw, environment, statePath } = fixture(t);
+  const store = new SettingsStore({ statePath, baseRaw, environment });
+  await store.load();
+  await store.save({ ollama: { request_timeout: '40m' } });
+  await store.save({ ollama: { request_timeout: '50m' } });
+  const rolledBack = await store.rollback();
+
+  assert.equal(rolledBack.changed, true);
+  assert.equal(rolledBack.revision, 3);
+  assert.equal(rolledBack.settings.ollama.request_timeout, '40m');
+  assert.equal(store.getEffectiveConfig().ollama.requestTimeoutMs, 40 * 60_000);
+});
+
+test('dangerous object keys cannot pollute prototypes or enter persisted overrides', (t) => {
+  const { baseRaw, environment } = fixture(t);
+  const draft = JSON.parse('{"clients":{"__proto__":{"priority":999},"frigate":{"priority":31}}}');
+  const result = validateSettingsDraft({ baseRaw, environment, draft });
+  assert.equal(result.valid, false);
+  assert.ok(result.diagnostics.some((item) => item.code === 'forbidden_key'));
+  assert.equal({}.priority, undefined);
+  assert.equal(Object.prototype.priority, undefined);
+  assert.equal(Object.hasOwn(result.overrides.clients, '__proto__'), false);
+});

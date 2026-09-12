@@ -20,6 +20,7 @@ export const DASHBOARD_HTML = String.raw`<!doctype html>
         </div>
       </div>
       <div class="header-actions">
+        <a class="quiet-button settings-link" href="/settings">Settings</a>
         <span id="connection-status" class="connection-badge" role="status" aria-live="polite">
           <span class="connection-dot" aria-hidden="true"></span>
           <span id="connection-label">Connecting</span>
@@ -384,12 +385,15 @@ h3 { margin-bottom: 0; font-size: 0.96rem; }
 .connection-badge.is-offline .connection-dot { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
 
 .quiet-button {
+  display: inline-flex;
+  align-items: center;
   padding: 7px 10px;
   border: 1px solid var(--border);
   border-radius: 9px;
   color: var(--muted);
   background: transparent;
   font-size: 0.74rem;
+  text-decoration: none;
 }
 .quiet-button:hover { color: var(--text); border-color: var(--faint); }
 
@@ -605,7 +609,7 @@ main { padding-block: 28px 16px; }
   .brand .eyebrow { display: none; }
   .brand-mark { width: 36px; height: 36px; border-radius: 10px; }
   .connection-badge { padding: 7px 9px; }
-  .header-actions .quiet-button { display: none; }
+  .header-actions .quiet-button:not(.settings-link) { display: none; }
   main { padding-top: 16px; }
   .health-banner { grid-template-columns: auto 1fr; padding: 18px; }
   .health-stats { grid-column: 1 / -1; width: 100%; padding-top: 14px; border-top: 1px solid var(--border-soft); justify-content: space-between; }

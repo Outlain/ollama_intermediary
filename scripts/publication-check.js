@@ -19,7 +19,13 @@ function fallbackFiles(directory = root) {
 
 function publicationFiles() {
   try {
-    const output = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    // Include both tracked files and untracked, non-ignored files so a newly
+    // implemented source file is scanned before it is staged for publication.
+    const output = execFileSync(
+      'git',
+      ['ls-files', '-z', '--cached', '--others', '--exclude-standard'],
+      { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+    );
     if (output) return output.split('\0').filter(Boolean);
   } catch {
     // The pre-publication workspace may not be initialized as a Git repository yet.

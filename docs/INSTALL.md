@@ -49,6 +49,7 @@ Edit `secrets.env`:
 OLLAMA_URL=http://YOUR_OLLAMA_HOST:11434
 FRIGATE_SOURCE=
 OBSERVABILITY_TOKEN=
+SETTINGS_TOKEN=
 MAINTENANCE_TOKEN=
 ```
 
@@ -56,7 +57,9 @@ The supplied configuration treats every unmatched request as Odysseus, so Odysse
 
 `OBSERVABILITY_TOKEN` protects the detailed dashboard data and Home Assistant endpoint. Generate a token with `openssl rand -hex 32`, or leave it blank only when port `11435` is restricted to a trusted LAN/VPN.
 
-`MAINTENANCE_TOKEN` is required and protects the state-changing pause/resume API. Generate it with `openssl rand -hex 32`. Do not reuse the observability token, and do not commit either token to Git.
+`SETTINGS_TOKEN` is required to use configuration reads and changes at `/settings`. Generate it separately with `openssl rand -hex 32`. It is intentionally loaded directly from the container environment so it can still authenticate the restricted recovery page when ordinary configuration is invalid.
+
+`MAINTENANCE_TOKEN` is required and protects the state-changing pause/resume API. Generate it with `openssl rand -hex 32`. Keep all three tokens distinct, and never commit them to Git.
 
 Validate and start:
 
@@ -71,23 +74,28 @@ curl http://127.0.0.1:11435/status
 
 Open `http://YOUR_UBUNTU_IP:11435/debug` to view the live dashboard. If a token is configured, enter the raw token when prompted. For Home Assistant, follow [HOME_ASSISTANT.md](HOME_ASSISTANT.md).
 
-The image uses `restart: unless-stopped`, so it returns after Docker or host restarts. A named Docker volume stores the maintenance pause record at `/app/state`; pause state therefore survives container recreation and upgrades.
+Open `http://YOUR_UBUNTU_IP:11435/settings` to view or change structured application settings. Enter `SETTINGS_TOKEN`; it is retained only in the current browser tab's session storage.
+
+The image uses `restart: unless-stopped`, so it returns after Docker or host restarts and after a settings apply. A named Docker volume stores both the maintenance pause record and validated settings overrides under `/app/state`; both survive container recreation and upgrades.
 
 ## Upgrade
 
-Download and verify the new release bundle in a temporary directory. Preserve the installed `config.yml` and `secrets.env`, then replace only `docker-compose.yml` with the new release's file:
+Keep local machine-specific Compose changes in `docker-compose.override.yml`. It is ignored by this repository and Compose loads it automatically alongside the supplied `docker-compose.yml`. The tracked/bundled base file can then receive project updates while the override retains host-specific additions. Always inspect the merged result with `docker compose config`.
+
+For a release-bundle installation, download and verify the new bundle in a temporary directory. Install the new bundled base Compose file and image reference without replacing `config.yml`, `secrets.env`, `docker-compose.override.yml`, or the named state volume:
 
 ```sh
 cd /opt/ollama-scheduling-proxy
 cp /path/to/new-release/docker-compose.yml ./docker-compose.yml
+docker compose config
 docker compose pull
 docker compose up -d
 docker compose ps
 ```
 
-Review changes to `config.example.yml` before adopting new options. Compose recreates the container while retaining local configuration files and the named maintenance-state volume. In-memory queued inference jobs are intentionally not restored.
+`config.example.yml` is documentation for new installations; do not copy it over an existing `config.yml` during an upgrade. Review its changes and deliberately adopt only options you want. Compose recreates the container while retaining `config.yml`, `secrets.env`, the optional override file, and the named state volume. In-memory queued inference jobs are intentionally not restored.
 
-When upgrading an installation that predates maintenance pause, add a unique `MAINTENANCE_TOKEN` to `secrets.env` and copy the new `maintenance:` section from `config.example.yml` into `config.yml` before starting the new image. The supplied `${MAINTENANCE_TOKEN:?...}` expression intentionally prevents startup with a blank administrative token.
+When upgrading an installation that predates the settings page, add a unique `SETTINGS_TOKEN` to `secrets.env`. The new image can use the existing `/app/state` volume for `/app/state/settings.json`; no second volume is required. Installations predating maintenance pause also need a unique `MAINTENANCE_TOKEN` and the `maintenance:` section from `config.example.yml`. The supplied `${MAINTENANCE_TOKEN:?...}` expression intentionally prevents normal startup with a blank administrative token.
 
 ## Roll back
 
@@ -118,20 +126,56 @@ curl http://127.0.0.1:11435/readyz
 ## Install from source instead
 
 ```sh
-git clone https://github.com/OWNER/ollama-scheduling-proxy.git
-cd ollama-scheduling-proxy
+git clone https://github.com/Outlain/ollama_intermediary.git
+cd ollama_intermediary
 cp config.example.yml config.yml
 cp secrets.example.env secrets.env
 chmod 600 secrets.env
 docker compose up -d --build
 ```
 
-Update a source installation with:
+The two `cp` commands above are for a first installation only. Never run them over an existing installation during an upgrade.
+
+For a normal source update, leave `config.yml`, `secrets.env`, and `docker-compose.override.yml` in place:
 
 ```sh
+cd /opt/ollama_intermediary
 git pull --ff-only
+docker compose config
+docker compose up -d --build
+docker compose ps
+curl -fsS http://127.0.0.1:11435/readyz
+```
+
+Those three local deployment files are ignored by Git, and the named state volume is outside the source tree, so the pull does not replace base settings, secrets, saved browser overrides, or maintenance state.
+
+If `git pull` says a locally modified tracked `docker-compose.yml` would be overwritten, preserve that edit while updating:
+
+```sh
+cd /opt/ollama_intermediary
+git stash push -m "local Compose settings before upgrade" -- docker-compose.yml
+git pull --ff-only
+git stash pop
+docker compose config
 docker compose up -d --build
 ```
+
+If `git stash pop` reports a conflict, do not discard either side. Keep the new project defaults and move only the host-specific values into `docker-compose.override.yml`, then run `docker compose config` again. Even without a conflict, migrating local base-file edits into the ignored override prevents the next pull from stopping. First retain a patch copy of the exact local edit:
+
+```sh
+git diff -- docker-compose.yml > /tmp/ollama-intermediary-compose-local.patch
+```
+
+A small override looks like this:
+
+```yaml
+services:
+  ollama-scheduler:
+    environment:
+      LOG_LEVEL: debug
+```
+
+After host-specific values are represented in the ignored override, restore the tracked base file once with `git restore docker-compose.yml`, then run `docker compose config` again and confirm the merged service still contains those values before recreating it. The temporary patch remains available if the override needs correction. Future `git pull --ff-only` updates will then be straightforward. Do not use `cp -f config.example.yml config.yml`, `git reset --hard`, or a whole-tree replacement as an update procedure.
 
 ## Exposure
 
@@ -142,7 +186,34 @@ ports:
   - "127.0.0.1:11435:11434"
 ```
 
-Inference remains compatible with Ollama's unauthenticated local API. Keep it on a trusted LAN/VPN or place it behind an authenticated reverse proxy. The maintenance mutation endpoints additionally require their own bearer token. Prevent applications from reaching Ollama directly, or they can bypass scheduler serialization and maintenance pause.
+Inference remains compatible with Ollama's unauthenticated local API. Keep it on a trusted LAN/VPN or place it behind an authenticated reverse proxy. The settings API and maintenance mutation endpoints additionally require separate bearer tokens, but those tokens do not protect ordinary Ollama routes. Prevent applications from reaching Ollama directly, or they can bypass scheduler serialization and maintenance pause.
+
+## Settings page and configuration recovery
+
+Open `http://YOUR_UBUNTU_IP:11435/settings` and enter `SETTINGS_TOKEN`. The page exposes only structured application settings that the intermediary knows how to validate. It never edits raw YAML, `config.yml`, `secrets.env`, Docker Compose, Docker networks, volumes, ports, or the Docker socket.
+
+The effective configuration is assembled in this order:
+
+1. The operator-managed, read-only `config.yml` provides the base.
+2. Validated overrides from `/app/state/settings.json` replace matching editable values.
+3. Host-managed tokens remain supplied by `secrets.env`; their values are never sent to the browser.
+
+The page requires validation before apply. A successful apply atomically saves a new revision and the prior last-known-good override, stops new inference admission, gracefully drains an active upstream request, and exits with status 75. Docker's supplied `restart: unless-stopped` policy restarts the service with the new effective configuration. If you deploy without Compose, configure a supervisor such as systemd with `Restart=on-failure`; a foreground process cannot restart itself.
+
+If application configuration is invalid, the intermediary starts a restricted recovery listener on the same container port. In recovery mode:
+
+- `/settings` and `/healthz` remain reachable.
+- `/readyz`, `/status`, inference, and model-management routes return HTTP 503.
+- Safe, editable application values can be validated and applied from the page.
+- Invalid YAML, missing host-only credentials, an invalid `SETTINGS_PATH`, a bad volume mount, or Compose/listener problems must be fixed on the host.
+
+The settings API is locked unless `SETTINGS_TOKEN` exists in the container environment, including during recovery. After changing `secrets.env`, recreate the container so Docker loads the new value:
+
+```sh
+docker compose up -d --force-recreate
+```
+
+If a value changed in `config.yml` still appears unchanged, it probably has a saved browser override. The settings page displays the effective value and its persisted revision. Reset the relevant override before expecting the base-file value to win.
 
 ## Exclusive GPU maintenance
 

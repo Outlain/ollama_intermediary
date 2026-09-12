@@ -66,7 +66,9 @@ test('timed pause countdown begins only after GPU release and auto-resumes', asy
       resolveResume();
     },
   });
-  const started = await state.begin({ duration: '25ms' });
+  // Leave enough wall-clock margin for loaded CI hosts; the behavior under
+  // test is that the timer starts at markReleased(), not millisecond precision.
+  const started = await state.begin({ duration: '250ms' });
   await new Promise((resolve) => setTimeout(resolve, 15));
   assert.equal(state.status().resume_at, null);
   await state.markReleased(started.revision);
@@ -76,7 +78,7 @@ test('timed pause countdown begins only after GPU release and auto-resumes', asy
   await Promise.race([
     resumed,
     new Promise((_, reject) => {
-      timeout = setTimeout(() => reject(new Error('timed pause did not auto-resume')), 500);
+      timeout = setTimeout(() => reject(new Error('timed pause did not auto-resume')), 1_500);
     }),
   ]);
   clearTimeout(timeout);

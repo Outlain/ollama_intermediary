@@ -1,15 +1,21 @@
 import fs from 'node:fs';
+import { isIP } from 'node:net';
 import YAML from 'yaml';
 
 const DURATION_RE = /^([0-9]+(?:\.[0-9]+)?)(ms|s|m|h)$/;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 export function parseDuration(value, field = 'duration') {
-  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) return value;
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= MAX_TIMER_DELAY_MS) return value;
   if (typeof value !== 'string') throw new Error(`${field} must be a duration such as 500ms, 20s, or 30m`);
   const match = DURATION_RE.exec(value.trim());
   if (!match) throw new Error(`${field} has invalid duration ${JSON.stringify(value)}`);
   const factors = { ms: 1, s: 1_000, m: 60_000, h: 3_600_000 };
-  return Number(match[1]) * factors[match[2]];
+  const milliseconds = Number(match[1]) * factors[match[2]];
+  if (!Number.isFinite(milliseconds) || milliseconds > MAX_TIMER_DELAY_MS) {
+    throw new Error(`${field} must not exceed ${MAX_TIMER_DELAY_MS}ms`);
+  }
+  return milliseconds;
 }
 
 const DEFAULTS = {
@@ -92,7 +98,7 @@ function clone(value) {
   return structuredClone(value);
 }
 
-function deepMerge(base, overlay) {
+export function deepMerge(base, overlay) {
   if (!overlay || typeof overlay !== 'object' || Array.isArray(overlay)) return overlay ?? base;
   const result = { ...base };
   for (const [key, value] of Object.entries(overlay)) {
@@ -143,6 +149,23 @@ function normalizeModelPolicy(policy, field, fallbackGroup) {
 }
 
 function validate(config) {
+  if (!Number.isInteger(config.server.body_limit_bytes) || config.server.body_limit_bytes < 1) {
+    throw new Error('server.body_limit_bytes must be a positive integer');
+  }
+  const primaryListen = parseListen(config.server.listen);
+  const listenerAddresses = [primaryListen];
+  if (!Array.isArray(config.server.dedicated_listeners)) {
+    throw new Error('server.dedicated_listeners must be an array');
+  }
+  for (const [index, listener] of config.server.dedicated_listeners.entries()) {
+    if (!listener || typeof listener !== 'object' || Array.isArray(listener)) {
+      throw new Error(`server.dedicated_listeners.${index} must be an object`);
+    }
+    listenerAddresses.push(parseListen(listener.listen));
+    if (!config.clients[listener.client]) {
+      throw new Error(`server.dedicated_listeners.${index}.client must name a configured client`);
+    }
+  }
   if (config.scheduler.max_parallel_generations !== 1) {
     throw new Error('scheduler.max_parallel_generations must be 1; this release intentionally serializes GPU work');
   }
@@ -152,6 +175,20 @@ function validate(config) {
     if (!Number.isInteger(client.queue_limit) || client.queue_limit < 1) throw new Error(`clients.${name}.queue_limit must be a positive integer`);
     if (!['reject', 'drop_newest', 'drop_oldest'].includes(client.overflow_policy)) {
       throw new Error(`clients.${name}.overflow_policy must be reject, drop_newest, or drop_oldest`);
+    }
+    for (const [index, source] of client.source_ips.entries()) {
+      const [address, prefix, extra] = source.split('/');
+      const family = isIP(address);
+      if (!family || extra !== undefined) {
+        throw new Error(`clients.${name}.source_ips.${index} must be an IP address or CIDR`);
+      }
+      if (prefix !== undefined) {
+        const numericPrefix = Number(prefix);
+        const maximum = family === 4 ? 32 : 128;
+        if (!/^\d+$/.test(prefix) || numericPrefix < 0 || numericPrefix > maximum) {
+          throw new Error(`clients.${name}.source_ips.${index} has an invalid CIDR prefix`);
+        }
+      }
     }
   }
   if (!['hold', 'reject_new'].includes(config.circuit_breaker.queue_behavior)) {
@@ -195,7 +232,30 @@ function validate(config) {
   if (typeof config.maintenance.state_path !== 'string' || !config.maintenance.state_path.startsWith('/')) {
     throw new Error('maintenance.state_path must be an absolute path');
   }
-  new URL(config.ollama.url);
+  let backendUrl;
+  try {
+    backendUrl = new URL(config.ollama.url);
+  } catch {
+    throw new Error('ollama.url must be a valid absolute HTTP(S) URL');
+  }
+  if (!['http:', 'https:'].includes(backendUrl.protocol)) {
+    throw new Error('ollama.url must use http or https');
+  }
+  if (backendUrl.username || backendUrl.password || backendUrl.search || backendUrl.hash || backendUrl.pathname !== '/') {
+    throw new Error('ollama.url must be an origin only, without credentials, a path, query string, or fragment');
+  }
+  const backendPort = Number(backendUrl.port || (backendUrl.protocol === 'https:' ? 443 : 80));
+  const backendHost = backendUrl.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  const backendIpFamily = isIP(backendHost);
+  const localBackend = backendHost === 'localhost'
+    || backendHost.endsWith('.localhost')
+    || backendHost === '0.0.0.0'
+    || backendHost === '::'
+    || backendHost === '::1'
+    || (backendIpFamily === 4 && backendHost.startsWith('127.'));
+  if (localBackend && listenerAddresses.some((listener) => listener.port === backendPort)) {
+    throw new Error('ollama.url points back to the intermediary listener; use the real Ollama address');
+  }
 }
 
 export function normalizeConfig(raw = {}) {
@@ -219,19 +279,63 @@ export function expandEnvironment(text, environment = process.env) {
   });
 }
 
-export function loadConfig(path, environment = process.env) {
+/**
+ * Parse the operator-owned YAML without normalizing it. Recovery mode uses the
+ * lenient option so a missing ${NAME:?message} value can be supplied later by a
+ * validated settings override. YAML syntax errors remain host-edit problems: we
+ * never try to rewrite an operator's source file from the web UI.
+ */
+export function parseConfigSource(text, environment = process.env, { allowMissingRequired = false } = {}) {
+  const missingEnvironment = [];
+  const parsed = YAML.parse(text) ?? {};
+  const expandString = (value, fieldPath) => value.replace(
+    /\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:-|:\?)([^}]*))?\}/g,
+    (token, name, operator, operand = '') => {
+      const replacement = environment[name];
+      const missing = replacement === undefined || replacement === '';
+      if (operator === ':-') return missing ? operand : replacement;
+      if (operator === ':?' && missing) {
+        if (!allowMissingRequired) throw new Error(operand || `environment variable ${name} is required`);
+        if (!missingEnvironment.some((entry) => entry.variable === name && entry.path === fieldPath)) {
+          missingEnvironment.push({
+            variable: name,
+            path: fieldPath,
+            message: operand || `environment variable ${name} is required`,
+          });
+        }
+        return '';
+      }
+      return replacement ?? '';
+    },
+  );
+  const expandNode = (value, fieldPath = '') => {
+    if (typeof value === 'string') return expandString(value, fieldPath || '$');
+    if (Array.isArray(value)) return value.map((child, index) => expandNode(child, `${fieldPath}.${index}`));
+    if (!value || typeof value !== 'object') return value;
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [
+      key,
+      expandNode(child, fieldPath ? `${fieldPath}.${key}` : key),
+    ]));
+  };
+  return { raw: expandNode(parsed), missingEnvironment };
+}
+
+export function readConfigSource(path, environment = process.env, options = {}) {
   let text;
   try {
     text = fs.readFileSync(path, 'utf8');
   } catch (error) {
     throw new Error(`cannot read config file ${path}: ${error.message}`, { cause: error });
   }
-  let raw;
   try {
-    raw = YAML.parse(expandEnvironment(text, environment)) ?? {};
+    return parseConfigSource(text, environment, options);
   } catch (error) {
     throw new Error(`cannot parse config file ${path}: ${error.message}`, { cause: error });
   }
+}
+
+export function loadConfig(path, environment = process.env) {
+  const { raw } = readConfigSource(path, environment);
   return normalizeConfig(raw);
 }
 

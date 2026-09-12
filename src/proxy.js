@@ -54,6 +54,8 @@ export class ProxyService {
     this.config = config;
     this.clock = options.clock ?? (() => Date.now());
     this.logger = options.logger ?? new Logger();
+    this.settingsController = options.settingsController ?? null;
+    this.settingsRestartPending = false;
     this.metrics = options.metrics ?? new Metrics();
     this.observability = options.observability ?? new Observability(config, { clock: this.clock });
     this.classifier = new Classifier(config);
@@ -143,6 +145,15 @@ export class ProxyService {
     const id = requestId(request.headers);
     response.setHeader('x-request-id', id);
     const url = new URL(request.url, 'http://proxy.local');
+    if (this.settingsController?.handles(url.pathname)) {
+      return this.settingsController.handle(request, response, url, id);
+    }
+    if (this.settingsRestartPending) {
+      return sendJson(response, 503, {
+        error: 'The intermediary is restarting to apply validated settings.',
+        code: 'settings_restart_pending',
+      }, id);
+    }
     if ((url.pathname === '/debug' || url.pathname === '/debug/') && request.method !== 'GET') {
       response.setHeader('allow', 'GET');
       return sendJson(response, 405, { error: 'debug dashboard only supports GET', code: 'method_not_allowed' }, id);
@@ -1032,5 +1043,13 @@ export class ProxyService {
     await waitWithTimeout(this.workerPromise, 1_000);
     this.backendClient.close();
     this.logger.info('proxy stopped');
+  }
+
+  beginSettingsRestart() {
+    // The new configuration is already durable at this point. Stop admitting
+    // work immediately so no request starts under values that are about to be
+    // replaced, while allowing the active upstream request to drain in stop().
+    this.settingsRestartPending = true;
+    this.scheduler.stop();
   }
 }

@@ -1,3 +1,6 @@
+# This is the operator-owned base configuration. The /settings page never
+# rewrites this file; it stores validated overrides in /app/state/settings.json.
+# Secrets remain in secrets.env and cannot be read or changed in the browser.
 server:
   listen: 0.0.0.0:11434
   body_limit_bytes: 67108864

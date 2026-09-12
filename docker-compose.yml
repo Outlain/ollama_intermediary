@@ -11,10 +11,17 @@ services:
       - "11435:11434"
     environment:
       CONFIG_PATH: /app/config.yml
+      # Validated browser overrides persist in the existing named state volume.
+      SETTINGS_PATH: /app/state/settings.json
+      # Used only if normal configuration cannot start; host port 11435 still
+      # reaches this container listener through the ports mapping below.
+      SETTINGS_RECOVERY_LISTEN: 0.0.0.0:11434
       LOG_LEVEL: info
     env_file:
       - ./secrets.env
     volumes:
+      # Base configuration is intentionally read-only. The settings page writes
+      # only a validated override document under /app/state.
       - ./config.yml:/app/config.yml:ro
       - ollama-scheduler-state:/app/state
     read_only: true
