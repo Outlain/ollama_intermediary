@@ -92,6 +92,29 @@ test('changing the Frigate origin preserves old backlog and reports a specific h
   assert.equal(fs.readFileSync(first.settings.state_path, 'utf8'), original);
 });
 
+test('backlog pagination exposes every saved job in bounded newest-first metadata pages', (t) => {
+  const { worker } = setup(t);
+  worker.state.jobs = Array.from({ length: 258 }, (_, i) => ({
+    id: `event-${i}`, kind: i % 2 ? 'object' : 'review', camera: 'yard', event_time: i,
+    state: 'pending', attempts: 0, next_attempt_at: 0, prompt: 'PRIVATE', image: 'PRIVATE',
+  }));
+  const ids = [];
+  for (let offset = 0; offset < 258; offset += 30) {
+    const page = worker.jobs({ offset, limit: 30 });
+    assert.equal(page.total, 258);
+    assert.ok(page.items.length <= 30);
+    assert.doesNotMatch(JSON.stringify(page), /PRIVATE|prompt|image/);
+    ids.push(...page.items.map((item) => item.id));
+  }
+  assert.equal(new Set(ids).size, 258);
+  assert.equal(ids[0], 'event-257');
+  assert.equal(ids.at(-1), 'event-0');
+  assert.equal(worker.jobs({ offset: 999, limit: 30 }).offset, 240);
+  assert.throws(() => worker.jobs({ limit: 101 }), /Invalid backlog page/);
+  assert.throws(() => worker.jobs({ offset: -1 }), /Invalid backlog page/);
+  assert.equal(worker.status().pending_jobs.length, 30);
+});
+
 test('Frigate eligibility respects effective per-camera filters and runtime toggles', () => {
   const config = cameraConfig();
   assert.equal(frigateEligibility('object', object('o'), config).source, 'snapshot');

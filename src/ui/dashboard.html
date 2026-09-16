@@ -140,13 +140,14 @@
         </dl>
         <p id="catchup-capabilities" class="muted">Object / review API support not checked.</p>
         <p id="catchup-active" class="muted">No background handoff.</p>
+        <p id="catchup-confirmation" class="notice notice-warning" hidden></p>
         <p id="catchup-error" class="notice notice-error" hidden></p>
         <p id="catchup-warning" class="notice notice-warning" hidden></p>
         <div class="catchup-columns">
-          <section aria-labelledby="catchup-pending-heading"><h3 id="catchup-pending-heading">Waiting list · newest first</h3><p id="catchup-pending-empty" class="compact-empty">No descriptions are waiting.</p><ul id="catchup-pending-jobs" class="queue-list" aria-label="Pending catch-up jobs"></ul></section>
+          <section aria-labelledby="catchup-pending-heading"><h3 id="catchup-pending-heading">Waiting list · newest first</h3><p id="catchup-pending-empty" class="compact-empty">No descriptions are waiting.</p><ul id="catchup-pending-jobs" class="queue-list" aria-label="Pending catch-up jobs"></ul><p id="catchup-page-status" class="muted" role="status">No queued descriptions.</p><div class="catchup-pagination"><button id="catchup-previous" type="button" class="quiet-button" disabled>Previous 30</button><button id="catchup-next" type="button" class="quiet-button" disabled>Next 30</button></div><p class="muted">Browse the whole saved queue. Positions can change as new events arrive or jobs finish.</p></section>
           <section aria-labelledby="catchup-recent-heading"><h3 id="catchup-recent-heading">Recent results</h3><p id="catchup-recent-empty" class="compact-empty">No completed or skipped jobs yet.</p><ul id="catchup-jobs" class="queue-list" aria-label="Recent catch-up jobs"></ul></section>
         </div>
-        <p><a class="quiet-button" href="/settings#catchup">Configure / fill missing descriptions</a></p>
+        <p><a class="quiet-button" href="/settings#catchup">Open catch-up settings</a> <span class="muted">Use “Fill missing descriptions” there to start a historical scan.</span></p>
         <small class="muted">Newest event first. Frigate stores the images; this queue stores identifiers only. Work already handed to Frigate is not preempted.</small>
       </section>
 

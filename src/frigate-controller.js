@@ -16,9 +16,17 @@ export class FrigateController {
 
   async handle(request, response, url, id) {
     response.setHeader('cache-control', 'no-store');
-    if (request.method === 'GET' && [PREFIX, `${PREFIX}/status`].includes(url.pathname)) {
+    if (request.method === 'GET' && [PREFIX, `${PREFIX}/status`, `${PREFIX}/jobs`].includes(url.pathname)) {
       if (!authorized(request, this.readToken) && !(this.controlToken && authorized(request, this.controlToken))) {
         return sendJson(response, 401, { error: 'Observability or settings token required.', code: 'unauthorized' }, id);
+      }
+      if (url.pathname === `${PREFIX}/jobs`) {
+        const offset = Number(url.searchParams.get('offset') ?? 0);
+        const limit = Number(url.searchParams.get('limit') ?? 30);
+        if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+          return sendJson(response, 400, { error: 'offset must be a nonnegative integer; limit must be 1–100.', code: 'invalid_page' }, id);
+        }
+        return sendJson(response, 200, this.catchup.jobs({ offset, limit }), id);
       }
       return sendJson(response, 200, this.catchup.status(), id);
     }

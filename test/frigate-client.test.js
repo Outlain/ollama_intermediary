@@ -81,6 +81,30 @@ test('explicit bearer authentication never performs password login', async (t) =
   assert.equal(requests[0].headers.authorization, 'Bearer token-value');
 });
 
+test('explicit no-login mode never sends configured credentials or attempts login after 401', async (t) => {
+  let status = 200;
+  const { client, requests } = await server(t, (_request, response) => json(response, {}, status), {
+    auth_mode: 'none', username: 'unused', password: 'unused', auth_token: 'unused-token',
+  });
+  client.cookie = 'old-cookie=unused';
+  await client.getConfig();
+  status = 401;
+  await assert.rejects(client.getConfig(), { code: 'authentication_failed' });
+  assert.equal(requests.length, 2);
+  assert.ok(requests.every((r) => r.url === '/api/config' && !r.headers.authorization && !r.headers.cookie));
+});
+
+test('explicit password mode ignores a leftover bearer token', async (t) => {
+  const { client, requests } = await server(t, (request, response) => {
+    if (request.url === '/api/login') response.setHeader('set-cookie', 'frigate_token=login-test; Path=/');
+    json(response, {});
+  }, { auth_mode: 'password', username: 'admin', password: 'test', auth_token: 'unused-token' });
+  await client.getConfig();
+  assert.equal(requests[0].url, '/api/login');
+  assert.equal(requests[1].headers.cookie, 'frigate_token=login-test');
+  assert.equal(requests[1].headers.authorization, undefined);
+});
+
 test('request errors do not expose response bodies, URL or credentials', async (t) => {
   const { client } = await server(t, (request, response) => json(response, { error: 'PRIVATE_CAMERA_PASSWORD' }, 503));
   await assert.rejects(client.getConfig(), (error) => {

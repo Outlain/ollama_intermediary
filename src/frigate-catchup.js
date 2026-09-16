@@ -35,6 +35,12 @@ const restoredJob = (job) => ({
   created_at: Number.isFinite(job.created_at) ? job.created_at : 0,
   next_attempt_at: job.next_attempt_at, ...(Number.isFinite(job.completed_at) ? { completed_at: job.completed_at } : {}),
 });
+const publicJob = (job) => ({
+  kind: job.kind, id: text(job.id), camera: text(job.camera), event_time: job.event_time,
+  state: job.state, reason: safeReason(job.reason), attempts: job.attempts,
+  next_attempt_at: job.next_attempt_at ?? null, completed_at: job.completed_at ?? null,
+});
+const newestFirst = (a, b) => b.event_time - a.event_time || key(a.kind, a.id).localeCompare(key(b.kind, b.id));
 
 export function hasFrigateDescription(kind, item) {
   if (kind === 'object') return typeof item?.data?.description === 'string' && Boolean(item.data.description.trim());
@@ -237,12 +243,7 @@ export class FrigateCatchup {
   status() {
     const counts = { pending: 0, waiting_live: 0, waiting_result: 0, retrying: 0 };
     for (const job of this.state?.jobs ?? []) counts[job.state] += 1;
-    const publicJob = (job) => ({
-      kind: job.kind, id: text(job.id), camera: text(job.camera), event_time: job.event_time,
-      state: job.state, reason: safeReason(job.reason), attempts: job.attempts,
-      next_attempt_at: job.next_attempt_at ?? null, completed_at: job.completed_at ?? null,
-    });
-    const queueItems = [...(this.state?.jobs ?? [])].sort((a, b) => b.event_time - a.event_time).slice(0, 30).map(publicJob);
+    const queueItems = this.jobs().items;
     return {
       enabled: Boolean(this.settings.enabled),
       state: !this.settings.enabled ? 'disabled' : this.storeError ? 'error' : !this.running ? 'stopped'
@@ -267,6 +268,17 @@ export class FrigateCatchup {
       },
       last_error: this.storeError ?? this.lastError, next_poll_at: this.nextPollAt,
     };
+  }
+
+  jobs({ offset = 0, limit = 30 } = {}) {
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new RangeError('Invalid backlog page');
+    }
+    const jobs = [...(this.state?.jobs ?? [])].sort(newestFirst);
+    // A live queue can shrink between pages; return the last valid page, not a blank screen.
+    const start = Math.min(offset, Math.max(0, Math.floor((jobs.length - 1) / limit) * limit));
+    return { items: jobs.slice(start, start + limit).map(publicJob), offset: start, limit,
+      total: jobs.length, has_more: start + limit < jobs.length };
   }
 
   scanMissing() {

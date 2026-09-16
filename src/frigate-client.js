@@ -21,6 +21,9 @@ export class FrigateError extends Error {
 export class FrigateClient {
   constructor(settings) {
     this.settings = settings;
+    this.authMode = !settings.auth_mode || settings.auth_mode === 'auto'
+      ? settings.auth_token ? 'token' : settings.username ? 'password' : 'none'
+      : settings.auth_mode;
     this.base = new URL(settings.url);
     if (!['http:', 'https:'].includes(this.base.protocol) || this.base.username || this.base.password) {
       throw new FrigateError('invalid_frigate_url');
@@ -53,8 +56,8 @@ export class FrigateClient {
     // A cached empty description can race a live completion and cause overwrite.
     const headers = { accept: discard ? '*/*' : 'application/json', 'x-cache-bypass': '1' };
     if (authenticated) {
-      if (this.settings.auth_token) headers.authorization = `Bearer ${this.settings.auth_token}`;
-      else if (this.cookie) headers.cookie = this.cookie;
+      if (this.authMode === 'token' && this.settings.auth_token) headers.authorization = `Bearer ${this.settings.auth_token}`;
+      else if (this.authMode === 'password' && this.cookie) headers.cookie = this.cookie;
     }
     if (payload) {
       headers['content-type'] = 'application/json';
@@ -120,12 +123,12 @@ export class FrigateClient {
   }
 
   async request(route, options = {}) {
-    if (this.settings.username && !this.settings.auth_token && !this.cookie) await this.login();
+    if (this.authMode === 'password' && !this.cookie) await this.login();
     let response;
     try {
       response = await this.raw(route, options);
     } catch (error) {
-      if (error.statusCode !== 401 || !this.settings.username || this.settings.auth_token) throw error;
+      if (error.statusCode !== 401 || this.authMode !== 'password') throw error;
       this.cookie = null;
       await this.login();
       response = await this.raw(route, options);

@@ -94,6 +94,7 @@ const EDITABLE_TREE = Object.freeze({
   frigate: Object.freeze({
     enabled: boolean(),
     url: descriptor('url', { schemes: ['http:', 'https:'] }),
+    auth_mode: descriptor('enum', { values: ['auto', 'none', 'password', 'token'] }),
     verify_tls: boolean(),
     poll_interval: duration({ greaterThanZero: true }),
     live_grace: duration(),
@@ -395,9 +396,9 @@ function operationalDiagnostics(raw) {
     diagnostics.push(diagnostic('frigate.verify_tls', 'tls_verification_disabled',
       'Frigate TLS certificate verification is disabled. Use only on a trusted network; credentials can be intercepted.', 'warning'));
   }
-  if (raw?.frigate?.enabled && !raw.frigate.auth_token && (!raw.frigate.username || !raw.frigate.password)) {
+  if (raw?.frigate?.enabled && raw.frigate.auth_mode !== 'none' && !raw.frigate.auth_token && (!raw.frigate.username || !raw.frigate.password)) {
     diagnostics.push(diagnostic('frigate.authentication', 'frigate_credentials_missing',
-      'No Frigate credentials are configured. Only the trusted internal unauthenticated API can work without them.', 'warning'));
+      'No Frigate credentials are configured. For an intentionally open trusted API, select No login required in Frigate authentication.', 'warning'));
   }
   if (raw?.maintenance?.enabled && !raw.maintenance.auth_token) {
     diagnostics.push(diagnostic(

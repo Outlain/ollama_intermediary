@@ -154,6 +154,8 @@ frigate:
   # Old operator config.yml files need no replacement: these defaults are automatic.
   enabled: false
   url: "${FRIGATE_URL:-}"
+  # Use none for an intentionally open trusted API; auto preserves existing setups.
+  auth_mode: auto
   username: "${FRIGATE_USERNAME:-}"
   password: "${FRIGATE_PASSWORD:-}"
   auth_token: "${FRIGATE_AUTH_TOKEN:-}"

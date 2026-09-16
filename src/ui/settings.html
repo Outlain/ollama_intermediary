@@ -256,6 +256,7 @@
           <div class="field-grid field-grid-2">
             <label class="check-field" data-field-wrap="frigate.enabled"><input data-path="frigate.enabled" type="checkbox"><span><strong>Enable catch-up</strong><small>Requires a reachable Frigate API and retained media.</small></span><span class="field-error" data-error-for="frigate.enabled"></span></label>
             <div class="field" data-field-wrap="frigate.url"><label for="frigate-url">Frigate API origin</label><input id="frigate-url" data-path="frigate.url" type="url" placeholder="https://frigate.example:8971" spellcheck="false"><p class="field-help">Not the Ollama address. No /api suffix. Credentials belong in secrets.env.</p><p class="field-error" data-error-for="frigate.url"></p></div>
+            <div class="field" data-field-wrap="frigate.auth_mode"><label for="frigate-auth-mode">Frigate authentication</label><select id="frigate-auth-mode" data-path="frigate.auth_mode"><option value="auto">Automatic (existing behavior)</option><option value="none">No login required — trusted local API</option><option value="password">Username and password from secrets.env</option><option value="token">Bearer token from secrets.env</option></select><p class="field-help">No login sends no credentials, even if old secrets remain configured. Keep an open API restricted to your trusted network.</p><p class="field-error" data-error-for="frigate.auth_mode"></p></div>
             <label class="check-field" data-field-wrap="frigate.verify_tls"><input data-path="frigate.verify_tls" type="checkbox"><span><strong>Verify TLS certificate</strong><small>Keep enabled. Disabling permits untrusted certificates and should only be used on a trusted network.</small></span><span class="field-error" data-error-for="frigate.verify_tls"></span></label>
             <div class="field" data-field-wrap="frigate.poll_interval"><label>Discovery interval<input data-path="frigate.poll_interval" type="text" placeholder="30s"></label><p class="field-error" data-error-for="frigate.poll_interval"></p></div>
             <div class="field" data-field-wrap="frigate.live_grace"><label>Let live descriptions finish first<input data-path="frigate.live_grace" type="text" placeholder="2m"></label><p class="field-help">Minimum delay after an event ends before it becomes a catch-up candidate.</p><p class="field-error" data-error-for="frigate.live_grace"></p></div>
@@ -267,7 +268,7 @@
           <p id="catchup-auth" class="section-intro">Credentials are managed on the host.</p>
           <p id="catchup-status" class="section-intro" role="status">Save and apply the connection settings before scanning.</p>
           <button id="catchup-scan" class="secondary-button" type="button">Fill missing descriptions from retained history</button>
-          <p class="field-help">Scans all eligible retained items, not only those recorded since enablement. Existing descriptions are kept. Pause mode stops background generation, not camera recording.</p>
+          <p class="field-help">Scans all eligible retained items, not only those recorded since enablement. Already-described items are skipped at the final check. Pause mode stops background generation, not camera recording.</p>
         </section>
 
         <section id="gpu-safety" class="settings-card" aria-labelledby="gpu-heading">

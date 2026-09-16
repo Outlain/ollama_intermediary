@@ -17,6 +17,10 @@
   var refreshPromise = null;
   var pollTimer = null;
   var authBlocked = false;
+  var catchupOffset = 0;
+  var catchupPage = null;
+  var catchupPagePromise = null;
+  var CATCHUP_PAGE_SIZE = 30;
 
   function byId(id) { return document.getElementById(id); }
   function setText(id, value) {
@@ -490,28 +494,91 @@
       : 'Enable recovery and configure the Frigate connection in Settings.');
     var active = data.active_job;
     setText('catchup-active', active ? titleCase(active.kind) + ' · ' + (active.camera || '') + ' · ' + titleCase(active.state || active.status) : 'No background handoff.');
+    setHidden('catchup-confirmation', !active);
+    if (active) {
+      var remaining = Math.max(0, (Number(active.next_attempt_at) - Date.now()) / 1000);
+      setText('catchup-confirmation', (remaining > 0
+        ? 'Waiting for Frigate to save the description. Confirmation window: ' + formatDuration(remaining) + ' remaining. '
+        : 'Confirmation window elapsed. Waiting for an idle opportunity to schedule a retry. ')
+        + 'This is not proof that the model is still generating. A failed generation may remain here until verification times out; no second catch-up handoff starts meanwhile.');
+    }
     setHidden('catchup-error', !data.last_error);
     setText('catchup-error', typeof data.last_error === 'string' ? data.last_error : data.last_error && (data.last_error.message || data.last_error.code));
     var warnings = Array.isArray(data.warnings) ? data.warnings : [];
     setHidden('catchup-warning', !warnings.length);
     setText('catchup-warning', warnings.length ? 'Some cameras use early-only object triggers that cannot be reconstructed later: '
       + warnings.map(function (warning) { return warning.camera + ' (' + titleCase(warning.code) + ')'; }).join(', ') : '');
-    function renderJobs(id, emptyId, jobs) {
+    renderCatchupJobs('catchup-jobs', 'catchup-recent-empty', Array.isArray(data.recent_jobs) ? data.recent_jobs : []);
+    if (catchupOffset === 0) {
+      catchupPage = { items: Array.isArray(data.pending_jobs) ? data.pending_jobs : [], offset: 0,
+        limit: CATCHUP_PAGE_SIZE, total: data.total_queued == null
+          ? Object.keys(counts).reduce(function (sum, key) { return sum + (counts[key] || 0); }, 0) : data.total_queued };
+    }
+    renderCatchupPage();
+  }
+
+  function renderCatchupJobs(id, emptyId, jobs) {
       var list = byId(id);
       list.replaceChildren();
       setHidden(emptyId, jobs.length > 0);
-      jobs.slice(0, 10).forEach(function (job) {
+      jobs.forEach(function (job) {
         var item = create('li', 'queue-item');
         item.appendChild(create('strong', '', titleCase(job.kind) + ' · ' + (job.camera || '') + ' · ' + titleCase(job.state || job.status)));
         var eventTime = Number(job.event_time);
         var details = compactId(job.id || job.event_id) + (Number.isFinite(eventTime) && eventTime > 0 ? ' · Recorded ' + new Date(eventTime * 1000).toLocaleString() : '');
         if (job.reason) details += ' · ' + titleCase(job.reason);
+        if (job.state === 'retrying' && job.next_attempt_at) details += ' · Retry after ' + formatDate(job.next_attempt_at);
         item.appendChild(create('p', 'muted', details));
         list.appendChild(item);
       });
-    }
-    renderJobs('catchup-pending-jobs', 'catchup-pending-empty', Array.isArray(data.pending_jobs) ? data.pending_jobs : []);
-    renderJobs('catchup-jobs', 'catchup-recent-empty', Array.isArray(data.recent_jobs) ? data.recent_jobs : []);
+  }
+
+  function renderCatchupPage() {
+    var page = catchupPage || { items: [], offset: 0, total: 0 };
+    renderCatchupJobs('catchup-pending-jobs', 'catchup-pending-empty', page.items);
+    setText('catchup-page-status', page.total ? 'Showing ' + (page.offset + 1) + '–'
+      + (page.offset + page.items.length) + ' of ' + formatInteger(page.total) + ' saved jobs' : 'No queued descriptions.');
+    byId('catchup-previous').disabled = Boolean(catchupPagePromise) || catchupOffset === 0;
+    byId('catchup-next').disabled = Boolean(catchupPagePromise) || catchupOffset + CATCHUP_PAGE_SIZE >= page.total;
+  }
+
+  async function refreshCatchupPage() {
+    if (catchupPagePromise) return catchupPagePromise;
+    var offset = catchupOffset;
+    var controller = new AbortController();
+    var timeout = window.setTimeout(function () { controller.abort(); }, 10000);
+    catchupPagePromise = (async function () {
+      try {
+        var response = await fetch('/_intermediary/v1/frigate/jobs?offset=' + offset + '&limit=' + CATCHUP_PAGE_SIZE,
+          { headers: requestHeaders(), cache: 'no-store', signal: controller.signal });
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        var page = await response.json();
+        if (!Array.isArray(page.items) || !Number.isSafeInteger(page.offset) || !Number.isSafeInteger(page.total)) throw new Error('Invalid page');
+        if (offset !== catchupOffset) return;
+        catchupOffset = page.offset;
+        catchupPage = page;
+        renderCatchupPage();
+      } catch (error) {
+        setText('catchup-page-status', 'Could not refresh this queue page. Retrying automatically; saved jobs are unchanged.');
+      } finally {
+        window.clearTimeout(timeout);
+        catchupPagePromise = null;
+        byId('catchup-previous').disabled = catchupOffset === 0;
+        byId('catchup-next').disabled = !catchupPage || catchupOffset + CATCHUP_PAGE_SIZE >= catchupPage.total;
+      }
+    })();
+    byId('catchup-previous').disabled = true;
+    byId('catchup-next').disabled = true;
+    return catchupPagePromise;
+  }
+
+  async function changeCatchupPage(direction) {
+    if (catchupPagePromise || !catchupPage) return;
+    var next = Math.max(0, catchupOffset + direction * CATCHUP_PAGE_SIZE);
+    if (next >= catchupPage.total && next !== 0) return;
+    catchupOffset = next;
+    await refreshCatchupPage();
+    byId('catchup-pending-jobs').scrollTop = 0;
   }
 
   function updateLiveClocks() {
@@ -555,6 +622,7 @@
         hideAuth();
         showError('');
         render(data);
+        if (catchupOffset > 0) await refreshCatchupPage();
         setConnection('live', 'Polling every 2s');
         return true;
       } catch (error) {
@@ -677,6 +745,8 @@
   });
 
   byId('pause-button').addEventListener('click', function () { performMaintenanceAction('pause'); });
+  byId('catchup-previous').addEventListener('click', function () { changeCatchupPage(-1); });
+  byId('catchup-next').addEventListener('click', function () { changeCatchupPage(1); });
   byId('resume-button').addEventListener('click', function () { performMaintenanceAction('resume'); });
 
   window.addEventListener('pagehide', stopConnections);

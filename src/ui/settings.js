@@ -243,7 +243,7 @@
           id: key,
           title: title,
           message: message,
-          ok: expectedFalse ? value === false : (key === 'ui_can_apply' ? undefined : (typeof value === 'boolean' ? value : undefined)),
+          ok: expectedFalse ? value === false : (key === 'ui_can_apply' || key === 'frigate_auth_configured' ? undefined : (typeof value === 'boolean' ? value : undefined)),
           severity: key === 'ui_can_apply' && value === false ? 'warning' : 'info'
         };
       });
@@ -473,6 +473,16 @@
       setText('action-detail', 'Edit a field to create a draft.');
     }
     setText('fallback-client-readout', getPath(collectSettings(), 'scheduler.default_client') || 'Odysseus');
+    renderFrigateAuthentication();
+  }
+
+  function renderFrigateAuthentication() {
+    var mode = getPath(collectSettings(), 'frigate.auth_mode') || 'auto';
+    var configured = loadedEnvelope && loadedEnvelope.infrastructure && loadedEnvelope.infrastructure.frigate_auth_configured;
+    setText('catchup-auth', mode === 'none'
+      ? 'No Frigate login is required. The intermediary will send no credentials. Only use this on a trusted local network.'
+      : configured ? 'Frigate credentials are managed in secrets.env; their values are never sent to this page.'
+      : 'For an open local API, select No login required above. Otherwise add the selected credentials to secrets.env and recreate the container.');
   }
 
   function applyEnvelope(payload) {
@@ -491,9 +501,12 @@
     lastValidatedSignature = '';
     showWorkspace();
     updateDirtyState();
-    setText('catchup-auth', payload.infrastructure && payload.infrastructure.frigate_auth_configured
-      ? 'Frigate credentials are configured in secrets.env. Their contents are never sent to this page.'
-      : 'Frigate credentials are not configured. Set FRIGATE_USERNAME + FRIGATE_PASSWORD (or FRIGATE_AUTH_TOKEN) in secrets.env and recreate the container. A trusted internal unauthenticated API is also supported.');
+    // Anchors may have been resolved while the authenticated workspace was hidden.
+    var section = window.location && window.location.hash;
+    if (section && /^#[a-z-]+$/.test(section)) window.setTimeout(function () {
+      var target = byId(section.slice(1));
+      if (target) target.scrollIntoView({ block: 'start' });
+    }, 0);
     refreshCatchup();
   }
 
@@ -506,14 +519,15 @@
       var counts = data.counts || {};
       setText('catchup-status', 'Objects: ' + (data.capabilities && data.capabilities.object ? 'supported' : 'not verified')
         + ' · Reviews: ' + (data.capabilities && data.capabilities.review ? 'supported' : 'not verified')
-        + ' · Pending: ' + (counts.pending || 0) + ' · Retrying: ' + (counts.retrying || 0)
+        + ' · Waiting: ' + ((counts.pending || 0) + (counts.waiting_live || 0))
+        + ' · Awaiting saved result: ' + (counts.waiting_result || 0) + ' · Retrying: ' + (counts.retrying || 0)
         + (data.last_error ? ' · ' + (data.last_error.message || data.last_error.code || data.last_error) : ''));
     } catch (_) { /* Settings may be restarting; keep current status. */ }
   }
 
   byId('catchup-scan').addEventListener('click', async function () {
     if (busy || dirty) return;
-    if (!window.confirm('Scan all retained eligible objects and reviews without descriptions? This can create a large background backlog. Existing descriptions will not be replaced.')) return;
+    if (!window.confirm('Scan all retained eligible objects and reviews without descriptions? This can create a large background backlog. Items with descriptions are skipped at the final check.')) return;
     setBusy(true, 'Starting historical discovery…');
     try {
       var response = await fetch('/_intermediary/v1/frigate/scan', {

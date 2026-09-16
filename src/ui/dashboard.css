@@ -380,3 +380,7 @@ main { padding-block: 28px 16px; }
 @media (forced-colors: active) {
   .health-orb, .connection-dot, .event-dot, .empty-pulse { forced-color-adjust: none; }
 }
+
+.catchup-pagination { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
+.catchup-pagination button:disabled { opacity: .45; cursor: not-allowed; }
+#catchup-page-status { margin-top: 12px; }

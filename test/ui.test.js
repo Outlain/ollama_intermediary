@@ -31,6 +31,7 @@ class Element {
   addEventListener() {}
   setAttribute() {}
   focus() {}
+  scrollIntoView() { this.scrolled = true; }
   remove() {}
   querySelectorAll() { return this.children; }
 }
@@ -72,7 +73,7 @@ function harness(kind) {
   });
   const marker = kind === 'dashboard' ? "  byId('token-form').addEventListener" : '  bindEvents();';
   const names = kind === 'dashboard'
-    ? 'eventSeverity, formatRelativeDate, renderCatchup, healthState, refreshSnapshot, startPolling'
+    ? 'eventSeverity, formatRelativeDate, renderCatchup, healthState, refreshSnapshot, startPolling, changeCatchupPage'
     : 'restartInfo, applyEnvelope, updateDirtyState';
   const boundary = source.indexOf(marker);
   assert.ok(boundary > 0, 'UI bootstrap marker must remain identifiable');
@@ -121,6 +122,54 @@ test('catch-up rendering uses durable totals, pending jobs, timestamps, and expi
   assert.match(nodes.get('catchup-pending-jobs').textContent, /Recorded/);
   assert.match(nodes.get('catchup-jobs').textContent, /Media Expired/);
   assert.equal(nodes.get('catchup-pending-empty').hidden, true);
+});
+
+test('backlog UI shows 30 jobs and pages through the remaining saved jobs', async () => {
+  const { context, ui, nodes } = harness('dashboard');
+  const rows = Array.from({ length: 65 }, (_, i) => ({ id: `event-${i}`, kind: 'object', camera: 'Yard', state: 'pending' }));
+  ui.renderCatchup({ enabled: true, total_queued: 65, counts: { pending: 65 }, pending_jobs: rows.slice(0, 30) });
+  assert.equal(nodes.get('catchup-pending-jobs').children.length, 30);
+  assert.equal(nodes.get('catchup-page-status').textContent, 'Showing 1–30 of 65 saved jobs');
+  const requests = [];
+  context.fetch = async (url) => {
+    requests.push(url);
+    const offset = Number(new URL(url, 'http://example.test').searchParams.get('offset'));
+    return { ok: true, json: async () => ({ offset, limit: 30, total: 65, items: rows.slice(offset, offset + 30) }) };
+  };
+  await ui.changeCatchupPage(1);
+  assert.equal(nodes.get('catchup-page-status').textContent, 'Showing 31–60 of 65 saved jobs');
+  await ui.changeCatchupPage(1);
+  assert.equal(nodes.get('catchup-pending-jobs').children.length, 5);
+  assert.equal(nodes.get('catchup-next').disabled, true);
+  await ui.changeCatchupPage(-1);
+  assert.equal(nodes.get('catchup-page-status').textContent, 'Showing 31–60 of 65 saved jobs');
+  assert.ok(requests.every((url) => url.includes('limit=30')));
+});
+
+test('waiting result explains the confirmation window instead of implying active GPU generation', () => {
+  const { ui, nodes } = harness('dashboard');
+  ui.renderCatchup({ enabled: true, active_job: { kind: 'review', camera: 'Yard', state: 'waiting_result', next_attempt_at: Date.now() + 600000 } });
+  assert.equal(nodes.get('catchup-confirmation').hidden, false);
+  assert.match(nodes.get('catchup-confirmation').textContent, /Confirmation window/);
+  assert.match(nodes.get('catchup-confirmation').textContent, /not proof that the model is still generating/);
+  ui.renderCatchup({ enabled: true, active_job: { state: 'waiting_result', next_attempt_at: 1 } });
+  assert.match(nodes.get('catchup-confirmation').textContent, /elapsed/);
+});
+
+test('open API authentication does not become a red infrastructure error and explains no login', () => {
+  const { ui, nodes } = harness('settings');
+  ui.applyEnvelope({ settings: maskSettings(testConfig({ frigate: { enabled: true, url: 'http://frigate.example', auth_mode: 'none' } })),
+    valid: true, revision: 'test', infrastructure: { ui_can_apply: true, frigate_auth_configured: false } });
+  assert.doesNotMatch(nodes.get('diagnostics-summary').textContent, /error/);
+  assert.match(nodes.get('catchup-auth').textContent, /No Frigate login is required/);
+});
+
+test('settings restores the requested section after the authenticated workspace is shown', () => {
+  const { context, ui, nodes, timeouts } = harness('settings');
+  context.window.location = { hash: '#catchup' };
+  ui.applyEnvelope({ settings: maskSettings(testConfig()), valid: true, revision: 'test', infrastructure: { ui_can_apply: true } });
+  for (const timer of timeouts.values()) if (timer.milliseconds === 0) timer.fn();
+  assert.equal(nodes.get('catchup').scrolled, true);
 });
 
 test('dashboard restores the connected badge after a temporary polling failure', async () => {

@@ -66,6 +66,23 @@ test('GPU recovery acknowledgment requires admin, pause, empty models, and expli
   assert.equal(service.maintenance.paused, true);
 });
 
+test('backlog pages use read authorization and enforce bounded page parameters', async (t) => {
+  const calls = [];
+  const catchup = { start() {}, async stop() {}, status: () => ({}), jobs(page) { calls.push(page); return { ...page, total: 50, items: [] }; } };
+  const { base } = await fixture(t, { observability: { auth_token: 'read-test' } }, { catchup });
+  const endpoint = `${base}/_intermediary/v1/frigate/jobs`;
+  assert.equal((await fetch(endpoint)).status, 401);
+  for (const token of ['read-test', 'settings-test']) {
+    const response = await fetch(`${endpoint}?offset=30&limit=30`, { headers: { authorization: `Bearer ${token}` } });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).total, 50);
+  }
+  for (const query of ['offset=-1', 'offset=NaN', 'limit=101', 'limit=0', 'limit=1.5']) {
+    assert.equal((await fetch(`${endpoint}?${query}`, { headers: { authorization: 'Bearer read-test' } })).status, 400);
+  }
+  assert.deepEqual(calls, [{ offset: 30, limit: 30 }, { offset: 30, limit: 30 }]);
+});
+
 test('request memory admission includes bodies held by an active HTTP request', async (t) => {
   const { base, service } = await fixture(t, { server: { body_limit_bytes: 300 }, scheduler: { max_queue_bytes: 300 } });
   const body = { model: 'od-model', id: 'long', delay_ms: 150, prompt: 'x'.repeat(160) };

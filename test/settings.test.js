@@ -79,6 +79,14 @@ function fixture(t) {
   };
 }
 
+test('explicit open Frigate API mode is editable without a missing-credentials warning', (t) => {
+  const options = fixture(t);
+  const result = validateSettingsDraft({ ...options, draft: { frigate: { enabled: true, url: 'http://frigate.test:5000', auth_mode: 'none' } } });
+  assert.equal(result.valid, true);
+  assert.equal(result.settings.frigate.auth_mode, 'none');
+  assert.equal(result.diagnostics.some((item) => item.code === 'frigate_credentials_missing'), false);
+});
+
 test('model overrides support normal tags and namespaces without exposing Frigate credentials', () => {
   const baseRaw = {
     server: { listen: '127.0.0.1:0' },

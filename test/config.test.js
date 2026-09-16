@@ -30,6 +30,16 @@ test('Frigate connection and operational bounds fail safely', () => {
   assert.throws(() => normalized({ scheduler: { mode: 'unknown' } }), /scheduler.mode/);
 });
 
+test('Frigate authentication is explicit and authenticated modes require host-managed credentials', () => {
+  const normalize = (frigate) => normalizeConfig({ server: { listen: '127.0.0.1:0' }, frigate: { enabled: true, url: 'http://frigate.test:5000', ...frigate } });
+  assert.equal(normalize({ auth_mode: 'none' }).frigate.auth_mode, 'none');
+  assert.equal(normalize({}).frigate.auth_mode, 'auto');
+  assert.throws(() => normalize({ auth_mode: 'invalid' }), /frigate.auth_mode/);
+  assert.throws(() => normalize({ auth_mode: 'password' }), /FRIGATE_USERNAME/);
+  assert.throws(() => normalize({ auth_mode: 'token' }), /FRIGATE_AUTH_TOKEN/);
+  assert.equal(normalize({ auth_mode: 'password', username: 'admin', password: 'test' }).frigate.auth_mode, 'password');
+});
+
 test('configuration environment values are expanded after YAML parsing', () => {
   const injected = 'http://192.0.2.10:11434\nscheduler:\n  default_client: attacker';
   const source = parseConfigSource('ollama:\n  url: "${OLLAMA_URL:?required}"\n', { OLLAMA_URL: injected });

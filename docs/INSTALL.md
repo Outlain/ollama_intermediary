@@ -220,7 +220,7 @@ The page requires validation before apply. A successful apply atomically saves a
 ## Enable Frigate object and review recovery
 
 1. Keep Frigate's Ollama provider pointed at this intermediary. Verify live requests are identified as `frigate` before enabling recovery.
-2. Set `FRIGATE_URL` in `secrets.env` to the reachable Frigate origin (for example `https://YOUR_FRIGATE_HOST:8971`, without `/api`). Supply `FRIGATE_USERNAME` and `FRIGATE_PASSWORD`, or `FRIGATE_AUTH_TOKEN`, for an administrator-capable connection. Use trusted TLS, and do not put credentials into the URL or UI.
+2. Set `FRIGATE_URL` in `secrets.env` to the reachable Frigate origin (for example `https://YOUR_FRIGATE_HOST:8971`, without `/api`). For an authenticated endpoint, supply `FRIGATE_USERNAME` and `FRIGATE_PASSWORD`, or `FRIGATE_AUTH_TOKEN`, for an administrator-capable connection. Use trusted TLS, and do not put credentials into the URL or UI. If you deliberately use the open internal API, use its reachable HTTP address (commonly port 5000), leave credentials unset, and select **No login required — trusted local API** in the Catch-up settings. Restrict that open API to trusted hosts.
 3. Recreate the intermediary after environment changes: `docker compose up -d --force-recreate ollama-scheduler`. Do this at an idle/paused boundary.
 4. Open `/settings`, enable Frigate recovery, and validate/apply. Normal discovery starts at enablement, not weeks of old history. Retained connection settings and the existing state volume are reused.
 5. Confirm the dashboard reports both object and review API capabilities. Review regeneration requires a Frigate build exposing the individual review regeneration API; Frigate 0.18 lacks it, while the targeted development build `0.19.0-bb6c2e9` includes it.
@@ -233,6 +233,22 @@ Check camera warnings before enabling a large historical scan. Object recovery e
 The backlog is tied to the configured Frigate server address. Changing its host, port, or HTTP/HTTPS scheme stops catch-up with `backlog_origin_changed`; it does not erase the old jobs or send their IDs to a different server. Restore the original address to resume that backlog. For an intentional server migration, disable catch-up and configure a different persistent `frigate.state_path` on the host before re-enabling, keeping the old state file intact. Discovery starts anew; **Fill missing descriptions** can rediscover retained work on the new address. Prefer stable DNS or a reserved IP to avoid unnecessary migrations.
 
 See the [README catch-up section](../README.md#frigate-description-catch-up) for timing limits and the [Home Assistant optional sensors/action](HOME_ASSISTANT.md) for quick-view controls. Production API permissions, media availability, and GPU stability still need verification on your actual deployment.
+
+### Context-size failures and apparent catch-up stalls
+
+An Ollama HTTP 400 such as `request (14407 tokens) exceeds the available context size (8192 tokens)` means the images/text do not fit the configured context window. It is not a scheduling-priority decision. In the targeted Frigate build `0.19.0-bb6c2e9`, the Ollama provider reads `provider_options.options.num_ctx`. In Frigate's **Settings → Enrichments → Generative AI**, edit the provider's **Provider options** field, preserving its other settings. For that specific 14,407-token failure, 16,384 is a reasonable first trial:
+
+```yaml
+keep_alive: 2m
+options:
+  num_ctx: 16384
+```
+
+This is the content of the Provider options field, not a replacement Frigate configuration. Save/apply through Frigate and follow any restart prompt. Test a single affected item and verify its saved description. Larger context uses more memory, and future requests or Frigate's frame selection can still exceed it; avoid blindly increasing it repeatedly. See [the pinned provider implementation](https://github.com/blakeblackshear/frigate/blob/bb6c2e9/frigate/genai/plugins/ollama.py) and [Ollama's context/memory guidance](https://docs.ollama.com/context-length).
+
+The intermediary can continue showing **Waiting Result** until its confirmation window expires even after generation fails. The queue is retained, but retrying cannot fix an unchanged oversized request. A separate `llama-server terminated ... signal: killed` line does not by itself establish an out-of-memory cause; inspect surrounding service/kernel logs. Successful `/api/tags` and `/api/ps` probes prove API reachability, not successful model inference.
+
+## Configuration recovery
 
 If application configuration is invalid, the intermediary starts a restricted recovery listener on the same container port. In recovery mode:
 

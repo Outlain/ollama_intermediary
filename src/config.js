@@ -80,6 +80,7 @@ const DEFAULTS = {
   frigate: {
     enabled: false,
     url: '',
+    auth_mode: 'auto',
     username: '',
     password: '',
     auth_token: '',
@@ -205,6 +206,16 @@ function validate(config) {
     if (typeof config.frigate[field] !== 'string') throw new Error(`frigate.${field} must be a string`);
   }
   if (config.frigate.enabled && !config.frigate.url) throw new Error('frigate.url is required when catch-up is enabled');
+  if (!['auto', 'none', 'password', 'token'].includes(config.frigate.auth_mode)) {
+    throw new Error('frigate.auth_mode must be auto, none, password, or token');
+  }
+  if (config.frigate.enabled && config.frigate.auth_mode === 'password'
+    && (!config.frigate.username || !config.frigate.password)) {
+    throw new Error('frigate.auth_mode requires FRIGATE_USERNAME and FRIGATE_PASSWORD in secrets.env');
+  }
+  if (config.frigate.enabled && config.frigate.auth_mode === 'token' && !config.frigate.auth_token) {
+    throw new Error('frigate.auth_mode requires FRIGATE_AUTH_TOKEN in secrets.env');
+  }
   if (config.frigate.url) {
     let address;
     try { address = new URL(config.frigate.url); } catch { throw new Error('frigate.url must be an absolute HTTP(S) URL'); }
