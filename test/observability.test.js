@@ -76,6 +76,25 @@ test('response collector only retains whitelisted completion reasons', () => {
   assert.doesNotMatch(JSON.stringify(result), /private upstream diagnostic text/);
 });
 
+test('oversized nonstreaming responses mark usage unavailable rather than zero', () => {
+  const collector = new ResponseStatsCollector(100);
+  collector.push(Buffer.from(JSON.stringify({ response: 'x'.repeat(200), eval_count: 42, prompt_eval_count: 10 })));
+  const result = collector.finish();
+  assert.equal(result.usage_available, false);
+  assert.equal(result.summary_truncated, true);
+  assert.equal(result.output_tokens, undefined);
+});
+
+test('bounded response tails still report usage from the final streaming record', () => {
+  const collector = new ResponseStatsCollector(100);
+  collector.push(Buffer.from(`${JSON.stringify({ response: 'x'.repeat(200) })}\n`));
+  collector.push(Buffer.from(`${JSON.stringify({ done: true, eval_count: 42 })}\n`));
+  const result = collector.finish();
+  assert.equal(result.usage_available, true);
+  assert.equal(result.output_tokens, 42);
+  assert.equal(result.summary_truncated, false);
+});
+
 test('observability history and subscribers are strictly bounded', () => {
   const config = testConfig({ observability: { history_limit: 2, recent_events: 2, max_event_clients: 1 } });
   const observability = new Observability(config, { clock: () => 1_000 });

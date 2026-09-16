@@ -2,7 +2,7 @@ import http from 'node:http';
 import { once } from 'node:events';
 import { BackendClient, BackendState, OperationGate } from './backend.js';
 import { Classifier, classifyEndpoint, isSafeMetadataEndpoint, isStreaming } from './classifier.js';
-import { copyRequestHeaders, copyResponseHeaders, readBody, sendJson, streamBody } from './http-utils.js';
+import { copyRequestHeaders, copyResponseHeaders, readBody, ResponseOutcomeCollector, sendJson, streamBody } from './http-utils.js';
 import { Logger, requestId } from './logger.js';
 import { Metrics } from './metrics.js';
 import {
@@ -13,6 +13,9 @@ import { createJob, Scheduler } from './scheduler.js';
 import { MaintenanceState } from './maintenance.js';
 import { parseListen } from './config.js';
 import { DASHBOARD_CSS, DASHBOARD_HTML, DASHBOARD_JS } from './dashboard.js';
+import { FrigateCatchup } from './frigate-catchup.js';
+import { FrigateController } from './frigate-controller.js';
+import { BUILD_INFO } from './build-info.js';
 
 function contentHeaders(headers, body) {
   const result = { ...headers };
@@ -25,7 +28,7 @@ function parseJson(body) {
   try {
     return JSON.parse(body.toString('utf8'));
   } catch (error) {
-    const wrapped = new Error(`invalid JSON request body: ${error.message}`);
+    const wrapped = new Error('invalid JSON request body');
     wrapped.statusCode = 400;
     throw wrapped;
   }
@@ -33,6 +36,10 @@ function parseJson(body) {
 
 function applyKeepAlive(pathname, parsed, policy) {
   if (!policy?.keep_alive || pathname.startsWith('/v1/')) return { parsed, changed: false };
+  // Explicit unload directives must not become load/retention requests simply
+  // because the client has an idle-hold policy. Other requests retain the
+  // administrator's configured retention policy.
+  if (parsed.keep_alive === 0 || /^0(?:ms|s|m|h)?$/.test(String(parsed.keep_alive))) return { parsed, changed: false };
   if (parsed.keep_alive === policy.keep_alive) return { parsed, changed: false };
   return { parsed: { ...parsed, keep_alive: policy.keep_alive }, changed: true };
 }
@@ -56,6 +63,8 @@ export class ProxyService {
     this.logger = options.logger ?? new Logger();
     this.settingsController = options.settingsController ?? null;
     this.settingsRestartPending = false;
+    this.reservedBodyBytes = 0;
+    this.incomingRequests = 0;
     this.metrics = options.metrics ?? new Metrics();
     this.observability = options.observability ?? new Observability(config, { clock: this.clock });
     this.classifier = new Classifier(config);
@@ -96,12 +105,24 @@ export class ProxyService {
       onAutoResume: () => this.resumeMaintenance('timer'),
     });
     if (this.maintenance.paused) this.scheduler.pause();
+    this.catchup = options.catchup ?? new FrigateCatchup(config, {
+      logger: this.logger,
+      clock: this.clock,
+      canRun: () => this.backgroundReadiness(),
+      onChange: () => this.scheduler.wake(),
+    });
+    this.frigateController = new FrigateController({
+      catchup: this.catchup,
+      readToken: config.observability.auth_token,
+      controlToken: options.settingsToken ?? this.settingsController?.token ?? '',
+    });
   }
 
   async start({ listen = true } = {}) {
     if (this.running) return this.addresses();
     this.running = true;
     this.backend.start();
+    this.catchup.start();
     this.workerPromise = this.dispatchLoop();
     this.expiryTimer = setInterval(() => this.scheduler.expire(), Math.min(1_000, this.config.ollama.healthIntervalMs));
     this.expiryTimer.unref?.();
@@ -148,11 +169,12 @@ export class ProxyService {
     if (this.settingsController?.handles(url.pathname)) {
       return this.settingsController.handle(request, response, url, id);
     }
-    if (this.settingsRestartPending) {
-      return sendJson(response, 503, {
-        error: 'The intermediary is restarting to apply validated settings.',
-        code: 'settings_restart_pending',
-      }, id);
+    if (this.frigateController.handles(url.pathname)) {
+      if (this.settingsRestartPending && request.method !== 'GET') return sendJson(response, 503, { error: 'Settings restart pending.' }, id);
+      return this.frigateController.handle(request, response, url, id);
+    }
+    if (url.pathname === '/_intermediary/v1/recovery/acknowledge') {
+      return this.handleRecoveryAcknowledgment(request, response, id);
     }
     if ((url.pathname === '/debug' || url.pathname === '/debug/') && request.method !== 'GET') {
       response.setHeader('allow', 'GET');
@@ -171,30 +193,119 @@ export class ProxyService {
       return this.handleMaintenanceControl(request, response, url, id);
     }
     if (url.pathname.startsWith('/_intermediary/')) return this.handleObservability(request, response, url, id);
-    if (request.method === 'GET' && url.pathname === this.config.server.status_path) return this.handleStatus(response, id);
-    if (request.method === 'GET' && url.pathname === this.config.server.metrics_path) return this.handleMetrics(response);
+    if (request.method === 'GET' && url.pathname === this.config.server.status_path) {
+      if (!this.authorizeDiagnostics(request, response, id)) return;
+      return this.handleStatus(response, id);
+    }
+    if (request.method === 'GET' && url.pathname === this.config.server.metrics_path) {
+      if (!this.authorizeDiagnostics(request, response, id)) return;
+      return this.handleMetrics(response);
+    }
     if (request.method === 'GET' && url.pathname === '/healthz') return sendJson(response, 200, { status: 'ok' }, id);
     if (request.method === 'GET' && url.pathname === '/readyz') {
-      const ready = !this.maintenance.paused && this.backend.canDispatch();
+      const ready = !this.settingsRestartPending && !this.maintenance.paused && this.backend.canDispatch();
+      const permitted = authorized(request, this.config.observability.auth_token);
+      const snapshot = permitted ? this.observabilitySnapshot() : null;
       return sendJson(response, ready ? 200 : 503, {
         status: ready ? 'ready' : 'not_ready',
-        backend: this.backend.status(),
-        maintenance: this.maintenance.status(),
+        ...(permitted ? { backend: snapshot.backend, maintenance: snapshot.maintenance } : {}),
       }, id);
     }
 
     const endpointClass = classifyEndpoint(request.method, url.pathname);
-    if (endpointClass === 'generation') return this.handleGeneration(request, response, url, id, forcedClient);
-    if (endpointClass === 'management') return this.handleManagement(request, response, url, id);
+    if (this.settingsRestartPending && endpointClass !== 'metadata') {
+      return sendJson(response, 503, {
+        error: 'The intermediary is draining active work before applying validated settings.',
+        code: 'settings_restart_pending',
+      }, id);
+    }
+    if (endpointClass === 'generation') return this.withBodyBudget(request, response, id, () => this.handleGeneration(request, response, url, id, forcedClient));
+    if (endpointClass === 'management') return this.withBodyBudget(request, response, id, () => this.handleManagement(request, response, url, id));
     if (this.maintenance.paused && !isSafeMetadataEndpoint(request.method, url.pathname)) {
       return this.sendMaintenancePaused(response, id);
     }
-    return this.handlePassthrough(request, response, url, id);
+    if (endpointClass !== 'metadata') {
+      return sendJson(response, 404, { error: 'Unsupported Ollama endpoint; it cannot bypass GPU scheduling', code: 'unsupported_endpoint' }, id);
+    }
+    return this.withBodyBudget(request, response, id, () => this.handlePassthrough(request, response, url, id));
+  }
+
+  async withBodyBudget(request, response, id, operation) {
+    const length = request.headers['content-length'];
+    const bytes = length !== undefined ? Number(length)
+      : request.headers['transfer-encoding'] ? this.config.server.body_limit_bytes : 0;
+    if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > this.config.server.body_limit_bytes) {
+      return sendJson(response, 413, { error: 'Request body exceeds the configured limit.', code: 'body_limit' }, id);
+    }
+    if (this.reservedBodyBytes + bytes > this.config.scheduler.max_queue_bytes) {
+      return sendJson(response, 429, { error: 'Request memory budget is full; retry later.', code: 'request_memory_full' }, id);
+    }
+    // Reserve before buffering, including chunked bodies. Keep the reservation
+    // through the full queued/active/draining lifetime, not only admission.
+    this.reservedBodyBytes += bytes;
+    this.incomingRequests += 1;
+    try { return await operation(); }
+    finally { this.reservedBodyBytes -= bytes; this.incomingRequests -= 1; this.scheduler.wake(); }
+  }
+
+  backgroundReadiness() {
+    const readiness = this.scheduler.backgroundReadiness();
+    if (!this.running || this.settingsRestartPending) return { allowed: false, reason: 'service_stopping' };
+    if (this.incomingRequests) return { allowed: false, reason: 'live_requests_pending' };
+    if (this.maintenance.paused) return { allowed: false, reason: 'maintenance_paused' };
+    if (!this.backend.canDispatch()) return { allowed: false, reason: this.backend.recoveryRequired ? 'recovery_required' : 'backend_unavailable' };
+    if (this.gate.active || this.gate.managementPending || this.gate.maintenancePending) return { allowed: false, reason: 'backend_operation' };
+    return { allowed: readiness.ready, reason: readiness.reason, wait_seconds: readiness.wait_seconds };
+  }
+
+  async handleRecoveryAcknowledgment(request, response, id) {
+    response.setHeader('cache-control', 'no-store');
+    const token = this.config.maintenance.auth_token;
+    if (!token) return sendJson(response, 503, { error: 'Configure MAINTENANCE_TOKEN before acknowledging recovery.' }, id);
+    if (!authorized(request, token)) return sendJson(response, 401, { error: 'Maintenance token required.' }, id);
+    if (request.method !== 'POST') {
+      response.setHeader('allow', 'POST');
+      return sendJson(response, 405, { error: 'Use POST.' }, id);
+    }
+    let body;
+    try { body = JSON.parse((await readBody(request, 4096)).toString('utf8')); }
+    catch { return sendJson(response, 400, { error: 'Provide a JSON confirmation.' }, id); }
+    if (body?.confirm_gpu_recovered !== true) {
+      return sendJson(response, 400, { error: 'Verify the real GPU on the host, then set confirm_gpu_recovered:true. API health alone is insufficient.' }, id);
+    }
+    if (!this.maintenance.paused) return sendJson(response, 409, { error: 'Pause inference before acknowledging GPU recovery.', code: 'pause_required' }, id);
+    if (this.settingsRestartPending || this.scheduler.active || this.gate.active) {
+      return sendJson(response, 409, { error: 'Wait for active work and maintenance operations to finish.', code: 'busy' }, id);
+    }
+    const pauseRevision = this.maintenance.revision;
+    const release = await this.gate.acquire('maintenance', this.workerController.signal);
+    try {
+      const models = await this.backendClient.loadedModels(this.workerController.signal, this.config.ollama.healthTimeoutMs);
+      if (models.length) return sendJson(response, 409, { error: 'Ollama still reports loaded models. Recovery was not cleared.', code: 'models_loaded' }, id);
+      if (!this.maintenance.paused || this.maintenance.revision !== pauseRevision || this.settingsRestartPending) {
+        return sendJson(response, 409, { error: 'Pause or settings state changed during verification. Recovery was not cleared; pause and verify again.', code: 'recovery_state_changed' }, id);
+      }
+      this.backend.clearRecovery();
+      this.scheduler.reconcile(null);
+      this.observability.record('gpu_recovery_acknowledged', { reason: 'operator_verified_gpu_and_empty_ollama' });
+      return sendJson(response, 200, { acknowledged: true, paused: true, message: 'Recovery latch cleared. Inference remains paused until resumed.' }, id);
+    } catch {
+      return sendJson(response, 503, { error: 'Recovery verification or persistence failed. The latch remains set.', code: 'recovery_verification_failed' }, id);
+    } finally { release(); }
   }
 
   handleStatus(response, id) {
     const scheduler = this.scheduler.status();
-    sendJson(response, 200, { backend: this.backend.status(), maintenance: this.maintenance.status(), ...scheduler }, id);
+    const snapshot = this.observabilitySnapshot();
+    sendJson(response, 200, { build: BUILD_INFO, backend: snapshot.backend, maintenance: snapshot.maintenance, frigate: snapshot.frigate, ...scheduler }, id);
+  }
+
+  authorizeDiagnostics(request, response, id) {
+    response.setHeader('cache-control', 'no-store');
+    if (authorized(request, this.config.observability.auth_token)) return true;
+    response.setHeader('www-authenticate', 'Bearer realm="ollama-intermediary"');
+    sendJson(response, 401, { error: 'observability token is required', code: 'unauthorized' }, id);
+    return false;
   }
 
   recordBackendTransition() {
@@ -241,9 +352,11 @@ export class ProxyService {
     const backend = {
       ...backendRaw,
       recovery_reason: backendRaw.recovery_required
-        ? 'Ollama reported a GPU fault; host recovery is required.'
+        ? 'GPU health or upstream completion could not be verified; host recovery verification is required.'
         : null,
       last_error: backendRaw.last_error ? 'Ollama backend error; inspect intermediary logs for details.' : null,
+      last_inference_error: backendRaw.last_inference_error ? 'Ollama inference failed; inspect intermediary logs for details.' : null,
+      recovery_storage_error: backendRaw.recovery_storage_error ? 'GPU recovery state could not be persisted or read; inspect intermediary logs.' : null,
     };
     const scheduler = this.scheduler.details(now);
     const maintenance = this.maintenance.status(now);
@@ -258,6 +371,7 @@ export class ProxyService {
     else if (scheduler.queue.total) schedulerState = 'queued';
     return {
       schema_version: 1,
+      build: BUILD_INFO,
       generated_at: new Date(now).toISOString(),
       service: {
         state: ready ? 'ready' : 'not_ready',
@@ -269,8 +383,12 @@ export class ProxyService {
       },
       backend,
       maintenance,
+      frigate: this.catchup.status(),
       scheduler: {
         state: schedulerState,
+        mode: this.config.scheduler.mode,
+        reserved_body_bytes: this.reservedBodyBytes,
+        background: this.backgroundReadiness(),
         current_model: scheduler.current_model,
         current_model_group: scheduler.current_model_group,
         model_lease_remaining: scheduler.model_lease_remaining,
@@ -655,7 +773,6 @@ export class ProxyService {
       return sendJson(response, 503, {
         error: 'GPU recovery is required before inference can resume',
         code: 'gpu_recovery_required',
-        detail: this.backend.recoveryReason,
       }, id);
     }
     if (this.config.circuit_breaker.queue_behavior === 'reject_new' && !this.backend.canDispatch()) {
@@ -672,7 +789,7 @@ export class ProxyService {
     if (!parsed.model || typeof parsed.model !== 'string') {
       return sendJson(response, 400, { error: 'generation request must contain a string model field', code: 'model_required' }, id);
     }
-    if (!this.config.models[parsed.model] && this.config.scheduler.unknown_model_policy === 'reject') {
+    if (!Object.hasOwn(this.config.models, parsed.model) && this.config.scheduler.unknown_model_policy === 'reject') {
       return sendJson(response, 400, { error: `model ${parsed.model} is not configured`, code: 'unknown_model' }, id);
     }
 
@@ -680,7 +797,7 @@ export class ProxyService {
     const client = identification.client;
     const streaming = isStreaming(url.pathname, parsed);
     const originalBodyBytes = body.length;
-    const normalized = applyKeepAlive(url.pathname, parsed, this.scheduler.modelPolicy(parsed.model, client));
+    let normalized = applyKeepAlive(url.pathname, parsed, this.scheduler.modelPolicy(parsed.model, client));
     if (normalized.changed) body = Buffer.from(JSON.stringify(normalized.parsed));
     let requestSummary;
     try {
@@ -709,6 +826,11 @@ export class ProxyService {
       downstreamDisconnected: false,
       dedupeKey: this.classifier.dedupeKey(client, request, parsed),
     });
+    // Only the serialized body needs to survive a potentially long queue wait.
+    // Do not retain a second object tree of prompts/base64 images in this frame.
+    parsed = null;
+    normalized = null;
+    body = null;
     const disconnect = () => {
       if (response.writableEnded || job.downstreamDisconnected) return;
       job.downstreamDisconnected = true;
@@ -761,6 +883,7 @@ export class ProxyService {
     let status = 499;
     let responseBody = Buffer.alloc(0);
     const responseStats = new ResponseStatsCollector();
+    const responseOutcome = new ResponseOutcomeCollector(this.config.gpu_safety.error_body_limit_bytes);
     try {
       const upstream = result.upstream;
       status = upstream.statusCode ?? 502;
@@ -772,8 +895,8 @@ export class ProxyService {
       const transfer = await streamBody(upstream, response, {
         flush: streaming,
         drainOnClose: this.config.gpu_safety.drain_active_disconnects,
-        captureLimit: status >= 500 ? this.config.gpu_safety.error_body_limit_bytes : 0,
-        onChunk: (chunk) => responseStats.push(chunk),
+        captureLimit: status >= 400 ? this.config.gpu_safety.error_body_limit_bytes : 0,
+        onChunk: (chunk) => { responseStats.push(chunk); responseOutcome.push(chunk); },
       });
       responseBody = transfer.captured;
       job.downstreamDisconnected ||= transfer.downstreamClosed;
@@ -800,6 +923,8 @@ export class ProxyService {
       job.finish({
         status,
         error: streamError,
+        inferenceError: responseOutcome.finish(),
+        completionUncertain: Boolean(streamError),
         clientDisconnected: job.downstreamDisconnected,
         responseBody,
         responseStats: responseStats.finish(),
@@ -842,6 +967,9 @@ export class ProxyService {
 
   async handleManagement(request, response, url, id) {
     if (this.maintenance.paused) return this.sendMaintenancePaused(response, id);
+    if (this.backend.recoveryRequired) {
+      return sendJson(response, 503, { error: 'GPU recovery verification is required before model operations can resume', code: 'gpu_recovery_required' }, id);
+    }
     if (!this.config.model_management.enabled) {
       return sendJson(response, 403, { error: 'model-management endpoints are disabled', code: 'management_disabled' }, id);
     }
@@ -854,11 +982,19 @@ export class ProxyService {
     } catch {
       return;
     }
+    response.removeListener('close', abort);
     if (this.maintenance.paused) {
       release();
       return this.sendMaintenancePaused(response, id);
     }
-    response.removeListener('close', abort);
+    if (this.backend.recoveryRequired) {
+      release();
+      return sendJson(response, 503, { error: 'GPU recovery verification is required before model operations can resume', code: 'gpu_recovery_required' }, id);
+    }
+    if (this.settingsRestartPending || !this.scheduler.accepting) {
+      release();
+      return sendJson(response, 503, { error: 'Intermediary is stopping or restarting; model operation was not started.', code: 'shutting_down' }, id);
+    }
     return this.handlePassthrough(request, response, url, id, release);
   }
 
@@ -940,12 +1076,19 @@ export class ProxyService {
         job.phase = job.streaming ? 'streaming' : 'running';
         job.settle({ type: 'upstream', upstream: response, cleanup });
         const outcome = await job.finished;
+        if (outcome.completionUncertain) {
+          this.backend.requireRecovery('Upstream inference ended without a complete response; verify Ollama and GPU idle state before resuming', {
+            request_id: job.id,
+            error: outcome.error?.message,
+            client_disconnected: outcome.clientDisconnected,
+          });
+        }
         const backendResult = this.backend.recordGenerationResult(
           outcome.status,
           outcome.responseBody,
-          outcome.clientDisconnected ? null : outcome.error,
+          outcome.inferenceError ?? outcome.error,
         );
-        if (backendResult.recoveryRequired) {
+        if (backendResult.recoveryRequired || this.backend.recoveryRequired) {
           this.scheduler.failQueued(503, 'gpu_recovery_required', 'GPU recovery is required before inference can resume');
         }
         const duration = (Date.now() - job.dispatchedAt) / 1000;
@@ -963,20 +1106,35 @@ export class ProxyService {
             client: job.client, endpoint: job.pathname,
           });
         }
-        this.logger.info('request completed', {
+        const failed = outcome.status >= 400 || Boolean(outcome.inferenceError || outcome.error);
+        const finalStatus = failed && outcome.status < 400 ? 502 : outcome.status;
+        const failureReason = outcome.completionUncertain ? 'upstream_completion_uncertain'
+          : outcome.inferenceError ? 'upstream_inference_error' : 'upstream_http_error';
+        this.logger[failed ? 'error' : 'info'](failed ? 'request failed' : 'request completed', {
           request_id: job.id, detected_client: job.client, requested_model: job.model,
           queue_wait: (job.dispatchedAt - job.enqueuedAt) / 1000,
           completion_time: new Date().toISOString(), request_duration: duration,
-          http_status: outcome.status, streaming: job.streaming,
+          http_status: finalStatus, upstream_http_status: outcome.status, streaming: job.streaming,
+          ...(failed ? { reason: failureReason, error: outcome.inferenceError?.message ?? outcome.error?.message } : {}),
         });
-        finalEvent = ['request_completed', this.scheduler.eventFields(job, {
-          status: outcome.status,
+        finalEvent = [failed ? 'request_failed' : 'request_completed', this.scheduler.eventFields(job, {
+          status: finalStatus,
+          upstream_http_status: outcome.status,
+          outcome: failed ? 'failed' : 'completed',
+          ...(failed ? { reason: failureReason } : {}),
           queue_wait_seconds: (job.dispatchedAt - job.enqueuedAt) / 1000,
           duration_seconds: duration,
           client_disconnected: outcome.clientDisconnected,
           response: outcome.responseStats,
         })];
       } catch (error) {
+        // A transport failure after sending the request does not establish that
+        // Ollama stopped working. Even an abandoned client must hold admission
+        // closed until recovery has been explicitly verified.
+        if (job.phase === 'connecting') {
+          this.backend.requireRecovery('Ollama request failed after dispatch; upstream completion is unknown', { error: error.message, request_id: job.id });
+          this.scheduler.failQueued(503, 'gpu_recovery_required', 'GPU recovery verification is required before inference can resume');
+        }
         const disconnected = job.signal?.aborted;
         if (disconnected) {
           job.settle({ type: 'local_error', status: 499, code: 'client_closed', message: 'client disconnected' });
@@ -1025,6 +1183,7 @@ export class ProxyService {
   async stop(graceMs = this.config.server.shutdownGraceMs) {
     if (!this.running) return;
     this.running = false;
+    await this.catchup.stop();
     this.scheduler.stop();
     this.backend.stop();
     this.maintenance.stop();
@@ -1051,5 +1210,14 @@ export class ProxyService {
     // replaced, while allowing the active upstream request to drain in stop().
     this.settingsRestartPending = true;
     this.scheduler.stop();
+  }
+
+  async waitForIdle(signal) {
+    // No grace-period cutoff here: a settings update must not kill inference
+    // that legitimately runs longer than the ordinary process shutdown grace.
+    while (this.scheduler.active || this.gate.active || this.maintenanceTask) {
+      if (signal?.aborted) throw signal.reason ?? new Error('idle wait cancelled');
+      await this.scheduler.waitForChange(100, signal);
+    }
   }
 }

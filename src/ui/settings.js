@@ -1,0 +1,745 @@
+(function () {
+  'use strict';
+
+  var SETTINGS_URL = '/_intermediary/v1/settings';
+  var VALIDATE_URL = '/_intermediary/v1/settings/validate';
+  var APPLY_URL = '/_intermediary/v1/settings/apply';
+  var ROLLBACK_URL = '/_intermediary/v1/settings/rollback';
+  var RESET_URL = '/_intermediary/v1/settings/reset';
+  var TOKEN_KEY = 'ollama-intermediary-settings-admin-token';
+  var memoryToken = '';
+  var loadedSettings = null;
+  var loadedEnvelope = null;
+  var loadedRevision = null;
+  var busy = false;
+  var dirty = false;
+  var lastValidatedSignature = '';
+  var lastApplyFeedback = null;
+  var touchedPaths = new Set();
+
+  function byId(id) { return document.getElementById(id); }
+  function all(selector) { return Array.prototype.slice.call(document.querySelectorAll(selector)); }
+  function setText(id, value) {
+    var element = byId(id);
+    if (element) element.textContent = value == null || value === '' ? '—' : String(value);
+  }
+  function setHidden(id, hidden) {
+    var element = byId(id);
+    if (element) element.hidden = Boolean(hidden);
+  }
+  function clone(value) { return value == null ? value : JSON.parse(JSON.stringify(value)); }
+  function asObject(value) { return value && typeof value === 'object' && !Array.isArray(value) ? value : {}; }
+  function getToken() {
+    try { return sessionStorage.getItem(TOKEN_KEY) || memoryToken; }
+    catch (_) { return memoryToken; }
+  }
+  function setToken(value) {
+    memoryToken = String(value || '');
+    try {
+      if (memoryToken) sessionStorage.setItem(TOKEN_KEY, memoryToken);
+      else sessionStorage.removeItem(TOKEN_KEY);
+    } catch (_) { /* Memory remains scoped to this tab if sessionStorage is unavailable. */ }
+    setHidden('forget-token', !memoryToken);
+  }
+  function headers(withBody) {
+    var result = { accept: 'application/json' };
+    if (withBody) result['content-type'] = 'application/json';
+    if (withBody && loadedRevision != null) result['if-match'] = String(loadedRevision);
+    var token = getToken();
+    if (token) result.authorization = 'Bearer ' + token;
+    return result;
+  }
+  function formatDate(value) {
+    if (!value) return '—';
+    var date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '—';
+    return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(date);
+  }
+  async function parseResponse(response) {
+    var text = await response.text();
+    if (!text) return {};
+    try { return JSON.parse(text); }
+    catch (_) { return { error: text }; }
+  }
+  function errorMessage(payload, fallback) {
+    if (!payload) return fallback;
+    if (typeof payload.error === 'string') return payload.error;
+    if (payload.error && typeof payload.error.message === 'string') return payload.error.message;
+    if (typeof payload.message === 'string') return payload.message;
+    return fallback;
+  }
+  function showPageError(message) {
+    setText('page-error', message);
+    setHidden('page-error', !message);
+  }
+  function showAuth(message) {
+    setHidden('settings-workspace', true);
+    setHidden('auth-panel', false);
+    setText('auth-message', message || 'A valid settings admin token is required.');
+    window.setTimeout(function () { byId('admin-token').focus(); }, 0);
+  }
+  function showWorkspace() {
+    setHidden('auth-panel', true);
+    setHidden('settings-workspace', false);
+  }
+
+  function pathParts(path) { return String(path || '').split('.').filter(Boolean); }
+  function getPath(source, path) {
+    return pathParts(path).reduce(function (current, key) {
+      return current == null ? undefined : current[key];
+    }, source);
+  }
+  function hasPath(source, path) {
+    var current = source;
+    var parts = pathParts(path);
+    for (var index = 0; index < parts.length; index += 1) {
+      if (current == null || !Object.prototype.hasOwnProperty.call(Object(current), parts[index])) return false;
+      current = current[parts[index]];
+    }
+    return true;
+  }
+  function setPath(target, path, value) {
+    var parts = pathParts(path);
+    var current = target;
+    parts.forEach(function (key, index) {
+      if (index === parts.length - 1) {
+        current[key] = value;
+        return;
+      }
+      var nextIsIndex = /^[0-9]+$/.test(parts[index + 1]);
+      if (!current[key] || typeof current[key] !== 'object') current[key] = nextIsIndex ? [] : {};
+      current = current[key];
+    });
+  }
+  function inputValue(input) {
+    if (input.type === 'checkbox') return input.checked;
+    if (input.type === 'number') return input.value === '' ? null : Number(input.value);
+    if (input.dataset.nullable === 'true' && input.value.trim() === '') return null;
+    return input.value.trim();
+  }
+  function setInputValue(input, value) {
+    if (input.type === 'checkbox') input.checked = Boolean(value);
+    else input.value = value == null ? '' : String(value);
+  }
+  function settingsFromEnvelope(payload) {
+    if (payload && payload.settings && typeof payload.settings === 'object') return payload.settings;
+    return {};
+  }
+  function populateForm(settings) {
+    var defaultClient = byId('default-client');
+    all('#default-client option[data-dynamic-client]').forEach(function (option) { option.remove(); });
+    var availableClients = Object.keys(asObject(settings.clients));
+    var selectedClient = getPath(settings, 'scheduler.default_client');
+    if (selectedClient && !availableClients.includes(selectedClient)) availableClients.push(selectedClient);
+    availableClients.forEach(function (name) {
+      if (all('#default-client option').some(function (option) { return option.value === name; })) return;
+      var option = document.createElement('option');
+      option.value = name;
+      option.textContent = name;
+      option.dataset.dynamicClient = 'true';
+      defaultClient.appendChild(option);
+    });
+    all('[data-path]').forEach(function (input) {
+      setInputValue(input, getPath(settings, input.dataset.path));
+    });
+    setText('fallback-client-readout', getPath(settings, 'scheduler.default_client') || 'Odysseus');
+  }
+  function collectSettings() {
+    var result = clone(loadedSettings || {});
+    all('[data-path]').forEach(function (input) {
+      var path = input.dataset.path;
+      if (!touchedPaths.has(path)) return;
+      var value = inputValue(input);
+      if (path === 'clients.frigate.source_ips.0' && value === '') {
+        var existingSources = getPath(result, 'clients.frigate.source_ips');
+        if (Array.isArray(existingSources) && existingSources.length) {
+          setPath(result, 'clients.frigate.source_ips', existingSources.slice(1));
+        }
+        return;
+      }
+      setPath(result, path, value);
+    });
+    return result;
+  }
+  function collectPatch() {
+    var result = {};
+    all('[data-path]').forEach(function (input) {
+      var path = input.dataset.path;
+      if (!touchedPaths.has(path)) return;
+      var value = inputValue(input);
+      if (path === 'clients.frigate.source_ips.0') {
+        var existingSources = getPath(loadedSettings, 'clients.frigate.source_ips');
+        var nextSources = Array.isArray(existingSources) ? existingSources.slice() : [];
+        if (value === '') nextSources = nextSources.slice(1);
+        else if (nextSources.length) nextSources[0] = value;
+        else nextSources.push(value);
+        setPath(result, 'clients.frigate.source_ips', nextSources);
+        return;
+      }
+      setPath(result, path, value);
+    });
+    return result;
+  }
+  function requestPayload() {
+    // The API accepts patches. Sending only touched fields prevents a repair of
+    // one invalid base setting from accidentally pinning every displayed base
+    // value into the persistent override document.
+    return { settings: collectPatch() };
+  }
+  function signature() {
+    return JSON.stringify({ settings: collectSettings() });
+  }
+  function calculateDirty() {
+    if (!loadedSettings) return false;
+    return signature() !== JSON.stringify({ settings: loadedSettings });
+  }
+
+  function secretConfigured(payload, name) {
+    var statuses = asObject(payload.secret_status || payload.secrets);
+    if (name === 'admin_token' && payload.infrastructure && typeof payload.infrastructure.settings_token_configured === 'boolean') {
+      return payload.infrastructure.settings_token_configured;
+    }
+    var aliases = [name, name + '_configured', name.replace('_token', ''), name.replace(/_([a-z])/g, function (_, c) { return c.toUpperCase(); })];
+    for (var i = 0; i < aliases.length; i += 1) {
+      var value = statuses[aliases[i]];
+      if (typeof value === 'boolean') return value;
+      if (value && typeof value.configured === 'boolean') return value.configured;
+      if (value && typeof value.present === 'boolean') return value.present;
+      if (typeof value === 'string') return value.length > 0;
+    }
+    return null;
+  }
+  function renderSecretStatus(payload) {
+    [
+      ['maintenance_token', 'maintenance-secret-state'],
+      ['observability_token', 'observability-secret-state'],
+      ['admin_token', 'admin-secret-state']
+    ].forEach(function (entry) {
+      var configured = secretConfigured(payload, entry[0]);
+      var badge = byId(entry[1]);
+      badge.className = 'configured-badge';
+      if (configured === true) { badge.classList.add('is-configured'); badge.textContent = 'Configured'; }
+      else if (configured === false) { badge.classList.add('is-missing'); badge.textContent = 'Missing'; }
+      else badge.textContent = 'Not reported';
+    });
+  }
+
+  function normalizeDiagnostics(payload) {
+    var infrastructure = payload.infrastructure;
+    var source = infrastructure && (infrastructure.diagnostics || infrastructure.checks || (Array.isArray(infrastructure) ? infrastructure : null));
+    if (!source && infrastructure && typeof infrastructure === 'object') {
+      source = Object.keys(infrastructure).filter(function (key) {
+        return key !== 'diagnostics' && key !== 'checks' && key !== 'ollama';
+      }).map(function (key) {
+        var value = infrastructure[key];
+        var title = key.replace(/_/g, ' ').replace(/\b\w/g, function (letter) { return letter.toUpperCase(); });
+        var message;
+        if (typeof value === 'boolean') message = value ? 'Yes' : 'No';
+        else if (value == null) message = 'Not reported';
+        else if (typeof value === 'object') message = JSON.stringify(value);
+        else message = String(value);
+        var expectedFalse = key === 'compose_editable' || key === 'secrets_editable';
+        return {
+          id: key,
+          title: title,
+          message: message,
+          ok: expectedFalse ? value === false : (key === 'ui_can_apply' ? undefined : (typeof value === 'boolean' ? value : undefined)),
+          severity: key === 'ui_can_apply' && value === false ? 'warning' : 'info'
+        };
+      });
+    }
+    if (!source) source = payload.infrastructure_diagnostics || [];
+    if (!Array.isArray(source) && source && typeof source === 'object') {
+      source = Object.keys(source).map(function (key) {
+        var value = source[key];
+        return typeof value === 'object' ? Object.assign({ id: key }, value) : { id: key, message: String(value) };
+      });
+    }
+    var combined = Array.isArray(source) ? source.slice() : [];
+    var configurationDiagnostics = Array.isArray(payload.diagnostics) ? payload.diagnostics : [];
+    configurationDiagnostics.forEach(function (item) {
+      if (!item) return;
+      var normalized = typeof item === 'string' ? { message: item } : Object.assign({}, item);
+      normalized.title = normalized.title
+        || (normalized.path && normalized.path !== '$' ? normalized.path : null)
+        || normalized.code
+        || 'Configuration check';
+      combined.push(normalized);
+    });
+    return combined;
+  }
+  function diagnosticSeverity(item) {
+    var severity = String(item.severity || item.level || item.status || '').toLowerCase();
+    if (item.ok === true || severity === 'ok' || severity === 'pass' || severity === 'healthy') return 'good';
+    if (item.ok === false || severity === 'error' || severity === 'critical' || severity === 'failed') return 'error';
+    if (severity === 'warning' || severity === 'warn' || severity === 'restart_required') return 'warning';
+    return 'neutral';
+  }
+  function renderDiagnostics(payload) {
+    var diagnostics = normalizeDiagnostics(payload);
+    var list = byId('diagnostics-list');
+    list.replaceChildren();
+    var errors = 0;
+    var warnings = 0;
+    diagnostics.forEach(function (item) {
+      item = typeof item === 'string' ? { message: item } : asObject(item);
+      var severity = diagnosticSeverity(item);
+      if (severity === 'error') errors += 1;
+      if (severity === 'warning') warnings += 1;
+      var li = document.createElement('li');
+      li.className = 'diagnostic diagnostic-' + severity;
+      var icon = document.createElement('span');
+      icon.className = 'diagnostic-icon';
+      icon.setAttribute('aria-hidden', 'true');
+      icon.textContent = severity === 'good' ? '\u2713' : severity === 'error' ? '!' : severity === 'warning' ? '\u2022' : 'i';
+      var copy = document.createElement('div');
+      var title = document.createElement('strong');
+      title.textContent = item.title || item.name || item.id || 'Infrastructure check';
+      var message = document.createElement('p');
+      message.textContent = item.message || item.detail || 'No details reported.';
+      copy.appendChild(title);
+      copy.appendChild(message);
+      if (item.remediation || item.action) {
+        var remediation = document.createElement('small');
+        remediation.textContent = item.remediation || item.action;
+        copy.appendChild(remediation);
+      }
+      li.appendChild(icon);
+      li.appendChild(copy);
+      list.appendChild(li);
+    });
+    setHidden('diagnostics-empty', diagnostics.length > 0);
+    var badge = byId('diagnostics-summary');
+    badge.className = 'status-pill';
+    if (errors) { badge.classList.add('status-error'); badge.textContent = errors + ' error' + (errors === 1 ? '' : 's'); }
+    else if (warnings) { badge.classList.add('status-warning'); badge.textContent = warnings + ' warning' + (warnings === 1 ? '' : 's'); }
+    else if (diagnostics.length) { badge.classList.add('status-good'); badge.textContent = 'All checks passed'; }
+    else { badge.classList.add('status-neutral'); badge.textContent = 'Not reported'; }
+  }
+
+  function clearErrors() {
+    all('[data-field-wrap]').forEach(function (element) { element.classList.remove('has-error'); });
+    all('[data-error-for]').forEach(function (element) { element.textContent = ''; });
+    setHidden('validation-summary', true);
+  }
+  function normalizeErrors(payload) {
+    var source = payload.field_errors || payload.errors || (payload.validation && (payload.validation.errors || payload.validation.diagnostics)) || payload.diagnostics || [];
+    var result = [];
+    if (Array.isArray(source)) {
+      source.forEach(function (error) {
+        if (typeof error === 'string') result.push({ path: '', message: error });
+        else if (error && typeof error === 'object' && String(error.severity || 'error').toLowerCase() === 'error') result.push({ path: error.path || error.field || error.pointer || '', message: error.message || error.error || 'Invalid value' });
+      });
+    } else if (source && typeof source === 'object') {
+      Object.keys(source).forEach(function (path) {
+        var value = source[path];
+        if (Array.isArray(value)) value.forEach(function (message) { result.push({ path: path, message: String(message) }); });
+        else result.push({ path: path, message: typeof value === 'string' ? value : (value.message || 'Invalid value') });
+      });
+    }
+    return result;
+  }
+  function normalizeErrorPath(path) {
+    return String(path || '').replace(/^settings\./, '').replace(/^\//, '').replace(/\//g, '.').replace(/\[(\d+)\]/g, '.$1');
+  }
+  function browserFieldErrors() {
+    var errors = [];
+    all('[data-path]').forEach(function (input) {
+      var value = input.type === 'checkbox' ? '' : input.value.trim();
+      if (input.required && !value) {
+        errors.push({ path: input.dataset.path, message: 'A value is required.' });
+      } else if (input.validity && input.validity.typeMismatch) {
+        errors.push({ path: input.dataset.path, message: 'Enter a valid value in the requested format.' });
+      } else if (input.validity && (input.validity.badInput || input.validity.rangeOverflow || input.validity.rangeUnderflow || input.validity.stepMismatch)) {
+        errors.push({ path: input.dataset.path, message: input.validationMessage || 'Enter a value within the allowed range.' });
+      }
+    });
+    return errors;
+  }
+  function renderErrors(payload) {
+    clearErrors();
+    var errors = normalizeErrors(payload);
+    browserFieldErrors().forEach(function (error) {
+      if (!errors.some(function (existing) { return normalizeErrorPath(existing.path) === error.path; })) errors.push(error);
+    });
+    errors.forEach(function (error) {
+      var path = normalizeErrorPath(error.path);
+      var wrap = all('[data-field-wrap]').find(function (element) { return element.dataset.fieldWrap === path; });
+      var output = all('[data-error-for]').find(function (element) { return element.dataset.errorFor === path; });
+      if (wrap) wrap.classList.add('has-error');
+      if (output) output.textContent = error.message;
+    });
+    if (errors.length) {
+      var summary = byId('validation-summary');
+      var located = errors.filter(function (error) { return Boolean(error.path); }).length;
+      summary.textContent = errors.length + ' configuration ' + (errors.length === 1 ? 'error needs' : 'errors need') + ' attention.' + (located < errors.length ? ' ' + (errors.length - located) + ' general error(s) are listed by the server.' : '');
+      summary.hidden = false;
+      summary.focus();
+    }
+    return errors;
+  }
+
+  function restartInfo(payload) {
+    var required = payload.restart_required === true;
+    var pending = payload.restart_pending === true;
+    return {
+      required: required || pending,
+      title: pending || payload.restarting ? 'Waiting for safe restart' : 'Restart required',
+      detail: payload.message || 'Settings are saved. The current GPU request will finish before the intermediary restarts; new requests are held.'
+    };
+  }
+  function renderRestart(payload) {
+    var info = restartInfo(payload);
+    setHidden('restart-banner', !info.required);
+    if (info.required) {
+      setText('restart-title', info.title);
+      setText('restart-detail', info.detail);
+    }
+  }
+  function configValidity(payload) {
+    if (payload.valid === false || payload.configuration_valid === false) return false;
+    if (browserFieldErrors().length) return false;
+    if (payload.valid === true || payload.configuration_valid === true) return true;
+    return normalizeErrors(payload).length === 0;
+  }
+  function renderConfiguration(payload) {
+    var valid = configValidity(payload);
+    var restart = restartInfo(payload);
+    var mode = String(payload.mode || '').toLowerCase();
+    var recovery = mode === 'recovery' || mode === 'configuration_error';
+    var banner = byId('configuration-banner');
+    banner.className = 'configuration-banner ' + (!valid || recovery ? 'state-error' : restart.required ? 'state-warning' : 'state-good');
+    if (!valid || recovery) {
+      setText('configuration-title', 'Configuration needs attention');
+      setText('configuration-detail', recovery
+        ? 'The intermediary is in restricted recovery mode. Correct the red fields, validate the draft, and apply it before inference can resume.'
+        : 'Correct the red fields, validate the draft, and apply it before inference continues.');
+    } else if (restart.required) {
+      setText('configuration-title', 'Saved settings are waiting for restart');
+      setText('configuration-detail', restart.detail);
+    } else {
+      setText('configuration-title', 'Configuration is valid');
+      setText('configuration-detail', 'The structured settings passed the intermediary\'s current validation checks.');
+    }
+    setText('configuration-revision', payload.revision != null ? payload.revision : (payload.etag != null ? payload.etag : (payload.version != null ? payload.version : '—')));
+    setText('configuration-applied-at', formatDate(payload.applied_at || payload.updated_at));
+    renderRestart(payload);
+  }
+
+  function setBusy(next, label) {
+    busy = next;
+    all('#settings-form button').forEach(function (button) { button.disabled = next; });
+    if (!next) all('#settings-form button').forEach(function (button) { button.disabled = false; });
+    if (!next) updateDirtyState();
+    if (next) {
+      setText('action-title', label || 'Working…');
+      setText('action-detail', 'Keep this page open while the intermediary processes the request.');
+    }
+  }
+  function updateDirtyState() {
+    dirty = calculateDirty();
+    var validForCurrentDraft = dirty && lastValidatedSignature === signature();
+    var restartPending = Boolean(loadedEnvelope && loadedEnvelope.restart_pending);
+    var canMutateSaved = !restartPending && Boolean(loadedEnvelope && loadedEnvelope.infrastructure && loadedEnvelope.infrastructure.ui_can_apply !== false);
+    byId('discard-button').disabled = busy || !dirty;
+    byId('validate-button').disabled = busy;
+    byId('apply-button').disabled = busy || !dirty || !validForCurrentDraft || !canMutateSaved;
+    byId('rollback-button').disabled = busy || dirty || !canMutateSaved || !Boolean(loadedEnvelope && loadedEnvelope.has_previous);
+    byId('reset-button').disabled = busy || dirty || !canMutateSaved;
+    byId('catchup-scan').disabled = busy || dirty || !loadedSettings || !loadedSettings.frigate || !loadedSettings.frigate.enabled || restartPending;
+    var strict = getPath(collectSettings(), 'scheduler.mode') !== 'balanced';
+    all('[data-field-wrap]').forEach(function (wrap) {
+      var field = wrap.dataset.fieldWrap;
+      var legacy = field.startsWith('scheduler.aging_') || field === 'scheduler.priority_aging'
+        || field.endsWith('.max_wait') || field.endsWith('.max_batch_requests') || field.endsWith('.max_batch_time');
+      if (legacy) { wrap.hidden = strict; wrap.querySelectorAll('input,select').forEach(function (input) { input.disabled = strict; }); }
+    });
+    var state = byId('document-state');
+    state.className = 'status-pill ' + (dirty || restartPending ? 'status-warning' : 'status-good');
+    state.textContent = restartPending ? 'Waiting for safe restart' : dirty ? 'Unapplied changes' : 'Settings current';
+    if (restartPending) {
+      setText('action-title', 'Settings saved · waiting for safe restart');
+      setText('action-detail', 'Active work will finish first. Reload after the intermediary restarts to check the applied settings.');
+    } else if (dirty) {
+      setText('action-title', !canMutateSaved ? 'Host fix required' : (validForCurrentDraft ? 'Draft validated' : 'Unapplied changes'));
+      setText('action-detail', !canMutateSaved
+        ? 'Validation remains available, but applying is disabled until the host-side diagnostic is corrected.'
+        : (validForCurrentDraft ? 'This exact draft passed validation and is ready to apply.' : 'Validate the draft before applying it.'));
+    } else if (lastApplyFeedback) {
+      setText('action-title', lastApplyFeedback.title);
+      setText('action-detail', lastApplyFeedback.detail);
+    } else {
+      setText('action-title', 'No unapplied changes');
+      setText('action-detail', 'Edit a field to create a draft.');
+    }
+    setText('fallback-client-readout', getPath(collectSettings(), 'scheduler.default_client') || 'Odysseus');
+  }
+
+  function applyEnvelope(payload) {
+    loadedEnvelope = payload;
+    loadedSettings = clone(settingsFromEnvelope(payload));
+    loadedRevision = payload.revision != null ? payload.revision : (payload.etag != null ? payload.etag : (payload.version != null ? payload.version : null));
+    touchedPaths.clear();
+    populateForm(loadedSettings);
+    renderConfiguration(payload);
+    renderSecretStatus(payload);
+    renderDiagnostics(payload);
+    renderErrors(payload);
+    if (payload.connectivity || payload.backend || payload.backend_connectivity || (payload.infrastructure && payload.infrastructure.ollama)) {
+      renderConnectivity(payload, true);
+    }
+    lastValidatedSignature = '';
+    showWorkspace();
+    updateDirtyState();
+    setText('catchup-auth', payload.infrastructure && payload.infrastructure.frigate_auth_configured
+      ? 'Frigate credentials are configured in secrets.env. Their contents are never sent to this page.'
+      : 'Frigate credentials are not configured. Set FRIGATE_USERNAME + FRIGATE_PASSWORD (or FRIGATE_AUTH_TOKEN) in secrets.env and recreate the container. A trusted internal unauthenticated API is also supported.');
+    refreshCatchup();
+  }
+
+  async function refreshCatchup() {
+    try {
+      var response = await fetch('/_intermediary/v1/frigate/status', { headers: headers(false), cache: 'no-store' });
+      if (!response.ok) return;
+      var data = await response.json();
+      setText('catchup-state', data.state || 'Unknown');
+      var counts = data.counts || {};
+      setText('catchup-status', 'Objects: ' + (data.capabilities && data.capabilities.object ? 'supported' : 'not verified')
+        + ' · Reviews: ' + (data.capabilities && data.capabilities.review ? 'supported' : 'not verified')
+        + ' · Pending: ' + (counts.pending || 0) + ' · Retrying: ' + (counts.retrying || 0)
+        + (data.last_error ? ' · ' + (data.last_error.message || data.last_error.code || data.last_error) : ''));
+    } catch (_) { /* Settings may be restarting; keep current status. */ }
+  }
+
+  byId('catchup-scan').addEventListener('click', async function () {
+    if (busy || dirty) return;
+    if (!window.confirm('Scan all retained eligible objects and reviews without descriptions? This can create a large background backlog. Existing descriptions will not be replaced.')) return;
+    setBusy(true, 'Starting historical discovery…');
+    try {
+      var response = await fetch('/_intermediary/v1/frigate/scan', {
+        method: 'POST', headers: headers(true), body: JSON.stringify({ confirm: true })
+      });
+      var payload = await parseResponse(response);
+      if (!response.ok) throw new Error(errorMessage(payload, 'The scan could not start.'));
+      setText('catchup-status', 'Historical scan accepted. Catch-up runs one job at a time when live work is idle.');
+      await refreshCatchup();
+    } catch (error) { showPageError(error.message); }
+    finally { setBusy(false); }
+  });
+
+  async function loadSettings() {
+    showPageError('');
+    var response;
+    try {
+      response = await fetch(SETTINGS_URL, { method: 'GET', headers: headers(false), cache: 'no-store' });
+    } catch (_) {
+      showPageError('The intermediary could not be reached. Check the address and try again.');
+      showAuth('The settings API could not be reached.');
+      return;
+    }
+    var payload = await parseResponse(response);
+    if (response.status === 401 || response.status === 403) {
+      showAuth(errorMessage(payload, 'A valid settings admin token is required.'));
+      return;
+    }
+    if (!response.ok) {
+      showPageError(errorMessage(payload, 'Settings could not be loaded.'));
+      showAuth('The settings API is unavailable.');
+      return;
+    }
+    lastApplyFeedback = null;
+    applyEnvelope(payload);
+  }
+
+  function renderConnectivity(payload, responseOk) {
+    var source = payload.connectivity || payload.backend_connectivity || payload.backend || (payload.validation && payload.validation.connectivity) || (payload.infrastructure && payload.infrastructure.ollama) || {};
+    var reachable = source.reachable === true || source.ok === true || source.status === 'healthy';
+    var tested = source.tested !== false && Object.keys(asObject(source)).length > 0;
+    var badge = byId('backend-connectivity');
+    badge.className = 'status-pill';
+    if (reachable) {
+      badge.classList.add('status-good');
+      badge.textContent = 'Reachable';
+      setText('backend-connectivity-detail', source.message || 'The draft Ollama address responded successfully.');
+      return true;
+    } else if (tested || !responseOk) {
+      badge.classList.add('status-error');
+      badge.textContent = 'Unreachable';
+      setText('backend-connectivity-detail', source.message || source.error || 'Ollama did not pass the connectivity check.');
+      return false;
+    } else {
+      badge.classList.add('status-neutral');
+      badge.textContent = 'Not tested';
+      setText('backend-connectivity-detail', 'The server validated the draft without reporting a connectivity result.');
+      return null;
+    }
+  }
+
+  async function validateDraft() {
+    if (busy || !loadedSettings) return false;
+    setBusy(true, 'Validating draft…');
+    clearErrors();
+    showPageError('');
+    var draftSignature = signature();
+    try {
+      var response = await fetch(VALIDATE_URL, { method: 'POST', headers: headers(true), body: JSON.stringify(requestPayload()) });
+      var payload = await parseResponse(response);
+      if (response.status === 401 || response.status === 403) { showAuth(errorMessage(payload, 'The admin token was rejected.')); return false; }
+      renderDiagnostics(Object.assign({}, loadedEnvelope || {}, payload, {
+        diagnostics: Array.isArray(payload.diagnostics) ? payload.diagnostics : []
+      }));
+      var errors = renderErrors(payload);
+      if (!response.ok || payload.valid === false || errors.length) {
+        showPageError(errorMessage(payload, 'The draft contains errors. No settings were changed.'));
+        return false;
+      }
+      lastValidatedSignature = draftSignature;
+      setText('action-title', 'Draft validated');
+      setText('action-detail', 'No settings were saved. This draft is ready to apply.');
+      return true;
+    } catch (_) {
+      showPageError('The validation request failed. No settings were changed.');
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function applyDraft() {
+    if (busy || !dirty || !loadedSettings || (loadedEnvelope && loadedEnvelope.restart_pending) || lastValidatedSignature !== signature()) return;
+    setBusy(true, 'Applying settings…');
+    clearErrors();
+    showPageError('');
+    var payloadToSend = requestPayload();
+    try {
+      var response = await fetch(APPLY_URL, { method: 'POST', headers: headers(true), body: JSON.stringify(payloadToSend) });
+      var payload = await parseResponse(response);
+      if (response.status === 401 || response.status === 403) { showAuth(errorMessage(payload, 'The admin token was rejected.')); return; }
+      var errors = renderErrors(payload);
+      if (!response.ok || payload.valid === false || errors.length) {
+        showPageError(errorMessage(payload, response.status === 409 ? 'The configuration changed elsewhere. Reload the current settings and try again.' : 'The draft was not applied.'));
+        return;
+      }
+      var envelope = payload.settings ? payload : Object.assign({}, loadedEnvelope || {}, payload, {
+        settings: collectSettings(),
+        updated_at: payload.updated_at || new Date().toISOString()
+      });
+      applyEnvelope(envelope);
+      showPageError('');
+      lastApplyFeedback = {
+        title: restartInfo(payload).required ? 'Settings saved · restart required' : 'Settings applied',
+        detail: restartInfo(payload).required ? 'Review the restart notice above before expecting every value to be active.' : 'The intermediary accepted the new configuration.'
+      };
+    } catch (_) {
+      showPageError('The apply request failed. The intermediary may not have changed anything; reload before trying again.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function discardDraft() {
+    if (!loadedSettings) return;
+    touchedPaths.clear();
+    populateForm(loadedSettings);
+    clearErrors();
+    showPageError('');
+    lastApplyFeedback = null;
+    lastValidatedSignature = '';
+    updateDirtyState();
+  }
+
+  async function mutateSavedOverrides(action) {
+    if (busy || dirty || !loadedEnvelope || loadedEnvelope.restart_pending) return;
+    var rollback = action === 'rollback';
+    var question = rollback
+      ? 'Roll back to the preceding saved settings revision? The intermediary will restart.'
+      : 'Remove every browser-saved override and return to config.yml values? The intermediary will restart.';
+    if (!window.confirm(question)) return;
+    setBusy(true, rollback ? 'Rolling back saved settings…' : 'Resetting saved overrides…');
+    clearErrors();
+    showPageError('');
+    try {
+      var response = await fetch(rollback ? ROLLBACK_URL : RESET_URL, {
+        method: 'POST',
+        headers: headers(true),
+        body: JSON.stringify({ revision: loadedRevision, settings: {} })
+      });
+      var payload = await parseResponse(response);
+      if (response.status === 401 || response.status === 403) {
+        setBusy(false);
+        showAuth(errorMessage(payload, 'The admin token was rejected.'));
+        return;
+      }
+      if (!response.ok) {
+        renderErrors(payload);
+        showPageError(errorMessage(payload, response.status === 409
+          ? 'The saved settings changed elsewhere or require a host-side repair. Reload and try again.'
+          : 'The saved overrides could not be changed.'));
+        setBusy(false);
+        return;
+      }
+      loadedRevision = payload.revision != null ? payload.revision : loadedRevision;
+      renderRestart(payload);
+      setText('configuration-revision', loadedRevision);
+      setText('configuration-title', 'Saved settings updated');
+      setText('configuration-detail', payload.message || 'The intermediary is restarting with the selected settings revision.');
+      var state = byId('document-state');
+      state.className = 'status-pill status-warning';
+      state.textContent = 'Restarting';
+      setText('action-title', rollback ? 'Rollback saved' : 'Overrides reset');
+      setText('action-detail', payload.message || 'Wait for the intermediary to restart, then reload this page.');
+      // Keep controls disabled while the process exits and its supervisor
+      // restarts it. Reloading after restart obtains the authoritative state.
+    } catch (_) {
+      showPageError('The request was interrupted. Reload after the intermediary restarts to verify the saved state.');
+      setBusy(false);
+    }
+  }
+
+  function bindEvents() {
+    byId('auth-form').addEventListener('submit', function (event) {
+      event.preventDefault();
+      setToken(byId('admin-token').value.trim());
+      byId('admin-token').value = '';
+      loadSettings();
+    });
+    byId('forget-token').addEventListener('click', function () {
+      setToken('');
+      loadedSettings = null;
+      showAuth('The settings admin token was cleared from this browser tab.');
+    });
+    byId('settings-form').addEventListener('input', function (event) {
+      var path = event.target.dataset.path || '';
+      if (path) {
+        touchedPaths.add(path);
+        var wrap = event.target.closest('[data-field-wrap]');
+        var output = all('[data-error-for]').find(function (element) { return element.dataset.errorFor === path; });
+        if (wrap) wrap.classList.remove('has-error');
+        if (output) output.textContent = '';
+      }
+      lastApplyFeedback = null;
+      lastValidatedSignature = '';
+      updateDirtyState();
+    });
+    byId('settings-form').addEventListener('change', function (event) {
+      if (event.target.dataset.path) touchedPaths.add(event.target.dataset.path);
+      lastValidatedSignature = '';
+      updateDirtyState();
+    });
+    byId('settings-form').addEventListener('submit', function (event) { event.preventDefault(); applyDraft(); });
+    byId('validate-button').addEventListener('click', function () { validateDraft(); });
+    byId('test-backend').addEventListener('click', function () { validateDraft(); });
+    byId('discard-button').addEventListener('click', discardDraft);
+    byId('rollback-button').addEventListener('click', function () { mutateSavedOverrides('rollback'); });
+    byId('reset-button').addEventListener('click', function () { mutateSavedOverrides('reset'); });
+    window.addEventListener('beforeunload', function (event) {
+      if (!dirty) return;
+      event.preventDefault();
+      event.returnValue = '';
+    });
+  }
+
+  bindEvents();
+  if (getToken()) loadSettings();
+  else showAuth('Enter the separate settings admin token to view or change configuration.');
+})();

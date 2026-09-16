@@ -44,6 +44,7 @@ jobs:
         run: |
           docker buildx create --name release-builder --use
           docker buildx build \
+            --build-arg "INTERMEDIARY_BUILD=${GITHUB_SHA}" \
             --platform linux/amd64 \
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.version=${GITHUB_REF_NAME}" \

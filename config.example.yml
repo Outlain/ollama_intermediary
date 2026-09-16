@@ -87,9 +87,14 @@ clients:
 models: {}
 
 scheduler:
+  # Strict mode: Odysseus always goes first; live Frigate waits for its idle hold.
+  # Aging, max_wait and batch limits are used only by the optional balanced mode.
+  mode: strict_priority
+  # Raw active + pending body budget, not a process RSS limit. Leave container headroom.
+  max_queue_bytes: 67108864
   # Version 1 intentionally enforces exactly one GPU inference at a time.
   max_parallel_generations: 1
-  priority_aging: true
+  priority_aging: false
   aging_interval: 10s
   aging_bonus: 5
   # Only Frigate needs a stable source match. Every unmatched request is Odysseus.
@@ -109,6 +114,8 @@ model_management:
   serialize_with_inference: true
 
 gpu_safety:
+  # A proxy restart alone must not forget uncertain upstream work / GPU errors.
+  state_path: /app/state/gpu-recovery.json
   # Once Ollama has accepted a request, finish reading it even if its caller disconnects.
   # This avoids aborting a ROCm model load and stranding a large GPU allocation.
   drain_active_disconnects: true
@@ -141,3 +148,22 @@ observability:
   recent_events: 20
   max_event_clients: 10
   queue_items_limit: 50
+
+frigate:
+  # Enable via /settings after providing the API address and host-managed credentials.
+  # Old operator config.yml files need no replacement: these defaults are automatic.
+  enabled: false
+  url: "${FRIGATE_URL:-}"
+  username: "${FRIGATE_USERNAME:-}"
+  password: "${FRIGATE_PASSWORD:-}"
+  auth_token: "${FRIGATE_AUTH_TOKEN:-}"
+  verify_tls: true
+  state_path: /app/state/frigate-backlog.json
+  poll_interval: 30s
+  live_grace: 2m
+  retry_interval: 1m
+  max_retry_interval: 1h
+  request_timeout: 15s
+  generation_timeout: 10m
+  page_size: 100
+  max_jobs: 10000

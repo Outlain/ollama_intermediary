@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0a0f18">
+  <title>Ollama Intermediary</title>
+  <link rel="stylesheet" href="/_intermediary/ui/dashboard.css">
+  <script defer src="/_intermediary/ui/dashboard.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="shell header-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">OI</span>
+        <div>
+          <p class="eyebrow">Operations monitor</p>
+          <h1>Ollama Intermediary</h1>
+        </div>
+      </div>
+      <div class="header-actions">
+        <a class="quiet-button settings-link" href="/settings">Settings</a>
+        <span id="connection-status" class="connection-badge" role="status" aria-live="polite">
+          <span class="connection-dot" aria-hidden="true"></span>
+          <span id="connection-label">Connecting</span>
+        </span>
+        <button id="forget-token" class="quiet-button" type="button" hidden>Forget token</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="shell">
+    <div id="page-error" class="notice notice-error" role="alert" hidden></div>
+
+    <section id="auth-panel" class="auth-panel" aria-labelledby="auth-title" hidden>
+      <div>
+        <p class="eyebrow">Protected endpoint</p>
+        <h2 id="auth-title">Enter the observability token</h2>
+        <p id="auth-message" class="muted">This dashboard needs a token to read operational metadata.</p>
+      </div>
+      <form id="token-form" class="token-form">
+        <label for="token-input">Bearer token</label>
+        <div class="token-row">
+          <input id="token-input" name="token" type="password" autocomplete="off" spellcheck="false" required>
+          <button type="submit">Connect</button>
+        </div>
+        <p class="form-help">The token is kept only in this browser tab's session storage.</p>
+      </form>
+    </section>
+
+    <section id="health-banner" class="health-banner health-neutral" aria-labelledby="overall-state">
+      <span class="health-orb" aria-hidden="true"></span>
+      <div class="health-copy">
+        <p class="eyebrow">System status</p>
+        <h2 id="overall-state">Connecting…</h2>
+        <p id="overall-detail">Waiting for the first intermediary snapshot.</p>
+      </div>
+      <dl class="health-stats">
+        <div>
+          <dt>Uptime</dt>
+          <dd id="service-uptime">—</dd>
+        </div>
+        <div>
+          <dt>Updated</dt>
+          <dd id="snapshot-age">—</dd>
+        </div>
+      </dl>
+    </section>
+
+    <div class="dashboard-grid">
+      <section class="card maintenance-card" aria-labelledby="maintenance-heading">
+        <div class="card-header">
+          <div>
+            <p class="eyebrow">GPU reservation</p>
+            <h2 id="maintenance-heading">Pause mode</h2>
+          </div>
+          <span id="maintenance-state" class="tag tag-neutral" role="status" aria-live="polite">Unknown</span>
+        </div>
+
+        <div class="maintenance-layout">
+          <div class="maintenance-status-panel">
+            <h3 id="maintenance-title">Waiting for status…</h3>
+            <p id="maintenance-detail" class="muted">Pause mode can temporarily reserve the GPU for work outside Ollama.</p>
+            <dl class="maintenance-details">
+              <div><dt>Automatic resume</dt><dd id="maintenance-resume-at">—</dd></div>
+              <div><dt>Time remaining</dt><dd id="maintenance-countdown">—</dd></div>
+              <div><dt>GPU released</dt><dd id="maintenance-gpu-released">—</dd></div>
+              <div><dt>Paused at</dt><dd id="maintenance-paused-at">—</dd></div>
+            </dl>
+          </div>
+
+          <div class="maintenance-controls-panel">
+            <form id="maintenance-token-form" class="maintenance-token-form">
+              <label for="maintenance-token-input">Maintenance control token</label>
+              <div class="maintenance-token-row">
+                <input id="maintenance-token-input" name="maintenance-token" type="password" autocomplete="off" spellcheck="false" aria-describedby="maintenance-token-state" required>
+                <button id="maintenance-token-submit" class="control-button control-button-secondary" type="submit">Use token</button>
+                <button id="forget-maintenance-token" class="quiet-button" type="button" hidden>Forget</button>
+              </div>
+              <p id="maintenance-token-state" class="form-help">Enter the separate maintenance token to enable controls.</p>
+            </form>
+
+            <div class="maintenance-action-row">
+              <div class="duration-control">
+                <label for="pause-duration">Pause duration</label>
+                <select id="pause-duration" name="pause-duration" aria-describedby="maintenance-warning">
+                  <option value="" selected>Until manually resumed</option>
+                  <option value="30m">30 minutes</option>
+                  <option value="1h">1 hour</option>
+                  <option value="2h">2 hours</option>
+                  <option value="4h">4 hours</option>
+                  <option value="8h">8 hours</option>
+                </select>
+              </div>
+              <div class="maintenance-buttons">
+                <button id="pause-button" class="control-button control-button-warning" type="button" aria-describedby="maintenance-warning" disabled>Pause inference</button>
+                <button id="resume-button" class="control-button control-button-primary" type="button" disabled>Resume inference</button>
+              </div>
+            </div>
+
+            <p id="maintenance-control-availability" class="form-help">Checking whether maintenance controls are configured…</p>
+            <p id="maintenance-action-status" class="action-status" role="status" aria-live="polite"></p>
+          </div>
+        </div>
+
+        <div id="maintenance-warning" class="notice notice-warning maintenance-warning" role="note">
+          <strong>What happens when pause mode starts</strong>
+          <span>The active inference request is allowed to drain. Queued and newly submitted inference requests receive HTTP 503 until inference is resumed.</span>
+        </div>
+      </section>
+
+      <section class="card catchup-card" aria-labelledby="catchup-heading">
+        <div class="card-header"><div><p class="eyebrow">Persistent background work</p><h2 id="catchup-heading">Frigate catch-up</h2></div><span id="catchup-state" class="tag tag-neutral">Disabled</span></div>
+        <p id="catchup-detail" class="muted">Enable recovery and configure the Frigate connection in Settings.</p>
+        <dl class="queue-summary">
+          <div><dt>Waiting</dt><dd id="catchup-pending">0</dd></div>
+          <div><dt>Retrying</dt><dd id="catchup-retrying">0</dd></div>
+          <div><dt>Completed</dt><dd id="catchup-completed">0</dd></div>
+        </dl>
+        <p id="catchup-capabilities" class="muted">Object / review API support not checked.</p>
+        <p id="catchup-active" class="muted">No background handoff.</p>
+        <p id="catchup-error" class="notice notice-error" hidden></p>
+        <p id="catchup-warning" class="notice notice-warning" hidden></p>
+        <div class="catchup-columns">
+          <section aria-labelledby="catchup-pending-heading"><h3 id="catchup-pending-heading">Waiting list · newest first</h3><p id="catchup-pending-empty" class="compact-empty">No descriptions are waiting.</p><ul id="catchup-pending-jobs" class="queue-list" aria-label="Pending catch-up jobs"></ul></section>
+          <section aria-labelledby="catchup-recent-heading"><h3 id="catchup-recent-heading">Recent results</h3><p id="catchup-recent-empty" class="compact-empty">No completed or skipped jobs yet.</p><ul id="catchup-jobs" class="queue-list" aria-label="Recent catch-up jobs"></ul></section>
+        </div>
+        <p><a class="quiet-button" href="/settings#catchup">Configure / fill missing descriptions</a></p>
+        <small class="muted">Newest event first. Frigate stores the images; this queue stores identifiers only. Work already handed to Frigate is not preempted.</small>
+      </section>
+
+      <section class="card current-card" aria-labelledby="current-heading">
+        <div class="card-header">
+          <div>
+            <p class="eyebrow">Scheduler</p>
+            <h2 id="current-heading">Current request</h2>
+          </div>
+          <span id="active-state" class="tag tag-neutral">Idle</span>
+        </div>
+
+        <div id="active-empty" class="empty-state">
+          <span class="empty-pulse" aria-hidden="true"></span>
+          <div>
+            <strong>No request is running</strong>
+            <p>The intermediary is ready for the next request.</p>
+          </div>
+        </div>
+
+        <div id="active-content" hidden>
+          <div class="request-title-row">
+            <div>
+              <div class="tag-row">
+                <span id="active-client" class="tag">—</span>
+                <span id="active-type" class="tag tag-neutral">—</span>
+                <span id="active-streaming" class="tag tag-neutral">—</span>
+              </div>
+              <h3 id="active-model">—</h3>
+              <p id="active-endpoint" class="mono muted">—</p>
+            </div>
+            <div class="duration-block">
+              <span>Running</span>
+              <strong id="active-running">0s</strong>
+            </div>
+          </div>
+
+          <dl class="detail-grid">
+            <div><dt>Queue wait</dt><dd id="active-queue-wait">—</dd></div>
+            <div><dt>Selected because</dt><dd id="active-reason">—</dd></div>
+            <div><dt>Request ID</dt><dd id="active-id" class="mono">—</dd></div>
+            <div><dt>State</dt><dd id="active-status-text">—</dd></div>
+          </dl>
+
+          <div class="metadata-strip" aria-label="Safe request metadata">
+            <div><span>Body</span><strong id="meta-body">—</strong></div>
+            <div><span>Characters</span><strong id="meta-characters">—</strong></div>
+            <div><span>Messages</span><strong id="meta-messages">—</strong></div>
+            <div><span>Images</span><strong id="meta-images">—</strong></div>
+            <div><span>Tools</span><strong id="meta-tools">—</strong></div>
+            <div><span>Context</span><strong id="meta-context">—</strong></div>
+            <div><span>Max output</span><strong id="meta-output">—</strong></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card queue-card" aria-labelledby="queue-heading">
+        <div class="card-header">
+          <div>
+            <p class="eyebrow">Waiting room</p>
+            <h2 id="queue-heading">Queue</h2>
+          </div>
+          <span id="queue-total" class="count-badge" aria-label="Total queued requests">0</span>
+        </div>
+
+        <dl class="queue-summary">
+          <div class="client-stat client-odysseus">
+            <dt>Odysseus</dt>
+            <dd id="queue-odysseus">0</dd>
+          </div>
+          <div class="client-stat client-frigate">
+            <dt>Frigate</dt>
+            <dd id="queue-frigate">0</dd>
+          </div>
+          <div>
+            <dt>Oldest wait</dt>
+            <dd id="queue-oldest">0s</dd>
+          </div>
+        </dl>
+
+        <p id="queue-empty" class="compact-empty">No requests are waiting.</p>
+        <ol id="queue-items" class="queue-list" aria-label="Queued requests"></ol>
+      </section>
+
+      <section class="card backend-card" aria-labelledby="backend-heading">
+        <div class="card-header">
+          <div>
+            <p class="eyebrow">Ollama backend</p>
+            <h2 id="backend-heading">Model &amp; GPU</h2>
+          </div>
+          <span id="backend-state" class="tag tag-neutral">Unknown</span>
+        </div>
+
+        <div class="model-hero">
+          <span>Scheduler model</span>
+          <strong id="scheduler-model">None loaded</strong>
+          <small id="scheduler-group">No active group</small>
+        </div>
+
+        <dl class="detail-grid backend-details">
+          <div><dt>Reported VRAM</dt><dd id="backend-vram">—</dd></div>
+          <div><dt>Context</dt><dd id="backend-context">—</dd></div>
+          <div><dt>Model lease</dt><dd id="backend-lease">—</dd></div>
+          <div><dt>Model switches</dt><dd id="backend-switches">0</dd></div>
+          <div><dt>Upstream drain</dt><dd id="backend-draining">No</dd></div>
+          <div><dt>Last API check</dt><dd id="backend-last-success">—</dd></div>
+        </dl>
+
+        <div id="recovery-warning" class="notice notice-warning" role="alert" hidden>
+          <strong>GPU recovery required</strong>
+          <span id="recovery-reason">The backend reported an unsafe GPU state.</span>
+        </div>
+        <p id="inference-warning" class="notice notice-warning" role="status" hidden></p>
+
+        <div class="subsection-heading">
+          <h3>Loaded models</h3>
+          <span id="loaded-model-count">0</span>
+        </div>
+        <ul id="loaded-models" class="model-list"></ul>
+        <p id="models-empty" class="compact-empty">Ollama reports no loaded model.</p>
+      </section>
+
+      <section class="card events-card" aria-labelledby="events-heading">
+        <div class="card-header">
+          <div>
+            <p class="eyebrow">In-memory history</p>
+            <h2 id="events-heading">Recent activity</h2>
+          </div>
+          <span class="privacy-label">Metadata only</span>
+        </div>
+        <ol id="event-list" class="timeline"></ol>
+        <p id="events-empty" class="compact-empty">No recent events.</p>
+      </section>
+    </div>
+  </main>
+
+  <footer class="site-footer shell">
+    <p>Prompts, responses, images, and authorization headers are never displayed.</p>
+    <p id="schema-version">Schema —</p>
+  </footer>
+
+  <noscript>
+    <div class="noscript-message">JavaScript is required to display live intermediary status.</div>
+  </noscript>
+</body>
+</html>

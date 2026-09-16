@@ -35,6 +35,8 @@ const DEFAULTS = {
     request_timeout: '30m',
   },
   scheduler: {
+    mode: 'strict_priority',
+    max_queue_bytes: 64 * 1024 * 1024,
     max_parallel_generations: 1,
     priority_aging: true,
     aging_interval: '10s',
@@ -53,6 +55,7 @@ const DEFAULTS = {
     serialize_with_inference: true,
   },
   gpu_safety: {
+    state_path: '',
     drain_active_disconnects: true,
     unload_on_model_switch: true,
     unload_timeout: '30s',
@@ -73,6 +76,23 @@ const DEFAULTS = {
     auth_token: '',
     max_pause: '168h',
     state_path: '/app/state/maintenance.json',
+  },
+  frigate: {
+    enabled: false,
+    url: '',
+    username: '',
+    password: '',
+    auth_token: '',
+    verify_tls: true,
+    state_path: '/app/state/frigate-backlog.json',
+    poll_interval: '30s',
+    live_grace: '2m',
+    retry_interval: '1m',
+    max_retry_interval: '1h',
+    request_timeout: '15s',
+    generation_timeout: '10m',
+    page_size: 100,
+    max_jobs: 10000,
   },
   clients: {
     default: {
@@ -119,6 +139,11 @@ function durationFields(config) {
   config.circuit_breaker.openDurationMs = parseDuration(config.circuit_breaker.open_duration, 'circuit_breaker.open_duration');
   config.gpu_safety.unloadTimeoutMs = parseDuration(config.gpu_safety.unload_timeout, 'gpu_safety.unload_timeout');
   config.maintenance.maxPauseMs = parseDuration(config.maintenance.max_pause, 'maintenance.max_pause');
+  for (const [field, derived] of Object.entries({
+    poll_interval: 'pollIntervalMs', live_grace: 'liveGraceMs',
+    retry_interval: 'retryIntervalMs', max_retry_interval: 'maxRetryIntervalMs',
+    request_timeout: 'requestTimeoutMs', generation_timeout: 'generationTimeoutMs',
+  })) config.frigate[derived] = parseDuration(config.frigate[field], `frigate.${field}`);
 
   for (const [name, client] of Object.entries(config.clients)) {
     client.requestTtlMs = parseDuration(client.request_ttl, `clients.${name}.request_ttl`);
@@ -149,6 +174,57 @@ function normalizeModelPolicy(policy, field, fallbackGroup) {
 }
 
 function validate(config) {
+  for (const [section, fields] of Object.entries({
+    ollama: { health_interval: 'healthIntervalMs', health_timeout: 'healthTimeoutMs', request_timeout: 'requestTimeoutMs' },
+    scheduler: { aging_interval: 'agingIntervalMs' },
+    circuit_breaker: { failure_window: 'failureWindowMs', open_duration: 'openDurationMs' },
+    gpu_safety: { unload_timeout: 'unloadTimeoutMs' },
+    frigate: { poll_interval: 'pollIntervalMs', retry_interval: 'retryIntervalMs', max_retry_interval: 'maxRetryIntervalMs', request_timeout: 'requestTimeoutMs', generation_timeout: 'generationTimeoutMs' },
+  })) {
+    for (const [field, derived] of Object.entries(fields)) {
+      if (config[section][derived] <= 0) throw new Error(`${section}.${field} must be greater than zero`);
+    }
+  }
+  if (!Number.isInteger(config.circuit_breaker.failure_threshold) || config.circuit_breaker.failure_threshold < 1) {
+    throw new Error('circuit_breaker.failure_threshold must be a positive integer');
+  }
+  if (!['strict_priority', 'balanced'].includes(config.scheduler.mode)) {
+    throw new Error('scheduler.mode must be strict_priority or balanced');
+  }
+  if (!Number.isSafeInteger(config.scheduler.max_queue_bytes) || config.scheduler.max_queue_bytes < 1) {
+    throw new Error('scheduler.max_queue_bytes must be a positive safe integer');
+  }
+  if (typeof config.gpu_safety.state_path !== 'string'
+    || (config.gpu_safety.state_path && !config.gpu_safety.state_path.startsWith('/'))) {
+    throw new Error('gpu_safety.state_path must be empty or an absolute path');
+  }
+  for (const field of ['enabled', 'verify_tls']) {
+    if (typeof config.frigate[field] !== 'boolean') throw new Error(`frigate.${field} must be true or false`);
+  }
+  for (const field of ['username', 'password', 'auth_token', 'url']) {
+    if (typeof config.frigate[field] !== 'string') throw new Error(`frigate.${field} must be a string`);
+  }
+  if (config.frigate.enabled && !config.frigate.url) throw new Error('frigate.url is required when catch-up is enabled');
+  if (config.frigate.url) {
+    let address;
+    try { address = new URL(config.frigate.url); } catch { throw new Error('frigate.url must be an absolute HTTP(S) URL'); }
+    if (!['http:', 'https:'].includes(address.protocol)
+      || address.username || address.password || address.search || address.hash || address.pathname !== '/') {
+      throw new Error('frigate.url must be an HTTP(S) origin without credentials, a path, query string, or fragment');
+    }
+  }
+  if (typeof config.frigate.state_path !== 'string' || !config.frigate.state_path.startsWith('/')) {
+    throw new Error('frigate.state_path must be an absolute path');
+  }
+  if (!Number.isInteger(config.frigate.page_size) || config.frigate.page_size < 1 || config.frigate.page_size > 1000) {
+    throw new Error('frigate.page_size must be between 1 and 1000');
+  }
+  if (!Number.isInteger(config.frigate.max_jobs) || config.frigate.max_jobs < 1 || config.frigate.max_jobs > 100000) {
+    throw new Error('frigate.max_jobs must be between 1 and 100000');
+  }
+  if (config.frigate.maxRetryIntervalMs < config.frigate.retryIntervalMs) {
+    throw new Error('frigate.max_retry_interval must be at least frigate.retry_interval');
+  }
   if (!Number.isInteger(config.server.body_limit_bytes) || config.server.body_limit_bytes < 1) {
     throw new Error('server.body_limit_bytes must be a positive integer');
   }

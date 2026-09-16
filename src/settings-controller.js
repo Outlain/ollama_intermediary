@@ -1,6 +1,7 @@
 import { readBody, sendJson } from './http-utils.js';
 import { authorized } from './observability.js';
 import { SETTINGS_SCHEMA, SettingsValidationError } from './settings.js';
+import { BUILD_INFO } from './build-info.js';
 import {
   SETTINGS_DASHBOARD_CSS,
   SETTINGS_DASHBOARD_HTML,
@@ -149,6 +150,7 @@ export class SettingsController {
     const valid = snapshot.valid && !hasBlockingDiagnostic;
     return {
       ...snapshot,
+      build: BUILD_INFO,
       valid,
       mode: this.mode,
       restart_pending: this.restartPending,
@@ -162,6 +164,9 @@ export class SettingsController {
         compose_editable: false,
         secrets_editable: false,
         restart_on_apply: true,
+        restart_strategy: 'after_active_request',
+        frigate_auth_configured: Boolean(this.store.getEffectiveConfig()?.frigate?.auth_token
+          || (this.store.getEffectiveConfig()?.frigate?.username && this.store.getEffectiveConfig()?.frigate?.password)),
         settings_token_configured: Boolean(this.token),
         ui_can_apply: Boolean(this.token)
           && !this.mutationDisabledReason
@@ -277,8 +282,9 @@ export class SettingsController {
         ok: true,
         revision: saved.revision,
         restart_required: true,
+        restart_pending: true,
         restarting: true,
-        message: 'Settings were saved. The intermediary is restarting with the validated configuration.',
+        message: 'Settings were saved. New GPU work is held; the intermediary will restart after the active request finishes.',
       }, id);
     } catch (error) {
       if (error instanceof SettingsValidationError) {

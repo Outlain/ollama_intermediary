@@ -1,6 +1,6 @@
 # Home Assistant quick-view dashboard
 
-The intermediary exposes one stable JSON snapshot for Home Assistant, plus authenticated pause/resume controls for planned exclusive GPU work:
+The intermediary exposes one stable JSON snapshot for Home Assistant, plus authenticated pause/resume controls and an optional historical Frigate missing-description scan:
 
 ```text
 http://UBUNTU_IP:11435/_intermediary/v1/status
@@ -15,9 +15,11 @@ Add the configured tokens from the intermediary's `secrets.env` to Home Assistan
 ```yaml
 ollama_intermediary_authorization: "Bearer PASTE_THE_TOKEN_HERE"
 ollama_intermediary_maintenance_authorization: "Bearer PASTE_THE_DIFFERENT_MAINTENANCE_TOKEN_HERE"
+# Optional: only needed for the historical Frigate scan action below.
+ollama_intermediary_settings_authorization: "Bearer PASTE_THE_SEPARATE_SETTINGS_TOKEN_HERE"
 ```
 
-The word `Bearer` is required. The first value is `OBSERVABILITY_TOKEN`; if that intermediary token is blank, omit the `Authorization` header from the REST snapshot below. The second value is the required, separate `MAINTENANCE_TOKEN`. Never reuse the read-only observability credential for administrative control. Home Assistant secrets prevent accidental publication but are not encrypted at rest.
+The word `Bearer` is required. The first value is `OBSERVABILITY_TOKEN`; if that intermediary token is blank, omit the `Authorization` header from the REST snapshot below. The second value is the required, separate `MAINTENANCE_TOKEN`. The optional third value is `SETTINGS_TOKEN`; it also authorizes broader intermediary configuration access, so restrict the Home Assistant account/actions that can use it. Never reuse the read-only observability credential for administrative control. Home Assistant secrets prevent accidental publication but are not encrypted at rest.
 
 ## 2. Add the REST entities
 
@@ -148,6 +150,45 @@ rest:
           {{ (value_json.get('scheduler') or {}).get('model_switches')
              | int(0) }}
 
+      # Optional Frigate catch-up sensors: keep these under this same shared
+      # REST resource, not a second resource with another polling loop.
+      - name: "Ollama Frigate Recovery State"
+        unique_id: ollama_frigate_recovery_state
+        icon: mdi:cctv
+        value_template: >-
+          {{ (value_json.get('frigate') or {}).get('state')
+             | default('disabled', true) }}
+
+      - name: "Ollama Frigate Pending Descriptions"
+        unique_id: ollama_frigate_pending_descriptions
+        icon: mdi:playlist-clock
+        unit_of_measurement: "descriptions"
+        state_class: measurement
+        value_template: >-
+          {% set counts = (value_json.get('frigate') or {}).get('counts') or {} %}
+          {{ (counts.get('pending', 0) | int(0))
+             + (counts.get('waiting_live', 0) | int(0))
+             + (counts.get('waiting_result', 0) | int(0))
+             + (counts.get('retrying', 0) | int(0)) }}
+
+      - name: "Ollama Frigate Lifetime Completed Descriptions"
+        unique_id: ollama_frigate_completed_descriptions
+        icon: mdi:check-all
+        unit_of_measurement: "descriptions"
+        state_class: total_increasing
+        value_template: >-
+          {{ (((value_json.get('frigate') or {}).get('totals') or {})
+              .get('completed')) | int(0) }}
+
+      - name: "Ollama Frigate Lifetime Skipped Descriptions"
+        unique_id: ollama_frigate_skipped_descriptions
+        icon: mdi:skip-next-circle-outline
+        unit_of_measurement: "descriptions"
+        state_class: total_increasing
+        value_template: >-
+          {{ (((value_json.get('frigate') or {}).get('totals') or {})
+              .get('skipped')) | int(0) }}
+
     binary_sensor:
       - name: "Ollama Intermediary Ready"
         unique_id: ollama_intermediary_ready
@@ -224,9 +265,23 @@ rest_command:
     content_type: "application/json"
     payload: '{}'
     timeout: 30
+
+  # Optional; requires Frigate catch-up to be configured and enabled.
+  ollama_intermediary_frigate_scan:
+    url: "http://UBUNTU_IP:11435/_intermediary/v1/frigate/scan"
+    method: POST
+    headers:
+      Authorization: !secret ollama_intermediary_settings_authorization
+    content_type: "application/json"
+    payload: '{"confirm":true}'
+    timeout: 30
 ```
 
-The pause command returns HTTP 202 after the pause record is safely stored; draining and unload continue in the background. The timed interval begins only after the intermediary confirms GPU release. A manual pause has no expiry; use it when the external task's duration is uncertain. New inference receives HTTP 503 while paused, so Home Assistant/Frigate may record unavailable descriptions during that period instead of accumulating an in-memory backlog.
+The pause command returns HTTP 202 after the pause record is safely stored; draining and unload continue in the background. The timed interval begins only after the intermediary confirms GPU release. A manual pause has no expiry; use it when the external task's duration is uncertain. New inference receives HTTP 503 while paused. When Frigate catch-up is configured, eligible missing descriptions can be discovered and regenerated after resuming, subject to media retention and API support; original HTTP connections are not kept open for hours.
+
+The optional scan action finds retained items missing descriptions and skips results already present at the final fresh check. Frigate lacks an atomic generate-if-missing operation, so an independent live/manual completion can still race the regeneration request. The scan does not start unrestricted GPU work: discovered eligible jobs share a newest-first durable backlog behind Odysseus and live Frigate. A full backlog pauses discovery, so ordering applies only to discovered jobs ready to run.
+
+The pending sensor includes items waiting for live results, queued recovery, accepted regenerations awaiting results, and delayed retries. Completed/skipped sensors read persistent lifetime totals; skipped can include expired media, deleted events, or items no longer eligible. Check the intermediary dashboard's recent jobs, early-trigger-only camera warnings, capacity warnings, and degraded/error state for details. Normal first enablement starts from that moment forward; only the explicit scan includes earlier history.
 
 Before starting the other GPU task, require `sensor.ollama_maintenance_state` to read `paused` and `binary_sensor.ollama_gpu_released_for_maintenance` to be `on`. An `error` state or a released sensor that remains off means the unload was not confirmed.
 
@@ -356,6 +411,25 @@ cards:
       - sensor.ollama_frigate_queue
       - sensor.ollama_oldest_queue_wait
       - sensor.ollama_model_switches
+
+  # Optional Frigate recovery card; uses the sensors/action above.
+  - type: entities
+    title: Frigate description recovery
+    show_header_toggle: false
+    entities:
+      - sensor.ollama_frigate_recovery_state
+      - sensor.ollama_frigate_pending_descriptions
+      - sensor.ollama_frigate_lifetime_completed_descriptions
+      - sensor.ollama_frigate_lifetime_skipped_descriptions
+
+  - type: button
+    name: Fill missing Frigate descriptions
+    icon: mdi:playlist-plus
+    tap_action:
+      action: perform-action
+      perform_action: rest_command.ollama_intermediary_frigate_scan
+      confirmation:
+        text: "Scan retained Frigate history for missing descriptions and queue eligible items?"
 ```
 
 Home Assistant may append `_2` to an entity ID if that ID already exists. Check the actual IDs under **Settings → Tools → States** and adjust the card if necessary.

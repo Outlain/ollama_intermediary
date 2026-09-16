@@ -25,6 +25,7 @@ cp secrets.example.env "${bundle_directory}/secrets.example.env"
 cp README.md SECURITY.md "${bundle_directory}/"
 cp docs/INSTALL.md "${bundle_directory}/docs/INSTALL.md"
 cp docs/HOME_ASSISTANT.md "${bundle_directory}/docs/HOME_ASSISTANT.md"
+cp docs/RELEASING.md "${bundle_directory}/docs/RELEASING.md"
 printf '%s\n' "$version" > "${bundle_directory}/VERSION"
 
 tar -C "$output" -czf "${output}/${bundle_name}.tar.gz" "$bundle_name"

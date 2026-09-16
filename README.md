@@ -1,11 +1,11 @@
 # Ollama Scheduling Proxy
 
-A model-aware, streaming reverse proxy for multiple applications sharing one Ollama server and one GPU. It owns the external inference queue, forwards at most one generation at a time, and deliberately trades a small amount of idle time for far fewer large-model unload/reload cycles.
+A streaming reverse proxy for multiple applications sharing one Ollama server and one GPU. It runs at most one inference at a time, prioritizes Odysseus, and can recover missing Frigate object and review descriptions later using a persistent backlog.
 
 The supplied defaults target these workloads without tying them to particular model names:
 
 - Odysseus: interactive priority, protected queue, and a one-minute model lease.
-- Frigate: bounded newest-biased queue, short lease, and a two-minute TTL.
+- Frigate: a bounded live queue plus optional durable description catch-up when the GPU is idle.
 - Ollama: a configurable backend URL, `OLLAMA_NUM_PARALLEL=1`, and `OLLAMA_MAX_LOADED_MODELS=1`.
 
 ## Install from a GitHub Release
@@ -15,11 +15,11 @@ Tagged releases publish two artifacts:
 - A versioned Linux `amd64` container image in GitHub Container Registry.
 - A small deployment bundle containing Compose, configuration templates, documentation, and a SHA-256 checksum.
 
-After substituting the public repository owner and version:
+Once a version has actually been published on [GitHub Releases](https://github.com/Outlain/ollama_intermediary/releases), use its tag below. The version in source code alone does not mean that an image or release exists yet.
 
 ```sh
 gh release download v1.0.0 \
-  --repo OWNER/ollama-scheduling-proxy \
+  --repo Outlain/ollama_intermediary \
   --pattern 'ollama-scheduling-proxy-v1.0.0-linux-amd64.tar.gz*'
 sha256sum -c ollama-scheduling-proxy-v1.0.0-linux-amd64.tar.gz.sha256
 tar -xzf ollama-scheduling-proxy-v1.0.0-linux-amd64.tar.gz
@@ -66,28 +66,24 @@ The container publishes host port `11435` to proxy port `11434`. The real Ollama
 
 Inference endpoints enter an in-memory queue. A single dispatcher is the only code path that can open a scheduled generation request to Ollama.
 
-At each dispatch boundary:
+`scheduler.mode: strict_priority` is the default, including for older configuration files without a mode field. At each dispatch boundary:
 
-1. Expired and disconnected work is removed.
-2. A request whose client `max_wait` has elapsed can force a model switch.
-3. Otherwise, requests for the selected model keep affinity while its request/time batch limits remain.
-4. If the selected model has no queued work, its `idle_hold` lease delays an avoidable switch. A same-model follow-up wakes the dispatcher immediately.
-5. When affinity does not decide, the highest effective priority runs:
+1. Expired and disconnected live HTTP requests are removed.
+2. Waiting Odysseus requests go first, in arrival order, regardless of model name.
+3. Other live clients use their configured priority, then arrival order. A lower-priority client waits for the previous client's idle hold; a higher-priority client does not.
+4. Frigate catch-up starts one regeneration attempt only when live queues, active inference, and idle holds are clear. Discovered, eligible catch-up items whose retry delay has elapsed are newest-event-first.
 
-```text
-effective_priority = base_priority
-                   + floor(wait / aging_interval) * aging_bonus
-```
+Active inference is never interrupted to give another client a turn. In strict mode, priority aging, `max_wait`, model affinity, and batch limits cannot force Frigate ahead of Odysseus. Continuous Odysseus work can therefore postpone Frigate indefinitely; that is intentional. With the default one-minute Odysseus hold, a short web-search pause does not immediately hand the GPU to Frigate.
 
-FIFO is preserved within each client/model pair. The hard `max_wait` rule is the starvation backstop; aging gives old work increasing weight before that point. `max_batch_requests` and `max_batch_time` bound how long a busy model can retain affinity.
+For `O1 F1 O2 F2 O3`, when the later requests arrive while O1 runs, the order is `O1 O2 O3`, the idle hold, then `F1 F2` if no new Odysseus request arrives.
 
-For `O1 F1 O2 F2 O3`, if the later jobs arrive while O1 runs, the expected order is `O1 O2 O3 F1 F2`, subject to maximum-wait and batch limits.
+For deployments that intentionally want the old fairness/affinity behavior, explicitly choose `scheduler.mode: balanced`. Only that compatibility mode applies priority aging, `max_wait` promotion, and model batch limits. A `max_wait` of zero disables forced promotion; it does not mean immediate expiration. Queue TTL is a separate setting in both modes.
 
 ### Lease versus Ollama keep-alive
 
 These controls are related but different:
 
-- `idle_hold` is a scheduling decision: leave the dispatcher idle briefly instead of choosing another model.
+- `idle_hold` is a scheduling decision: leave the dispatcher idle briefly instead of handing the GPU to a lower-priority client. It does not delay a higher-priority request in strict mode, even when the model is unchanged.
 - `keep_alive` is written into native Ollama generation request bodies: ask Ollama to retain that model for the configured duration.
 
 The proxy never sends a separate preload request. The selected real request loads whatever model its JSON body names. OpenAI-compatible request bodies are not modified with native `keep_alive` fields. Once the scheduler has actually chosen a different model, the default GPU-safety policy sends a native `keep_alive: 0` cleanup request for the previous model and waits for `/api/ps` to confirm its unload before dispatching the replacement.
@@ -124,19 +120,21 @@ Scheduled inference endpoints:
 - `POST /api/embed`
 - `POST /api/embeddings`
 - `POST /v1/chat/completions`
+- `POST /v1/completions`
+- `POST /v1/responses`
 - `POST /v1/embeddings`
 
-Metadata endpoints—including `/api/tags`, `/api/show`, `/api/ps`, and `/v1/models`—pass through immediately and do not wait for inference. Unknown non-management endpoints also pass through.
+Explicitly allowlisted metadata endpoints—including `/api/tags`, `/api/show`, `/api/ps`, and `/v1/models`—pass through immediately and do not wait for inference. Unknown routes are rejected rather than risking a new inference endpoint bypassing serialization. Supported blob checks are metadata; blob uploads and model mutations use the management gate.
 
 Model-management endpoints `/api/pull`, `/api/push`, `/api/create`, `/api/delete`, and `/api/copy` use an exclusive operation gate. Once one is waiting it has precedence at the next inference boundary, and it never runs concurrently with generation. They can be disabled entirely.
 
-Response status, content type, application headers, and body bytes are streamed as Ollama supplies them. The proxy does not buffer a complete model response and does not invent heartbeat tokens. Hop-by-hop HTTP headers are removed as required for a proxy. Request bodies are capped by `server.body_limit_bytes` because queued payloads live in memory.
+Response status, content type, application headers, and body bytes are streamed as Ollama supplies them. The proxy does not buffer a complete model response and does not invent heartbeat tokens. Hop-by-hop HTTP headers are removed as required for a proxy. Request bodies are capped individually by `server.body_limit_bytes`; `scheduler.max_queue_bytes` additionally bounds admitted active plus queued request bodies (64 MiB by default). This is a payload budget, not a guarantee about total process memory.
 
 Unconfigured models are normally scheduled using their detected client's policy. Keep `scheduler.unknown_model_policy: schedule` for this model-agnostic behavior. The alternative `reject` mode is only useful for an intentional model allowlist.
 
 ## Deployment variables and `secrets.env`
 
-Docker Compose loads `secrets.env` into the container. The YAML loader expands `${NAME}`, `${NAME:-default}`, and `${NAME:?error message}` placeholders before parsing the configuration.
+Docker Compose loads `secrets.env` into the container. The YAML loader parses YAML first, then expands `${NAME}`, `${NAME:-default}`, and `${NAME:?error message}` placeholders in values, so environment text cannot inject additional YAML sections.
 
 ```dotenv
 OLLAMA_URL=http://192.0.2.10:11434
@@ -144,6 +142,10 @@ FRIGATE_SOURCE=192.0.2.50/32
 OBSERVABILITY_TOKEN=
 SETTINGS_TOKEN=
 MAINTENANCE_TOKEN=
+FRIGATE_URL=
+FRIGATE_USERNAME=
+FRIGATE_PASSWORD=
+FRIGATE_AUTH_TOKEN=
 ```
 
 `OLLAMA_URL` and `MAINTENANCE_TOKEN` are required by the supplied base configuration, and `SETTINGS_TOKEN` is required to use the settings page/API. Generate each administrative token independently with `openssl rand -hex 32`. `SETTINGS_TOKEN` protects configuration reads and changes; `MAINTENANCE_TOKEN` authorizes pause/resume. Neither should be reused as the optional read-only `OBSERVABILITY_TOKEN`. `FRIGATE_SOURCE` can remain blank until Frigate is connected, or when Frigate sends `X-Ollama-Client: frigate`. The supplied `scheduler.default_client: odysseus` setting means an unmatched source automatically receives the Odysseus policy; Odysseus's changing container IP never needs to be configured. `secrets.env` is ignored by Git and excluded from the Docker build context.
@@ -162,7 +164,7 @@ Configuration has three deliberately separate owners:
 
 Docker Compose is also host-only. The container has neither the Compose file nor the Docker socket mounted for writing, so the page cannot change ports, mounts, restart policy, image tags, memory limits, or Docker networking. Keep machine-specific Compose changes in the ignored `docker-compose.override.yml`, not in the tracked base file.
 
-Use **Validate changes** before **Apply settings**. Apply atomically saves the override plus one last-known-good revision, stops admitting new inference, lets an already-dispatched Ollama request drain during graceful shutdown, and exits with status 75. The supplied Compose `restart: unless-stopped` policy starts it again with the new values. A systemd installation needs `Restart=on-failure`; a foreground `node` process must be started again manually.
+Use **Validate changes** before **Apply settings**. Apply atomically saves the override plus one last-known-good revision, stops admitting new inference, and waits for already-dispatched work to finish before beginning shutdown and exiting with status 75. The supplied Compose `restart: unless-stopped` policy starts it again with the new values. A systemd installation needs `Restart=on-failure`; a foreground `node` process must be started again manually.
 
 If a safely editable setting prevents normal startup, the service enters a restricted configuration-recovery mode on the same container listener. `/settings` and `/healthz` remain available, `/readyz` and `/status` return HTTP 503 with `configuration_invalid`, and inference receives HTTP 503 until a valid configuration is applied and the supervisor restarts the service. Invalid YAML, a missing host-managed token, a bad volume mount, or a listener/Compose problem still requires a host-side fix. `SETTINGS_TOKEN` must be present in `secrets.env` even in recovery mode; without it, the static page loads but the settings API remains locked.
 
@@ -174,9 +176,9 @@ Because saved overrides take precedence, later edits to an overridden field in `
 - Frigate defaults to 20 queued requests and `drop_oldest`. An evicted caller receives JSON HTTP 429. Jobs older than two minutes receive HTTP 408 and are never dispatched.
 - Optional coalescing is newest-wins and only activates when at least one configured header or scalar JSON field yields a key. Do not enable it until the real Frigate identifiers are confirmed.
 - A queued disconnect removes the job immediately. By default, a running disconnect stops downstream delivery but drains Ollama to a normal completion while holding the single-inference gate. This deliberately trades some otherwise-wasted GPU time for safer ROCm cleanup.
-- Generation requests are not retried. Even a connection failure before response headers is ambiguous—the backend may have started work—so version 1 chooses duplicate safety.
+- Original inference payloads are never automatically replayed. Even a connection failure before response headers is ambiguous: the backend may have started work. Optional Frigate recovery instead checks saved descriptions and asks Frigate's own regeneration API to handle still-missing results.
 - Three failures in the configured window open the circuit. With `queue_behavior: hold`, queued jobs remain subject to their normal TTL while health probes run; `reject_new` returns 503 for new inference.
-- A response containing a recognized ROCm/GPU out-of-memory signature bypasses the ordinary failure threshold and latches `recovery_required`. Queued work is failed with 503, new inference is rejected, and `/readyz` remains 503 until the proxy process is restarted after Ollama or the host has been recovered.
+- A recognized GPU out-of-memory error or an uncertain upstream completion can latch `recovery_required`. Queued work is failed with 503 and new inference is rejected until an operator has recovered the host and acknowledges recovery. HTTP 200 streaming responses can contain model errors; they are not automatically counted as successful generations.
 - `/api/tags` and `/api/ps` are probed periodically. `/api/ps` reconciles the scheduler's model state when no request is active, covering Ollama restarts and external unloads.
 
 The proxy intentionally does not kill `llama-server`, run `amd-smi`, or reboot the host. It contains a suspected GPU fault instead of claiming to repair kernel/driver state. The ambiguous condition “`/api/ps` empty while VRAM is busy” still requires a host-side `rocm-smi` check; no GPU devices or host privileges are granted to this container.
@@ -194,16 +196,51 @@ gpu_safety:
   error_body_limit_bytes: 65536
 ```
 
-`drain_active_disconnects` applies only after dispatch. Callers that disappear while queued are still removed immediately. `unload_on_model_switch` runs only after normal lease/priority/batch scheduling has selected a different model, so it does not shorten `idle_hold`. The error-body limit bounds how much of an HTTP 5xx body is retained for fault classification; successful and streaming response bodies are not buffered.
+`drain_active_disconnects` applies only after dispatch. Callers that disappear while queued are still removed immediately. `unload_on_model_switch` runs only after scheduling has selected a different model. The error-body limit bounds retained error text; streaming responses are inspected incrementally for model errors without retaining complete output. Usage statistics that cannot be safely parsed within bounded buffers are unavailable, not invented.
 
 When `/status` reports `backend.state: recovery_required`:
 
 1. Check `ollama ps` and `sudo rocm-smi --showmeminfo vram --showpids` on the host.
 2. Restart Ollama. If an `UNKNOWN` KFD PID still owns substantial VRAM, reboot the host to reset the driver.
-3. Restart the intermediary container after the backend is clean: `docker compose restart ollama-scheduler`.
-4. Confirm `/readyz` returns 200 before sending inference again.
+3. Keep maintenance paused, with no active inference or management operation. Acknowledge recovery only after checking physical GPU state: `POST /_intermediary/v1/recovery/acknowledge`, authenticated with `MAINTENANCE_TOKEN`, and JSON `{"confirm_gpu_recovered":true}`. The endpoint checks a fresh Ollama loaded-model list and requires it to be empty; it does not reset the GPU or independently prove that driver allocations are gone.
+4. Recovery acknowledgment leaves maintenance paused. Resume explicitly, then confirm `/readyz` returns 200 before sending inference again.
 
 The recovery latch is intentionally not cleared by an HTTP health probe: `/api/tags` can succeed while ROCm still holds orphaned VRAM.
+
+## Frigate description catch-up
+
+Catch-up is opt-in (`frigate.enabled: false` by default). It is a durable to-do list of Frigate object/review IDs, timestamps, state, and retry metadata—not a second copy of camera images, prompts, or recordings. Frigate still retrieves its own retained media and stores the resulting descriptions.
+
+Use `/settings` for enablement and ordinary timing/limit changes. Keep connection credentials in `secrets.env`:
+
+```dotenv
+FRIGATE_URL=https://YOUR_FRIGATE_HOST:8971
+FRIGATE_USERNAME=YOUR_ADMIN_USERNAME
+FRIGATE_PASSWORD=YOUR_PASSWORD
+# Alternatively use an appropriate bearer credential instead of username/password.
+FRIGATE_AUTH_TOKEN=
+```
+
+The URL is the Frigate origin, without `/api`. Use a trusted TLS certificate; credentials must not be embedded in the URL. The intermediary needs an administrator-capable Frigate API connection because regeneration is an administrative operation. This connection is separate from `FRIGATE_SOURCE`, which identifies live inference traffic, and separate from Frigate's Ollama URL, which must continue pointing at the intermediary.
+
+- Object recovery uses Frigate's native event-description regeneration API.
+- Review recovery requires an installed Frigate build exposing `PUT /api/review/{id}/regenerate_description`, such as the tested-against source interface in development build `0.19.0-bb6c2e9`. This is not a claim of live hardware validation or a recommendation to blindly upgrade a production camera system.
+- Unsupported review regeneration must be reported as unavailable, not silently replaced with a time-period summary.
+- Effective per-camera enablement, object/zone filters, and review alert/detection settings control eligibility. The worker skips descriptions present at its final fresh check, bypassing Frigate's API cache. Frigate has no atomic “generate only if still missing” operation: a separate live/manual completion can race that check and the subsequent regeneration request. Object `force:false` respects camera enablement; it is not a no-overwrite guard.
+- Cameras configured only for early object triggers (`tracked_object_end: false`) are excluded from object recovery and show `early_trigger_only_not_recoverable`. Retained event records do not expose the significant-update count needed to prove that their early trigger fired. Review recovery remains independent. Enable **Send on end** in Frigate only if you actually want that behavior; the intermediary does not change it for you.
+- Automatic discovery begins at first enablement and persists that starting point. Use **Fill missing descriptions** to deliberately scan older retained items. Automatic and manual candidates share a deduplicated, newest-first backlog.
+- Live HTTP requests keep their normal bounded queue and timeouts. A lost live connection does not need to remain open for hours: missing descriptions are discovered from Frigate afterwards.
+- A background attempt starts only when the GPU scheduler is idle and not paused/recovering. Once Frigate has accepted a regeneration or inference is running, it is not forcibly cancelled when a new live request arrives. Frigate's native requests are not tagged as live versus regeneration, so this is idle-only background admission, not preemption of every subsequent native request.
+- Regeneration acceptance is not completion. The worker checks Frigate for the saved description, retries transient problems with delay, and records deleted events/missing media as skipped rather than retrying missing recordings forever.
+- Snapshots/recordings must outlast the backlog. Review regeneration uses retained recordings; object regeneration uses available configured snapshots/thumbnails, not necessarily the exact original live image sequence.
+
+The backlog lives at `/app/state/frigate-backlog.json` by default, in the existing named volume. Never delete that volume during upgrades. `max_jobs` bounds pending queue state; a `backlog_capacity_reached` warning means discovery keeps its cursor and waits for room rather than discarding pending items. Newest-first applies to discovered, ready jobs: undiscovered items behind a full queue or unfinished scan cannot participate yet. Monitor capacity when scanning large histories. `poll_interval`, `live_grace`, `retry_interval`, `max_retry_interval`, `request_timeout`, and `generation_timeout` distinguish discovery, time allowed for a live description to arrive, retry backoff, API requests, and waiting for a generated result.
+
+`GET /_intermediary/v1/status` exposes `frigate.state`, `frigate.counts` (`pending`, `waiting_live`, `waiting_result`, `retrying`), and persistent `frigate.totals.completed` / `frigate.totals.skipped`. Recent jobs show reasons; connection or state-store failures appear as degraded/error state. To request the historical missing-description scan, use `POST /_intermediary/v1/frigate/scan` with `SETTINGS_TOKEN` and JSON `{"confirm":true}`. The scan requests work; it does not synchronously generate every description. Home Assistant examples are in [docs/HOME_ASSISTANT.md](docs/HOME_ASSISTANT.md).
+
+`frigate.eligibility_skipped` counts discovery observations by exclusion reason, not distinct events: overlapping or repeated scans can count the same item again. Camera warnings and these counts help explain why a missing description is not eligible; they are not failed-generation totals.
+
+Before enabling unattended recovery, test one retained object and one ended review on your installed Frigate instance, confirm the resulting descriptions appear in Frigate, then test live Odysseus priority and a container restart. Mock tests cannot validate real media retention, permissions, or GPU driver stability.
 
 ## Planned maintenance pause
 
@@ -292,7 +329,7 @@ The versioned read-only API is:
 - `GET /_intermediary/v1/history?limit=50` for bounded in-memory history
 - `GET /_intermediary/v1/events` for live Server-Sent Events
 
-Set `OBSERVABILITY_TOKEN` in `secrets.env` to require a bearer token for these three data endpoints. The static dashboard will request it and retain it only in the browser tab's session storage. A blank token is convenient on a trusted LAN but provides no read-API authentication. Pause/resume and settings are separate administrative operations protected by their own non-empty `MAINTENANCE_TOKEN` and `SETTINGS_TOKEN`; an observability token cannot mutate state.
+Set `OBSERVABILITY_TOKEN` in `secrets.env` to require a bearer token for these data endpoints and legacy `/status` and `/metrics`. The static dashboard will request it and retain it only in the browser tab's session storage. A blank token is convenient on a trusted LAN but provides no read-API authentication. Pause/resume/recovery acknowledgment and settings/catch-up scanning are separate administrative operations protected by `MAINTENANCE_TOKEN` and `SETTINGS_TOKEN`; an observability token cannot mutate state.
 
 Home Assistant can turn the shared snapshot into native sensors with one five-second REST poll. See [Home Assistant setup](docs/HOME_ASSISTANT.md).
 
@@ -315,7 +352,7 @@ Home Assistant can turn the shared snapshot into native sensors with one five-se
 - `proxy_upstream_draining`
 - `proxy_circuit_breaker_opens_total`
 
-All application logs are newline-delimited JSON. Scheduling lifecycle entries include request ID, detected client, model, queue/dispatch/completion times, wait/duration, streaming flag, status, and switch reason. Supply `X-Request-ID` to correlate an existing trace; otherwise the proxy creates one.
+All application logs are newline-delimited JSON. The supplied Compose files rotate container logs at 10 MiB across three files. Scheduling lifecycle entries include request ID, detected client, model, queue/dispatch/completion times, wait/duration, streaming flag, status, and switch reason. Supply `X-Request-ID` to correlate an existing trace; otherwise the proxy creates one. Prometheus model labels and per-metric series are bounded, with excess values aggregated rather than retained without limit.
 
 Alert at minimum on `proxy_backend_healthy == 0`, `proxy_gpu_recovery_required == 1`, circuit openings, elevated queue age, drops, and the rate of `proxy_model_switches_total`. The last metric is the central before/after measure for GPU churn.
 
@@ -387,4 +424,4 @@ npm test
 npm run test:coverage
 ```
 
-The tests use Node's built-in test runner and a real HTTP mock Ollama. They cover FIFO, priority, aging/max-wait fairness, affinity batching, lease behavior, bounded batches, TTL, overflow, queued cancellation, active and streaming disconnect draining, unload-before-switch confirmation, ROCm OOM recovery latching, maintenance admission/drain/unload/state restoration, streaming latency, single upstream generation concurrency, circuit breaking, metadata bypass, exclusive model management, mappings, unknown models, keep-alive normalization, status/metrics, graceful shutdown, the `O O O F F` scenario, and post-restart model reconciliation.
+The tests use Node's built-in test runner and HTTP mocks. Coverage includes strict priority and balanced compatibility, same-model client holds, higher-priority hold bypass, bounded payload memory and metric cardinality, endpoint safety classification, streaming errors/draining, unload-before-switch, recovery latching, maintenance persistence, Frigate discovery/regeneration state transitions, settings validation/restarts, status/metrics, and existing streaming behavior. Live Frigate media access and ROCm hardware recovery require deployment acceptance tests.

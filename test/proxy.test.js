@@ -295,7 +295,8 @@ test('one ROCm OOM latches recovery and rejects subsequent inference', async (t)
 
   const status = await (await fetch(`${proxyUrl}/status`)).json();
   assert.equal(status.backend.recovery_required, true);
-  assert.match(status.backend.recovery_reason, /ROCm error: out of memory/i);
+  assert.match(status.backend.recovery_reason, /host recovery verification/i);
+  assert.doesNotMatch(JSON.stringify(status), /ROCm error: out of memory/i);
   const metrics = await (await fetch(`${proxyUrl}/metrics`)).text();
   assert.match(metrics, /proxy_gpu_recovery_required 1/);
   assert.match(metrics, /proxy_gpu_recovery_required_total 1/);
@@ -505,6 +506,136 @@ test('an unregistered model uses client-wide policy without a model mapping upda
   assert.equal(response.status, 200);
   assert.equal(received.model, 'newly-downloaded-odysseus-model:latest');
   assert.equal(received.keep_alive, '750ms');
+});
+
+test('explicit keep_alive zero reaches Ollama as an unload, not a retention policy', async (t) => {
+  const { mock, proxyUrl } = await setup(t);
+  const response = await requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', keep_alive: 0 });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.ok(mock.events.includes('unload:od-model'));
+  assert.equal(mock.loadedModel, null);
+});
+
+test('HTTP 200 in-band GPU errors fail the request and persistently block inference', async (t) => {
+  const { mock, service, proxyUrl } = await setup(t);
+  const original = mock.handle.bind(mock);
+  mock.handle = async (request, response) => {
+    if (request.url !== '/api/chat') return original(request, response);
+    await mock.body(request);
+    response.setHeader('content-type', 'application/x-ndjson');
+    response.write('{"response":"partial","done":false}\n');
+    response.end('{"error":"ROCm error: out of memory private diagnostic"}\n');
+  };
+  const response = await requestJson(`${proxyUrl}/api/chat`, { model: 'od-model', stream: true });
+  assert.equal(response.status, 200); // Already forwarded; the protocol reports the error.
+  await response.text();
+  await waitFor(() => service.backend.recoveryRequired && service.scheduler.active === null);
+  const failed = service.observability.recent().find((event) => event.type === 'request_failed');
+  assert.equal(failed.reason, 'upstream_inference_error');
+  assert.equal(failed.status, 502);
+  assert.equal(failed.upstream_http_status, 200);
+  assert.doesNotMatch(JSON.stringify(service.observability.recent()), /private diagnostic/);
+  await service.backend.probe();
+  assert.equal(service.backend.recoveryRequired, true);
+  assert.equal((await requestJson(`${proxyUrl}/api/chat`, { model: 'od-model' })).status, 503);
+});
+
+test('SSE response.failed records produce failures rather than green completed events', async (t) => {
+  const { mock, service, proxyUrl } = await setup(t);
+  const original = mock.handle.bind(mock);
+  mock.handle = async (request, response) => {
+    if (request.url !== '/v1/chat/completions') return original(request, response);
+    await mock.body(request);
+    response.setHeader('content-type', 'text/event-stream');
+    response.write('event: response.failed\ndata: {"type":"response.failed","response":{"error":');
+    response.end('{"message":"model runner failed"}}}\n\ndata: [DONE]\n\n');
+  };
+  const response = await requestJson(`${proxyUrl}/v1/chat/completions`, { model: 'od-model', stream: true });
+  await response.text();
+  await waitFor(() => service.scheduler.active === null);
+  assert.ok(service.observability.recent().some((event) => event.type === 'request_failed' && event.reason === 'upstream_inference_error'));
+  assert.equal(service.observability.recent().some((event) => event.type === 'request_completed'), false);
+  await service.backend.probe();
+  assert.equal(service.backend.status().reachable, true);
+  assert.match(service.backend.status().last_inference_error, /model runner failed/);
+  assert.match(service.backend.status().last_error, /model runner failed/);
+});
+
+test('broken upstream streams terminate downstream and latch uncertain completion', async (t) => {
+  const { mock, service, proxyUrl } = await setup(t);
+  const original = mock.handle.bind(mock);
+  mock.handle = async (request, response) => {
+    if (request.url !== '/api/chat') return original(request, response);
+    await mock.body(request);
+    response.write('{"response":"partial","done":false}\n');
+    setTimeout(() => response.destroy(new Error('mock runner transport lost')), 20);
+  };
+  const response = await requestJson(`${proxyUrl}/api/chat`, { model: 'od-model', stream: true });
+  await assert.rejects(response.text());
+  await waitFor(() => service.backend.recoveryRequired && service.scheduler.active === null);
+  const event = service.observability.recent().find((item) => item.type === 'request_failed');
+  assert.equal(event.reason, 'upstream_completion_uncertain');
+  assert.equal((await requestJson(`${proxyUrl}/api/generate`, { model: 'f-model' })).status, 503);
+});
+
+test('hard timeout during client-disconnect draining keeps subsequent inference blocked', async (t) => {
+  const { mock, service, proxyUrl } = await setup(t);
+  service.config.ollama.requestTimeoutMs = 100;
+  const original = mock.handle.bind(mock);
+  mock.handle = async (request, response) => {
+    if (request.url !== '/api/chat') return original(request, response);
+    await mock.body(request);
+    response.write('{"response":"still computing","done":false}\n');
+    // Never finish: the backend runtime limit will abort this transport, but
+    // cannot establish whether a GPU kernel stopped.
+  };
+  const abandoned = http.request(new URL('/api/chat', proxyUrl), { method: 'POST', headers: { 'content-type': 'application/json' } });
+  abandoned.on('error', () => {});
+  const disconnected = new Promise((resolve) => abandoned.once('response', (response) => {
+    response.once('data', () => { abandoned.destroy(); resolve(); });
+  }));
+  abandoned.end(JSON.stringify({ model: 'od-model', stream: true }));
+  await disconnected;
+  await waitFor(() => service.backend.recoveryRequired);
+  assert.equal((await requestJson(`${proxyUrl}/api/generate`, { model: 'f-model', id: 'blocked-after-timeout' })).status, 503);
+  assert.equal(mock.order.includes('blocked-after-timeout'), false);
+  await service.backend.probe();
+  assert.equal(service.backend.recoveryRequired, true);
+});
+
+test('legacy diagnostics require the observability token and readiness redacts unauthenticated details', async (t) => {
+  const { proxyUrl } = await setup(t, { observability: { auth_token: 'status-secret' } });
+  for (const endpoint of ['/status', '/metrics']) {
+    assert.equal((await fetch(`${proxyUrl}${endpoint}`)).status, 401);
+    assert.equal((await fetch(`${proxyUrl}${endpoint}`, { headers: { authorization: 'Bearer status-secret' } })).status, 200);
+  }
+  assert.deepEqual(await (await fetch(`${proxyUrl}/readyz`)).json(), { status: 'ready' });
+  assert.deepEqual(await (await fetch(`${proxyUrl}/healthz`)).json(), { status: 'ok' });
+});
+
+test('unknown endpoints cannot bypass the GPU operation gate', async (t) => {
+  const { mock, proxyUrl } = await setup(t);
+  const response = await fetch(`${proxyUrl}/api/future-compute`, { method: 'POST', body: '{}' });
+  assert.equal(response.status, 404);
+  assert.equal((await response.json()).code, 'unsupported_endpoint');
+  assert.equal(mock.events.includes('/api/future-compute'), false);
+});
+
+test('settings restart waits for active inference without hiding diagnostics', async (t) => {
+  const { service, proxyUrl } = await setup(t);
+  const active = requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', delay_ms: 180 });
+  await waitFor(() => service.scheduler.active !== null);
+  service.beginSettingsRestart();
+  let idle = false;
+  const idleWait = service.waitForIdle().then(() => { idle = true; });
+  assert.equal((await fetch(`${proxyUrl}/status`)).status, 200);
+  assert.equal((await fetch(`${proxyUrl}/readyz`)).status, 503);
+  assert.equal((await requestJson(`${proxyUrl}/api/generate`, { model: 'od-model' })).status, 503);
+  assert.equal(idle, false);
+  await (await active).text();
+  await idleWait;
+  assert.equal(idle, true);
 });
 
 test('idle graceful shutdown does not wait for the full grace period', async () => {

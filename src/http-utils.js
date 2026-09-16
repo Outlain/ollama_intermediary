@@ -1,4 +1,5 @@
 import { isIP } from 'node:net';
+import { StringDecoder } from 'node:string_decoder';
 
 const HOP_BY_HOP = new Set([
   'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
@@ -67,6 +68,68 @@ function captureChunk(chunks, state, chunk, limit) {
   state.length += captured.length;
 }
 
+// Inspect only complete protocol records. Keep memory bounded even when an
+// upstream emits one enormous JSON response or an unterminated stream line.
+// Error messages are private diagnostics, never dashboard metadata.
+export class ResponseOutcomeCollector {
+  constructor(limit = 65_536) {
+    this.limit = limit;
+    this.decoder = new StringDecoder('utf8');
+    this.pending = '';
+    this.discarding = false;
+    this.errorMessage = null;
+    this.document = '';
+  }
+
+  inspect(line) {
+    let data = line.trim();
+    if (data.startsWith('data:')) data = data.slice(5).trim();
+    if (!data.startsWith('{')) return;
+    try {
+      const value = JSON.parse(data);
+      const error = value.error ?? value.response?.error;
+      if (error || value.type === 'response.failed' || value.type === 'error') {
+        const message = typeof error === 'string' ? error : error?.message;
+        this.errorMessage ??= (typeof message === 'string' ? message : 'Ollama reported an in-band inference error').slice(0, this.limit);
+      }
+    } catch { /* Non-JSON protocol frames are not inference errors. */ }
+  }
+
+  push(chunk) {
+    const text = this.decoder.write(chunk);
+    if (this.document !== null) this.document = this.document.length + text.length <= this.limit ? this.document + text : null;
+    let start = 0;
+    while (start < text.length) {
+      const end = text.indexOf('\n', start);
+      const part = text.slice(start, end < 0 ? text.length : end);
+      if (!this.discarding) {
+        if (this.pending.length + part.length > this.limit) {
+          this.pending = '';
+          this.discarding = true;
+        } else this.pending += part;
+      }
+      if (end < 0) break;
+      if (!this.discarding) this.inspect(this.pending);
+      this.pending = '';
+      this.discarding = false;
+      start = end + 1;
+    }
+  }
+
+  finish() {
+    const remaining = this.decoder.end();
+    this.pending += remaining;
+    if (!this.discarding && this.pending) this.inspect(this.pending);
+    if (this.document !== null) this.inspect(this.document + remaining);
+    this.pending = '';
+    this.document = null;
+    if (!this.errorMessage) return null;
+    const error = new Error(this.errorMessage);
+    error.code = 'upstream_inference_error';
+    return error;
+  }
+}
+
 export function streamBody(upstream, downstream, {
   flush = false, drainOnClose = false, captureLimit = 0, onChunk = null,
 } = {}) {
@@ -107,7 +170,12 @@ export function streamBody(upstream, downstream, {
         if (downstreamOpen && !downstream.writableEnded) downstream.end();
         finish();
       };
-      const onUpstreamError = (error) => finish(error);
+      const onUpstreamError = (error) => {
+        // Headers may already have been forwarded. Ending normally would make
+        // the truncated answer appear successful, so terminate the transport.
+        if (downstreamOpen && !downstream.destroyed) downstream.destroy(error);
+        finish(error);
+      };
       const stopWriting = () => {
         downstreamOpen = false;
         if (pausedForBackpressure) {

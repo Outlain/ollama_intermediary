@@ -1,5 +1,8 @@
 import http from 'node:http';
 import https from 'node:https';
+import fs from 'node:fs';
+import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 const GPU_FAULT_PATTERNS = [
   /ROCm error:\s*out of memory/i,
@@ -47,6 +50,9 @@ export class BackendState {
     this.lastProbeAt = null;
     this.lastSuccessAt = null;
     this.lastError = 'not probed yet';
+    this.lastInferenceError = null;
+    this.lastInferenceFailureAt = null;
+    this.lastInferenceSuccessAt = null;
     this.failures = [];
     this.openUntil = 0;
     this.timer = null;
@@ -56,6 +62,67 @@ export class BackendState {
     this.recoveryReason = null;
     this.recoverySince = null;
     this.loadedModels = [];
+    this.recoveryStorageError = null;
+    this.restoreRecovery();
+  }
+
+  restoreRecovery() {
+    const statePath = this.config.gpu_safety.state_path;
+    if (!statePath) return;
+    try {
+      if (fs.statSync(statePath).size > 16_384) throw new Error('recovery state exceeds size limit');
+      const saved = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      if (saved.schema_version !== 1 || typeof saved.recovery_required !== 'boolean') throw new Error('invalid recovery state');
+      if (saved.recovery_required) {
+        this.recoveryRequired = true;
+        this.recoveryReason = typeof saved.reason === 'string' ? saved.reason : 'Persisted GPU recovery required';
+        this.recoverySince = Number.isFinite(saved.since) ? saved.since : this.clock();
+        this.lastError = this.recoveryReason;
+      }
+    } catch (error) {
+      if (error.code === 'ENOENT') return;
+      this.recoveryRequired = true;
+      this.recoveryReason = 'GPU recovery state could not be read; manual verification required';
+      this.recoverySince = this.clock();
+      this.recoveryStorageError = error.message;
+      this.lastError = this.recoveryReason;
+    }
+  }
+
+  persistRecovery(required, reason = null, since = null) {
+    const statePath = this.config.gpu_safety.state_path;
+    if (!statePath) return;
+    const temporary = `${statePath}.${randomUUID()}.tmp`;
+    try {
+      fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
+      const descriptor = fs.openSync(temporary, 'wx', 0o600);
+      try {
+        fs.writeFileSync(descriptor, JSON.stringify({ schema_version: 1, recovery_required: required, reason, since }));
+        fs.fsyncSync(descriptor);
+      } finally {
+        fs.closeSync(descriptor);
+      }
+      fs.renameSync(temporary, statePath);
+      this.recoveryStorageError = null;
+    } catch (error) {
+      this.recoveryStorageError = error.message;
+      try { fs.unlinkSync(temporary); } catch { /* No temporary file may exist. */ }
+      throw error;
+    }
+  }
+
+  // Caller must hold the operation gate and explicitly verify host recovery.
+  // API reachability alone cannot prove that GPU/driver memory is healthy.
+  clearRecovery() {
+    this.persistRecovery(false);
+    this.recoveryRequired = false;
+    this.recoveryReason = null;
+    this.recoverySince = null;
+    this.lastError = null;
+    this.lastInferenceError = null;
+    this.openUntil = 0;
+    this.failures = [];
+    this.onChange();
   }
 
   canDispatch(now = this.clock()) {
@@ -72,6 +139,10 @@ export class BackendState {
     this.failures = this.failures.filter((timestamp) => timestamp >= windowStart);
     this.failures.push(now);
     this.lastError = error?.message ?? String(error);
+    if (source !== 'health_probe') {
+      this.lastInferenceError = this.lastError;
+      this.lastInferenceFailureAt = now;
+    }
     this.metrics.increment('proxy_requests_failed_total', { source, reason: error?.code ?? error?.name ?? 'backend_error' });
     if (this.failures.length >= this.config.circuit_breaker.failure_threshold) {
       const wasOpen = this.circuitOpen(now);
@@ -105,12 +176,19 @@ export class BackendState {
     }
     if (error) this.recordFailure(error, 'response_stream');
     else this.recordHttpStatus(status);
+    if (!error && status < 400) {
+      this.lastInferenceSuccessAt = this.clock();
+      this.lastInferenceError = null;
+      if (!this.recoveryRequired) this.lastError = null;
+    }
     return { recoveryRequired: false, reason: null };
   }
 
   requireRecovery(reason, details = {}) {
-    const message = reason?.message ?? String(reason);
+    const message = (reason?.message ?? String(reason)).slice(0, 1_024);
     this.lastError = message;
+    this.lastInferenceError = message;
+    this.lastInferenceFailureAt = this.clock();
     if (!this.recoveryRequired) {
       this.recoveryRequired = true;
       this.recoveryReason = message;
@@ -120,6 +198,11 @@ export class BackendState {
         reason: message,
         ...details,
       });
+      try {
+        this.persistRecovery(true, message, this.recoverySince);
+      } catch (error) {
+        this.logger.error('GPU recovery state could not be persisted; admission remains blocked', { error: error.message });
+      }
     }
     this.onChange();
   }
@@ -144,14 +227,14 @@ export class BackendState {
       const wasHealthy = this.canDispatch(now);
       this.reachable = true;
       this.lastSuccessAt = now;
-      if (!this.recoveryRequired) this.lastError = null;
+      if (!this.recoveryRequired) this.lastError = this.lastInferenceError;
       if (this.openUntil && this.openUntil <= now) {
         this.openUntil = 0;
         this.failures = [];
         this.logger.info('backend circuit breaker closed after successful probe');
       }
       this.onModel(model);
-      if (!wasHealthy && this.canDispatch(now)) this.logger.info('Ollama backend is healthy', { loaded_model: model });
+      if (!wasHealthy && this.canDispatch(now)) this.logger.info('Ollama API is reachable', { loaded_model: model });
     } catch (error) {
       const wasReachable = this.reachable;
       this.reachable = false;
@@ -180,6 +263,9 @@ export class BackendState {
     return {
       state: this.recoveryRequired ? 'recovery_required' : this.canDispatch(now) ? 'healthy' : this.circuitOpen(now) ? 'circuit_open' : 'unreachable',
       reachable: this.reachable,
+      inference_state: this.recoveryRequired ? 'recovery_required'
+        : this.lastInferenceError ? 'last_request_failed'
+          : this.lastInferenceSuccessAt ? 'last_request_succeeded' : 'not_observed',
       recovery_required: this.recoveryRequired,
       recovery_reason: this.recoveryReason,
       recovery_since: this.recoverySince ? new Date(this.recoverySince).toISOString() : null,
@@ -188,6 +274,10 @@ export class BackendState {
       last_probe_at: this.lastProbeAt ? new Date(this.lastProbeAt).toISOString() : null,
       last_success_at: this.lastSuccessAt ? new Date(this.lastSuccessAt).toISOString() : null,
       last_error: this.lastError,
+      last_inference_error: this.lastInferenceError,
+      last_inference_failure_at: this.lastInferenceFailureAt ? new Date(this.lastInferenceFailureAt).toISOString() : null,
+      last_inference_success_at: this.lastInferenceSuccessAt ? new Date(this.lastInferenceSuccessAt).toISOString() : null,
+      recovery_storage_error: this.recoveryStorageError,
       loaded_models: this.loadedModels,
     };
   }
@@ -259,7 +349,9 @@ export class BackendClient {
       const raw = await this.readResponse(response);
       if ((response.statusCode ?? 500) >= 400) throw new Error(`/api/ps returned HTTP ${response.statusCode}`);
       const parsed = JSON.parse(raw.toString('utf8') || '{}');
-      return Array.isArray(parsed.models) ? parsed.models.map((model) => model.name ?? model.model).filter(Boolean) : [];
+      if (!Array.isArray(parsed.models)) throw new Error('/api/ps did not return a models array');
+      if (parsed.models.some((model) => !model || typeof (model.name ?? model.model) !== 'string')) throw new Error('/api/ps returned invalid model entries');
+      return parsed.models.map((model) => model.name ?? model.model);
     } finally {
       cleanup();
     }

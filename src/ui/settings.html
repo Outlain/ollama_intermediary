@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#090e16">
+  <title>Settings · Ollama Intermediary</title>
+  <link rel="stylesheet" href="/_intermediary/ui/settings.css">
+  <script defer src="/_intermediary/ui/settings.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="shell header-inner">
+      <a class="brand" href="/debug" aria-label="Return to operations dashboard">
+        <span class="brand-mark" aria-hidden="true">OI</span>
+        <span>
+          <span class="eyebrow">Administration</span>
+          <strong>Intermediary settings</strong>
+        </span>
+      </a>
+      <div class="header-actions">
+        <span id="document-state" class="status-pill status-neutral" role="status" aria-live="polite">Not loaded</span>
+        <a class="quiet-button" href="/debug">Dashboard</a>
+        <button id="forget-token" class="quiet-button" type="button" hidden>Forget admin token</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="shell">
+    <div id="page-error" class="notice notice-error" role="alert" hidden></div>
+
+    <section id="auth-panel" class="auth-panel" aria-labelledby="auth-heading">
+      <div>
+        <p class="eyebrow">Protected configuration</p>
+        <h1 id="auth-heading">Enter the settings admin token</h1>
+        <p id="auth-message" class="muted">This token permits configuration changes. It is kept only in this browser tab.</p>
+      </div>
+      <form id="auth-form" class="auth-form">
+        <label for="admin-token">Admin token</label>
+        <div class="input-action-row">
+          <input id="admin-token" type="password" autocomplete="off" spellcheck="false" required>
+          <button type="submit">Open settings</button>
+        </div>
+        <p class="field-help">The token is stored in sessionStorage, never localStorage, and is cleared when this tab session ends.</p>
+      </form>
+    </section>
+
+    <div id="settings-workspace" hidden>
+      <section id="configuration-banner" class="configuration-banner state-neutral" aria-labelledby="configuration-title">
+        <span class="state-orb" aria-hidden="true"></span>
+        <div class="configuration-copy">
+          <p class="eyebrow">Configuration health</p>
+          <h1 id="configuration-title">Loading current settings…</h1>
+          <p id="configuration-detail">Waiting for the intermediary to report its effective configuration.</p>
+        </div>
+        <dl class="banner-facts">
+          <div><dt>Revision</dt><dd id="configuration-revision">—</dd></div>
+          <div><dt>Last applied</dt><dd id="configuration-applied-at">—</dd></div>
+        </dl>
+      </section>
+
+      <div id="restart-banner" class="notice notice-warning" role="status" aria-live="polite" hidden>
+        <strong id="restart-title">Restart required</strong>
+        <span id="restart-detail">The saved values will become active after the intermediary is restarted.</span>
+      </div>
+
+      <div class="notice notice-info" role="note">
+        <strong>Application settings only</strong>
+        <span>This page stores validated, versioned overrides in the intermediary's state volume. Your config.yml and Docker Compose files remain untouched; raw YAML, the Docker socket, and host files are never exposed. Infrastructure findings below are read-only.</span>
+      </div>
+
+      <form id="settings-form" novalidate>
+        <div id="validation-summary" class="notice notice-error" role="alert" tabindex="-1" hidden></div>
+
+        <nav class="section-nav" aria-label="Settings sections">
+          <a href="#backend">Backend</a>
+          <a href="#frigate-source">Frigate source</a>
+          <a href="#scheduler">Scheduler</a>
+          <a href="#odysseus">Odysseus</a>
+          <a href="#frigate">Frigate</a>
+          <a href="#catchup">Catch-up</a>
+          <a href="#gpu-safety">GPU safety</a>
+          <a href="#access">Access</a>
+          <a href="#infrastructure">Diagnostics</a>
+        </nav>
+
+        <section id="backend" class="settings-card" aria-labelledby="backend-heading">
+          <div class="card-heading">
+            <div><p class="eyebrow">Upstream service</p><h2 id="backend-heading">Ollama backend</h2></div>
+            <span id="backend-connectivity" class="status-pill status-neutral">Checked after restart</span>
+          </div>
+          <div class="field-grid field-grid-2">
+            <div class="field field-wide" data-field-wrap="ollama.url">
+              <label for="ollama-url">Ollama URL <span aria-hidden="true">*</span></label>
+              <input id="ollama-url" data-path="ollama.url" type="url" inputmode="url" spellcheck="false" placeholder="http://192.168.1.10:11434" required>
+              <p class="field-help">Use the host's LAN address when Ollama runs under systemd and this intermediary runs in Docker. Never point this URL back at the intermediary.</p>
+              <p class="field-error" data-error-for="ollama.url"></p>
+            </div>
+            <div class="field" data-field-wrap="ollama.health_interval">
+              <label for="health-interval">Health interval</label>
+              <input id="health-interval" data-path="ollama.health_interval" type="text" inputmode="text" placeholder="5s">
+              <p class="field-error" data-error-for="ollama.health_interval"></p>
+            </div>
+            <div class="field" data-field-wrap="ollama.health_timeout">
+              <label for="health-timeout">Health timeout</label>
+              <input id="health-timeout" data-path="ollama.health_timeout" type="text" placeholder="3s">
+              <p class="field-error" data-error-for="ollama.health_timeout"></p>
+            </div>
+            <div class="field" data-field-wrap="ollama.request_timeout">
+              <label for="request-timeout">Inference request timeout</label>
+              <input id="request-timeout" data-path="ollama.request_timeout" type="text" placeholder="30m">
+              <p class="field-help">This clock starts after a request leaves the queue.</p>
+              <p class="field-error" data-error-for="ollama.request_timeout"></p>
+            </div>
+            <div class="test-panel">
+              <strong>Backend validation</strong>
+              <p id="backend-connectivity-detail">Validation checks URL structure and cross-field safety without making a network request. Ollama reachability is checked after a saved configuration restarts.</p>
+              <button id="test-backend" class="secondary-button" type="button">Validate backend settings</button>
+            </div>
+          </div>
+        </section>
+
+        <section id="frigate-source" class="settings-card" aria-labelledby="frigate-source-heading">
+          <div class="card-heading">
+            <div><p class="eyebrow">Client identification</p><h2 id="frigate-source-heading">Frigate source</h2></div>
+          </div>
+          <div class="field-grid field-grid-2">
+            <div class="field field-wide" data-field-wrap="clients.frigate.source_ips.0">
+              <label for="frigate-source-cidr">Frigate IP address or CIDR</label>
+              <input id="frigate-source-cidr" data-path="clients.frigate.source_ips.0" type="text" inputmode="decimal" spellcheck="false" placeholder="192.168.1.25/32">
+              <p class="field-help">Use the address that reaches the intermediary. A single host can be written as an IP or as a /32 CIDR. Leave this empty only if every Frigate request sends <code>X-Ollama-Client: frigate</code>.</p>
+              <p class="field-error" data-error-for="clients.frigate.source_ips.0"></p>
+            </div>
+            <div class="readout">
+              <span>Fallback client</span>
+              <strong id="fallback-client-readout">Odysseus</strong>
+              <small>Requests without a Frigate source match use this client policy.</small>
+            </div>
+          </div>
+        </section>
+
+        <section id="scheduler" class="settings-card" aria-labelledby="scheduler-heading">
+          <div class="card-heading">
+            <div><p class="eyebrow">General behavior</p><h2 id="scheduler-heading">Server &amp; scheduler</h2></div>
+          </div>
+          <div class="field-grid field-grid-3">
+            <div class="field field-wide" data-field-wrap="scheduler.mode">
+              <label for="scheduler-mode">Scheduling behavior</label>
+              <select id="scheduler-mode" data-path="scheduler.mode">
+                <option value="strict_priority">Odysseus first, Frigate when idle</option>
+                <option value="balanced">Legacy balanced / fair sharing</option>
+              </select>
+              <p class="field-help">Strict priority never forces Frigate ahead because it has waited a long time. Existing work finishes first. Aging, forced-switch waits, and batch limits only apply in balanced mode.</p>
+              <p class="field-error" data-error-for="scheduler.mode"></p>
+            </div>
+            <div class="field" data-field-wrap="scheduler.max_queue_bytes">
+              <label for="queue-byte-limit">Total queued + active request bytes</label>
+              <input id="queue-byte-limit" data-path="scheduler.max_queue_bytes" type="number" min="1" step="1">
+              <p class="field-error" data-error-for="scheduler.max_queue_bytes"></p>
+            </div>
+            <div class="field" data-field-wrap="server.body_limit_bytes">
+              <label for="body-limit">Request body limit (bytes)</label>
+              <input id="body-limit" data-path="server.body_limit_bytes" type="number" min="1" step="1">
+              <p class="field-error" data-error-for="server.body_limit_bytes"></p>
+            </div>
+            <div class="field" data-field-wrap="server.shutdown_grace">
+              <label for="shutdown-grace">Shutdown grace</label>
+              <input id="shutdown-grace" data-path="server.shutdown_grace" type="text" placeholder="2m">
+              <p class="field-error" data-error-for="server.shutdown_grace"></p>
+            </div>
+            <div class="field" data-field-wrap="scheduler.default_client">
+              <label for="default-client">Fallback client</label>
+              <select id="default-client" data-path="scheduler.default_client">
+                <option value="odysseus">Odysseus</option>
+                <option value="default">Default</option>
+                <option value="frigate">Frigate</option>
+              </select>
+              <p class="field-error" data-error-for="scheduler.default_client"></p>
+            </div>
+            <label class="check-field" data-field-wrap="scheduler.priority_aging">
+              <input data-path="scheduler.priority_aging" type="checkbox">
+              <span><strong>Priority aging</strong><small>Gradually raise waiting work so it cannot starve indefinitely.</small></span>
+              <span class="field-error" data-error-for="scheduler.priority_aging"></span>
+            </label>
+            <div class="field" data-field-wrap="scheduler.aging_interval">
+              <label for="aging-interval">Aging interval</label>
+              <input id="aging-interval" data-path="scheduler.aging_interval" type="text" placeholder="10s">
+              <p class="field-error" data-error-for="scheduler.aging_interval"></p>
+            </div>
+            <div class="field" data-field-wrap="scheduler.aging_bonus">
+              <label for="aging-bonus">Aging bonus</label>
+              <input id="aging-bonus" data-path="scheduler.aging_bonus" type="number" step="any">
+              <p class="field-error" data-error-for="scheduler.aging_bonus"></p>
+            </div>
+            <div class="field" data-field-wrap="circuit_breaker.failure_threshold">
+              <label for="failure-threshold">Circuit failure threshold</label>
+              <input id="failure-threshold" data-path="circuit_breaker.failure_threshold" type="number" min="1" step="1">
+              <p class="field-error" data-error-for="circuit_breaker.failure_threshold"></p>
+            </div>
+            <div class="field" data-field-wrap="circuit_breaker.failure_window">
+              <label for="failure-window">Failure window</label>
+              <input id="failure-window" data-path="circuit_breaker.failure_window" type="text" placeholder="60s">
+              <p class="field-error" data-error-for="circuit_breaker.failure_window"></p>
+            </div>
+            <div class="field" data-field-wrap="circuit_breaker.open_duration">
+              <label for="open-duration">Circuit open duration</label>
+              <input id="open-duration" data-path="circuit_breaker.open_duration" type="text" placeholder="30s">
+              <p class="field-error" data-error-for="circuit_breaker.open_duration"></p>
+            </div>
+          </div>
+        </section>
+
+        <section id="odysseus" class="settings-card client-card client-odysseus" aria-labelledby="odysseus-heading">
+          <div class="card-heading">
+            <div><p class="eyebrow">Interactive workload</p><h2 id="odysseus-heading">Odysseus</h2></div>
+            <span class="client-chip">Higher priority</span>
+          </div>
+          <div class="field-grid field-grid-4">
+            <div class="field" data-field-wrap="clients.odysseus.priority"><label>Priority<input data-path="clients.odysseus.priority" type="number" step="any"></label><p class="field-error" data-error-for="clients.odysseus.priority"></p></div>
+            <div class="field" data-field-wrap="clients.odysseus.queue_limit"><label>Queue limit<input data-path="clients.odysseus.queue_limit" type="number" min="1" step="1"></label><p class="field-error" data-error-for="clients.odysseus.queue_limit"></p></div>
+            <div class="field" data-field-wrap="clients.odysseus.request_ttl"><label>Request TTL<input data-path="clients.odysseus.request_ttl" type="text" placeholder="30m"></label><p class="field-error" data-error-for="clients.odysseus.request_ttl"></p></div>
+            <div class="field" data-field-wrap="clients.odysseus.max_wait"><label>Forced switch wait<input data-path="clients.odysseus.max_wait" type="text" placeholder="0s"></label><p class="field-error" data-error-for="clients.odysseus.max_wait"></p></div>
+            <div class="field" data-field-wrap="clients.odysseus.model_policy.idle_hold"><label>Idle hold<input data-path="clients.odysseus.model_policy.idle_hold" type="text" placeholder="1m"></label><p class="field-error" data-error-for="clients.odysseus.model_policy.idle_hold"></p></div>
+            <div class="field" data-field-wrap="clients.odysseus.model_policy.max_batch_requests"><label>Maximum batch requests<input data-path="clients.odysseus.model_policy.max_batch_requests" type="number" min="1" step="1"></label><p class="field-error" data-error-for="clients.odysseus.model_policy.max_batch_requests"></p></div>
+            <div class="field" data-field-wrap="clients.odysseus.model_policy.max_batch_time"><label>Maximum batch time<input data-path="clients.odysseus.model_policy.max_batch_time" type="text" placeholder="90s"></label><p class="field-error" data-error-for="clients.odysseus.model_policy.max_batch_time"></p></div>
+            <div class="field" data-field-wrap="clients.odysseus.model_policy.keep_alive"><label>Ollama keep-alive<input data-path="clients.odysseus.model_policy.keep_alive" data-nullable="true" type="text" placeholder="60s"></label><p class="field-error" data-error-for="clients.odysseus.model_policy.keep_alive"></p></div>
+          </div>
+        </section>
+
+        <section id="frigate" class="settings-card client-card client-frigate" aria-labelledby="frigate-heading">
+          <div class="card-heading">
+            <div><p class="eyebrow">Live HTTP requests</p><h2 id="frigate-heading">Frigate</h2></div>
+            <span class="client-chip">Live requests: FIFO</span>
+          </div>
+          <div class="field-grid field-grid-4">
+            <div class="field" data-field-wrap="clients.frigate.priority"><label>Priority<input data-path="clients.frigate.priority" type="number" step="any"></label><p class="field-error" data-error-for="clients.frigate.priority"></p></div>
+            <div class="field" data-field-wrap="clients.frigate.queue_limit"><label>Queue limit<input data-path="clients.frigate.queue_limit" type="number" min="1" step="1"></label><p class="field-error" data-error-for="clients.frigate.queue_limit"></p></div>
+            <div class="field" data-field-wrap="clients.frigate.request_ttl"><label>Request TTL<input data-path="clients.frigate.request_ttl" type="text" placeholder="2m"></label><p class="field-error" data-error-for="clients.frigate.request_ttl"></p></div>
+            <div class="field" data-field-wrap="clients.frigate.max_wait"><label>Forced switch wait<input data-path="clients.frigate.max_wait" type="text" placeholder="2m"></label><p class="field-error" data-error-for="clients.frigate.max_wait"></p></div>
+            <div class="field" data-field-wrap="clients.frigate.overflow_policy"><label>Queue overflow<select data-path="clients.frigate.overflow_policy"><option value="drop_oldest">Drop oldest</option><option value="drop_newest">Drop newest</option><option value="reject">Reject new</option></select></label><p class="field-error" data-error-for="clients.frigate.overflow_policy"></p></div>
+            <div class="field" data-field-wrap="clients.frigate.model_policy.idle_hold"><label>Idle hold<input data-path="clients.frigate.model_policy.idle_hold" type="text" placeholder="3s"></label><p class="field-error" data-error-for="clients.frigate.model_policy.idle_hold"></p></div>
+            <div class="field" data-field-wrap="clients.frigate.model_policy.max_batch_requests"><label>Maximum batch requests<input data-path="clients.frigate.model_policy.max_batch_requests" type="number" min="1" step="1"></label><p class="field-error" data-error-for="clients.frigate.model_policy.max_batch_requests"></p></div>
+            <div class="field" data-field-wrap="clients.frigate.model_policy.max_batch_time"><label>Maximum batch time<input data-path="clients.frigate.model_policy.max_batch_time" type="text" placeholder="60s"></label><p class="field-error" data-error-for="clients.frigate.model_policy.max_batch_time"></p></div>
+            <div class="field" data-field-wrap="clients.frigate.model_policy.keep_alive"><label>Ollama keep-alive<input data-path="clients.frigate.model_policy.keep_alive" data-nullable="true" type="text" placeholder="15s"></label><p class="field-error" data-error-for="clients.frigate.model_policy.keep_alive"></p></div>
+            <label class="check-field" data-field-wrap="clients.frigate.deduplication.enabled"><input data-path="clients.frigate.deduplication.enabled" type="checkbox"><span><strong>Deduplicate events</strong><small>Enable only when stable event identifiers are configured.</small></span><span class="field-error" data-error-for="clients.frigate.deduplication.enabled"></span></label>
+          </div>
+        </section>
+
+        <section id="catchup" class="settings-card" aria-labelledby="catchup-heading">
+          <div class="card-heading">
+            <div><p class="eyebrow">Persistent, metadata-only waiting list</p><h2 id="catchup-heading">Frigate description catch-up</h2></div>
+            <span id="catchup-state" class="status-pill status-neutral">Not loaded</span>
+          </div>
+          <p class="section-intro">Missing object and review descriptions are rediscovered from Frigate, newest first. Automatic discovery starts when first enabled. Images stay in Frigate. Live work has priority; only one background request is handed off at a time.</p>
+          <div class="field-grid field-grid-2">
+            <label class="check-field" data-field-wrap="frigate.enabled"><input data-path="frigate.enabled" type="checkbox"><span><strong>Enable catch-up</strong><small>Requires a reachable Frigate API and retained media.</small></span><span class="field-error" data-error-for="frigate.enabled"></span></label>
+            <div class="field" data-field-wrap="frigate.url"><label for="frigate-url">Frigate API origin</label><input id="frigate-url" data-path="frigate.url" type="url" placeholder="https://frigate.example:8971" spellcheck="false"><p class="field-help">Not the Ollama address. No /api suffix. Credentials belong in secrets.env.</p><p class="field-error" data-error-for="frigate.url"></p></div>
+            <label class="check-field" data-field-wrap="frigate.verify_tls"><input data-path="frigate.verify_tls" type="checkbox"><span><strong>Verify TLS certificate</strong><small>Keep enabled. Disabling permits untrusted certificates and should only be used on a trusted network.</small></span><span class="field-error" data-error-for="frigate.verify_tls"></span></label>
+            <div class="field" data-field-wrap="frigate.poll_interval"><label>Discovery interval<input data-path="frigate.poll_interval" type="text" placeholder="30s"></label><p class="field-error" data-error-for="frigate.poll_interval"></p></div>
+            <div class="field" data-field-wrap="frigate.live_grace"><label>Let live descriptions finish first<input data-path="frigate.live_grace" type="text" placeholder="2m"></label><p class="field-help">Minimum delay after an event ends before it becomes a catch-up candidate.</p><p class="field-error" data-error-for="frigate.live_grace"></p></div>
+            <div class="field" data-field-wrap="frigate.retry_interval"><label>First retry delay<input data-path="frigate.retry_interval" type="text" placeholder="1m"></label><p class="field-error" data-error-for="frigate.retry_interval"></p></div>
+            <div class="field" data-field-wrap="frigate.max_retry_interval"><label>Maximum retry delay<input data-path="frigate.max_retry_interval" type="text" placeholder="1h"></label><p class="field-error" data-error-for="frigate.max_retry_interval"></p></div>
+            <div class="field" data-field-wrap="frigate.generation_timeout"><label>Wait for saved result<input data-path="frigate.generation_timeout" type="text" placeholder="10m"></label><p class="field-help">An accepted API request is not a completed description.</p><p class="field-error" data-error-for="frigate.generation_timeout"></p></div>
+            <div class="field" data-field-wrap="frigate.max_jobs"><label>Maximum stored jobs<input data-path="frigate.max_jobs" type="number" min="1" max="100000" step="1"></label><p class="field-help">Capacity limits stop discovery visibly; pending jobs are not silently discarded.</p><p class="field-error" data-error-for="frigate.max_jobs"></p></div>
+          </div>
+          <p id="catchup-auth" class="section-intro">Credentials are managed on the host.</p>
+          <p id="catchup-status" class="section-intro" role="status">Save and apply the connection settings before scanning.</p>
+          <button id="catchup-scan" class="secondary-button" type="button">Fill missing descriptions from retained history</button>
+          <p class="field-help">Scans all eligible retained items, not only those recorded since enablement. Existing descriptions are kept. Pause mode stops background generation, not camera recording.</p>
+        </section>
+
+        <section id="gpu-safety" class="settings-card" aria-labelledby="gpu-heading">
+          <div class="card-heading">
+            <div><p class="eyebrow">ROCm protection</p><h2 id="gpu-heading">GPU safety</h2></div>
+            <span class="safety-lock">Safety-critical</span>
+          </div>
+          <div class="notice notice-warning compact-notice" role="note">
+            <strong>Change cautiously</strong><span>These controls exist to avoid aborted model loads, stranded VRAM, and overlapping model-state mutations.</span>
+          </div>
+          <div class="field-grid field-grid-2 checks-grid">
+            <label class="check-field" data-field-wrap="gpu_safety.drain_active_disconnects"><input data-path="gpu_safety.drain_active_disconnects" type="checkbox"><span><strong>Drain disconnected requests</strong><small>Finish reading Ollama after a caller disconnects.</small></span><span class="field-error" data-error-for="gpu_safety.drain_active_disconnects"></span></label>
+            <label class="check-field" data-field-wrap="gpu_safety.unload_on_model_switch"><input data-path="gpu_safety.unload_on_model_switch" type="checkbox"><span><strong>Unload before model switch</strong><small>Release the prior model before loading another.</small></span><span class="field-error" data-error-for="gpu_safety.unload_on_model_switch"></span></label>
+            <label class="check-field" data-field-wrap="gpu_safety.recovery_on_oom"><input data-path="gpu_safety.recovery_on_oom" type="checkbox"><span><strong>Latch recovery after OOM</strong><small>Stop dispatching into a potentially poisoned GPU state.</small></span><span class="field-error" data-error-for="gpu_safety.recovery_on_oom"></span></label>
+            <div class="field" data-field-wrap="gpu_safety.unload_timeout"><label>Unload timeout<input data-path="gpu_safety.unload_timeout" type="text" placeholder="30s"></label><p class="field-error" data-error-for="gpu_safety.unload_timeout"></p></div>
+            <div class="field" data-field-wrap="gpu_safety.error_body_limit_bytes"><label>Error inspection limit (bytes)<input data-path="gpu_safety.error_body_limit_bytes" type="number" min="1" step="1"></label><p class="field-error" data-error-for="gpu_safety.error_body_limit_bytes"></p></div>
+          </div>
+        </section>
+
+        <section id="access" class="settings-card" aria-labelledby="access-heading">
+          <div class="card-heading">
+            <div><p class="eyebrow">Authentication &amp; visibility</p><h2 id="access-heading">Maintenance, observability &amp; secrets</h2></div>
+          </div>
+          <div class="field-grid field-grid-3">
+            <label class="check-field" data-field-wrap="maintenance.enabled"><input data-path="maintenance.enabled" type="checkbox"><span><strong>Maintenance controls</strong><small>Allow authenticated pause and resume actions.</small></span><span class="field-error" data-error-for="maintenance.enabled"></span></label>
+            <label class="check-field" data-field-wrap="observability.enabled"><input data-path="observability.enabled" type="checkbox"><span><strong>Observability API</strong><small>Expose protected operational metadata.</small></span><span class="field-error" data-error-for="observability.enabled"></span></label>
+            <label class="check-field" data-field-wrap="observability.ui_enabled"><input data-path="observability.ui_enabled" type="checkbox"><span><strong>Operations dashboard</strong><small>Serve the read-only <code>/debug</code> dashboard. The protected settings recovery page remains available.</small></span><span class="field-error" data-error-for="observability.ui_enabled"></span></label>
+            <div class="field" data-field-wrap="maintenance.max_pause"><label>Maximum timed pause<input data-path="maintenance.max_pause" type="text" placeholder="168h"></label><p class="field-error" data-error-for="maintenance.max_pause"></p></div>
+            <div class="field" data-field-wrap="observability.history_limit"><label>Event history limit<input data-path="observability.history_limit" type="number" min="1" max="1000" step="1"></label><p class="field-error" data-error-for="observability.history_limit"></p></div>
+            <div class="field" data-field-wrap="observability.queue_items_limit"><label>Visible queue item limit<input data-path="observability.queue_items_limit" type="number" min="1" max="500" step="1"></label><p class="field-error" data-error-for="observability.queue_items_limit"></p></div>
+          </div>
+
+          <div class="secrets-heading">
+            <h3>Host-managed tokens</h3>
+            <p>Token values are never returned to this page and cannot be changed from the browser. Edit <code>secrets.env</code> on the host, then recreate the intermediary container.</p>
+          </div>
+          <div class="field-grid field-grid-3 secret-grid">
+            <div class="secret-field">
+              <div class="secret-label"><strong>Maintenance token</strong><span id="maintenance-secret-state" class="configured-badge">Unknown</span></div>
+              <div class="secret-readout"><span>Value hidden</span><code>MAINTENANCE_TOKEN</code></div>
+            </div>
+            <div class="secret-field">
+              <div class="secret-label"><strong>Observability token</strong><span id="observability-secret-state" class="configured-badge">Unknown</span></div>
+              <div class="secret-readout"><span>Value hidden</span><code>OBSERVABILITY_TOKEN</code></div>
+            </div>
+            <div class="secret-field">
+              <div class="secret-label"><strong>Settings admin token</strong><span id="admin-secret-state" class="configured-badge">Unknown</span></div>
+              <div class="secret-readout"><span>Value hidden</span><code>SETTINGS_TOKEN</code></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="infrastructure" class="settings-card" aria-labelledby="infrastructure-heading">
+          <div class="card-heading">
+            <div><p class="eyebrow">Read-only host checks</p><h2 id="infrastructure-heading">Infrastructure diagnostics</h2></div>
+            <span id="diagnostics-summary" class="status-pill status-neutral">Waiting</span>
+          </div>
+          <p class="section-intro">This lists configuration and storage checks the intermediary can verify itself. Check host-only ports and volume mounts with <code>docker compose config</code>; this page will never alter Docker Compose or control Docker.</p>
+          <ul id="diagnostics-list" class="diagnostics-list"></ul>
+          <p id="diagnostics-empty" class="empty-state">No infrastructure diagnostics were reported.</p>
+          <div class="saved-settings-controls">
+            <div>
+              <strong>Saved override recovery</strong>
+              <p>Rollback restores the preceding saved revision. Reset removes all browser-saved overrides and returns to the read-only <code>config.yml</code> values. Neither action edits config.yml, Compose, or secrets.</p>
+            </div>
+            <div class="saved-settings-buttons">
+              <button id="rollback-button" class="secondary-button" type="button" disabled>Roll back one revision</button>
+              <button id="reset-button" class="danger-button" type="button" disabled>Reset saved overrides</button>
+            </div>
+          </div>
+        </section>
+
+        <div class="action-bar" aria-label="Configuration actions">
+          <div>
+            <strong id="action-title">No unapplied changes</strong>
+            <span id="action-detail">Edit a field to create a draft.</span>
+          </div>
+          <div class="action-buttons">
+            <button id="discard-button" class="quiet-button" type="button" disabled>Discard draft</button>
+            <button id="validate-button" class="secondary-button" type="button">Validate changes</button>
+            <button id="apply-button" class="primary-button" type="submit" disabled>Apply settings</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </main>
+
+  <noscript><div class="noscript-message">JavaScript is required to use the structured settings editor.</div></noscript>
+</body>
+</html>

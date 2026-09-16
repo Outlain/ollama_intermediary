@@ -55,6 +55,8 @@ const EDITABLE_TREE = Object.freeze({
     request_timeout: duration({ greaterThanZero: true }),
   }),
   scheduler: Object.freeze({
+    mode: descriptor('enum', { values: ['strict_priority', 'balanced'] }),
+    max_queue_bytes: integer({ min: 1, max: 1024 * 1024 * 1024 }),
     priority_aging: boolean(),
     aging_interval: duration({ greaterThanZero: true }),
     aging_bonus: number({ min: 0 }),
@@ -89,8 +91,21 @@ const EDITABLE_TREE = Object.freeze({
     enabled: boolean(),
     max_pause: duration({ greaterThanZero: true }),
   }),
+  frigate: Object.freeze({
+    enabled: boolean(),
+    url: descriptor('url', { schemes: ['http:', 'https:'] }),
+    verify_tls: boolean(),
+    poll_interval: duration({ greaterThanZero: true }),
+    live_grace: duration(),
+    retry_interval: duration({ greaterThanZero: true }),
+    max_retry_interval: duration({ greaterThanZero: true }),
+    request_timeout: duration({ greaterThanZero: true }),
+    generation_timeout: duration({ greaterThanZero: true }),
+    page_size: integer({ min: 1, max: 1000 }),
+    max_jobs: integer({ min: 1, max: 100000 }),
+  }),
   clients: Object.freeze({ $dynamic: CLIENT_FIELDS }),
-  models: Object.freeze({ $dynamic: MODEL_POLICY_FIELDS }),
+  models: Object.freeze({ $dynamic: MODEL_POLICY_FIELDS, $modelNames: true }),
 });
 
 export const SETTINGS_SCHEMA = Object.freeze({
@@ -106,6 +121,11 @@ export const SETTINGS_SCHEMA = Object.freeze({
     'observability.auth_token',
     'maintenance.auth_token',
     'maintenance.state_path',
+    'gpu_safety.state_path',
+    'frigate.state_path',
+    'frigate.username',
+    'frigate.password',
+    'frigate.auth_token',
     'docker.compose',
     'docker.socket',
   ]),
@@ -127,6 +147,12 @@ function clone(value) {
 
 function safeKey(key) {
   return !FORBIDDEN_KEYS.has(key);
+}
+
+function validDynamicName(key, schemaNode) {
+  return safeKey(key) && (schemaNode.$modelNames
+    ? /^[^\s\x00-\x1f\x7f]{1,256}$/.test(key)
+    : NAME_RE.test(key));
 }
 
 function deepMerge(base, overlay) {
@@ -233,6 +259,7 @@ function validateDescriptor(value, field, spec, diagnostics) {
       }
       break;
     case 'url':
+      if (value === '' && !spec.required) break;
       if (typeof value !== 'string' || (spec.required && value.trim() === '')) {
         invalid('required', 'A URL is required.');
       } else {
@@ -264,13 +291,15 @@ function sanitizeNode(input, schemaNode, field, diagnostics, currentNode) {
     }
     let childSchema = schemaNode[key];
     if (!childSchema && dynamicSchema) {
-      if (!NAME_RE.test(key)) {
-        diagnostics.push(diagnostic(childField, 'invalid_name', 'Names may contain letters, numbers, dots, dashes, and underscores.'));
+      if (!validDynamicName(key, schemaNode)) {
+        diagnostics.push(diagnostic(childField, 'invalid_name', schemaNode.$modelNames
+          ? 'Model names must be 1–256 characters without whitespace or control characters.'
+          : 'Names may contain letters, numbers, dots, dashes, and underscores.'));
         continue;
       }
       childSchema = dynamicSchema;
     }
-    if (!childSchema || key === '$dynamic') {
+    if (!childSchema || key.startsWith('$')) {
       diagnostics.push(diagnostic(childField, 'read_only_or_unknown', 'This setting is unknown or read-only and cannot be changed here.'));
       continue;
     }
@@ -296,7 +325,7 @@ function redact(message, secretValues = []) {
 }
 
 function inferPath(message) {
-  const match = String(message).match(/\b(server|ollama|scheduler|circuit_breaker|model_management|gpu_safety|observability|maintenance|clients|models)(?:\.[A-Za-z0-9_.-]+)+/);
+  const match = String(message).match(/\b(server|ollama|scheduler|circuit_breaker|model_management|gpu_safety|observability|maintenance|frigate|clients|models)(?:\.[A-Za-z0-9_.-]+)+/);
   return match?.[0] ?? '$';
 }
 
@@ -315,8 +344,8 @@ function projectEditable(value, schemaNode = EDITABLE_TREE) {
   const dynamicSchema = schemaNode.$dynamic;
   for (const [key, child] of Object.entries(value)) {
     let childSchema = schemaNode[key];
-    if (!childSchema && dynamicSchema && safeKey(key) && NAME_RE.test(key)) childSchema = dynamicSchema;
-    if (!childSchema || key === '$dynamic') continue;
+    if (!childSchema && dynamicSchema && validDynamicName(key, schemaNode)) childSchema = dynamicSchema;
+    if (!childSchema || key.startsWith('$')) continue;
     if (childSchema.type) output[key] = clone(child);
     else output[key] = projectEditable(child, childSchema);
   }
@@ -338,21 +367,23 @@ function maskNode(value, schemaNode = EDITABLE_TREE) {
 
 export function maskSettings(raw) {
   const masked = maskNode(projectEditable(raw));
-  if (typeof masked?.ollama?.url === 'string') {
-    try {
-      const parsed = new URL(masked.ollama.url);
-      if (parsed.username || parsed.password || parsed.search || parsed.hash) {
-        parsed.username = '';
-        parsed.password = '';
-        parsed.search = '';
-        parsed.hash = '';
-        masked.ollama.url = parsed.toString();
+  for (const section of ['ollama', 'frigate']) {
+    if (typeof masked?.[section]?.url === 'string') {
+      try {
+        const parsed = new URL(masked[section].url);
+        if (parsed.username || parsed.password || parsed.search || parsed.hash) {
+          parsed.username = '';
+          parsed.password = '';
+          parsed.search = '';
+          parsed.hash = '';
+          masked[section].url = parsed.toString();
+        }
+      } catch {
+        masked[section].url = masked[section].url.replace(
+          /^(https?:\/\/)[^\s/@]+(?::[^\s/@]*)?@/i,
+          '$1',
+        );
       }
-    } catch {
-      masked.ollama.url = masked.ollama.url.replace(
-        /^(https?:\/\/)[^\s/@]+(?::[^\s/@]*)?@/i,
-        '$1',
-      );
     }
   }
   return masked;
@@ -360,6 +391,14 @@ export function maskSettings(raw) {
 
 function operationalDiagnostics(raw) {
   const diagnostics = [];
+  if (raw?.frigate?.enabled && raw.frigate.verify_tls === false) {
+    diagnostics.push(diagnostic('frigate.verify_tls', 'tls_verification_disabled',
+      'Frigate TLS certificate verification is disabled. Use only on a trusted network; credentials can be intercepted.', 'warning'));
+  }
+  if (raw?.frigate?.enabled && !raw.frigate.auth_token && (!raw.frigate.username || !raw.frigate.password)) {
+    diagnostics.push(diagnostic('frigate.authentication', 'frigate_credentials_missing',
+      'No Frigate credentials are configured. Only the trusted internal unauthenticated API can work without them.', 'warning'));
+  }
   if (raw?.maintenance?.enabled && !raw.maintenance.auth_token) {
     diagnostics.push(diagnostic(
       'maintenance.auth_token',

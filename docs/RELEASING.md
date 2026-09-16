@@ -8,18 +8,7 @@
 4. Review `git diff --cached` before the first commit.
 5. Publish privately first, inspect the GitHub file tree, then change the repository to public.
 
-## Repository initialization
-
-```sh
-git init -b main
-git add .
-git status --short
-git diff --cached
-git commit -m "Initial release"
-gh repo create ollama-scheduling-proxy --private --source=. --remote=origin --push
-```
-
-After the private review and license decision, change repository visibility through GitHub settings or the GitHub CLI.
+The existing repository is [Outlain/ollama_intermediary](https://github.com/Outlain/ollama_intermediary). Do not initialize another repository or replace its remote during an update.
 
 ## Create a release
 
@@ -28,15 +17,15 @@ The release workflow runs for semantic version tags matching `v*.*.*`:
 ```sh
 npm run check:public
 npm test
-git tag -a v1.0.0 -m "Release v1.0.0"
-git push origin v1.0.0
+git tag -a v1.1.0 -m "Release v1.1.0"
+git push origin v1.1.0
 ```
 
 The workflow:
 
 1. Repeats publication checks and tests.
 2. Builds a Linux `amd64` image with SBOM and provenance metadata.
-3. Publishes versioned and `latest` tags to `ghcr.io/OWNER/REPOSITORY` using the workflow's built-in `GITHUB_TOKEN`.
+3. Publishes versioned and `latest` tags to `ghcr.io/outlain/ollama_intermediary` using the workflow's built-in `GITHUB_TOKEN`.
 4. Generates a deployment bundle whose Compose file pins the release image tag.
 5. Creates a GitHub Release with generated notes, the bundle, and its SHA-256 checksum.
 
@@ -45,7 +34,7 @@ The workflow:
 GitHub Container Registry creates the first package as private by default. After the first workflow publishes it:
 
 1. Open the owner or organization **Packages** page.
-2. Open the `ollama-scheduling-proxy` package.
+2. Open the `ollama_intermediary` package.
 3. Open **Package settings**.
 4. Confirm it is connected to the public repository.
 5. Change package visibility to **Public**.
@@ -57,3 +46,11 @@ Once public, GHCR permits anonymous pulls and release-bundle users do not need a
 - GitHub Actions must be enabled.
 - Workflow `GITHUB_TOKEN` must be allowed to write packages and releases. The workflow requests only `packages: write` and `contents: write`.
 - Protect `main` and require the CI workflow before merging once the initial repository is established.
+
+## Release verification
+
+Do not describe a release as published until the workflow has succeeded and its image/bundle are available. Source version 1.1.0 is not itself proof that a `v1.1.0` release exists.
+
+Before release, test both object and ended-review regeneration against the intended Frigate build, confirm live-work priority, verify settings and backlog survive container recreation, and confirm real media-retention failure reporting. Automated mocks exercise protocol and state-machine behavior but do not certify Frigate deployment permissions or ROCm driver recovery. Keep that distinction in release notes.
+
+The source and release Compose templates must retain matching state mounts, security options, settings recovery listener, and bounded logging. Deployment bundles contain examples only: update instructions must preserve users' `config.yml`, `secrets.env`, ignored Compose overrides, and named state volume.

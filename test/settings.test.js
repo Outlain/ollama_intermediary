@@ -79,6 +79,27 @@ function fixture(t) {
   };
 }
 
+test('model overrides support normal tags and namespaces without exposing Frigate credentials', () => {
+  const baseRaw = {
+    server: { listen: '127.0.0.1:0' },
+    frigate: { url: 'https://frigate.example:8971', username: 'private-admin', password: 'very-secret', auth_token: 'private-token' },
+    models: { 'namespace/qwen3-vl:8b': { idle_hold: '30s' } },
+  };
+  const result = validateSettingsDraft({ baseRaw, environment: null, draft: {
+    models: { 'namespace/qwen3-vl:8b': { idle_hold: '1m' } },
+    frigate: { enabled: true },
+  } });
+  assert.equal(result.valid, true);
+  assert.equal(result.settings.models['namespace/qwen3-vl:8b'].idle_hold, '1m');
+  assert.equal(result.effectiveConfig.frigate.password, 'very-secret');
+  assert.doesNotMatch(JSON.stringify(result), /private-admin|very-secret|private-token/);
+  for (const field of ['username', 'password', 'auth_token', 'state_path']) {
+    const blocked = validateSettingsDraft({ baseRaw, environment: null, draft: { frigate: { [field]: 'not-allowed' } } });
+    assert.equal(blocked.valid, false);
+    assert.ok(blocked.diagnostics.some((item) => item.path === `frigate.${field}`));
+  }
+});
+
 test('structured draft merges editable fields, expands the base environment, and masks secrets', (t) => {
   const { baseRaw, environment } = fixture(t);
   const result = validateSettingsDraft({

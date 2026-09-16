@@ -37,7 +37,7 @@ test('interactive priority wins when models begin queued together', () => {
 });
 
 test('maximum wait prevents Frigate starvation and overrides affinity', () => {
-  const { scheduler, add, setNow } = harness();
+  const { scheduler, add, setNow } = harness({ scheduler: { mode: 'balanced' } });
   add('O1', 'odysseus', 'od-model');
   const first = scheduler.take().job;
   scheduler.complete(first);
@@ -49,7 +49,7 @@ test('maximum wait prevents Frigate starvation and overrides affinity', () => {
 });
 
 test('current-model requests are batched ahead of other queued models', () => {
-  const { scheduler, add } = harness();
+  const { scheduler, add } = harness({ scheduler: { mode: 'balanced' } });
   add('O1', 'odysseus', 'od-model');
   let active = scheduler.take().job;
   scheduler.complete(active);
@@ -79,7 +79,7 @@ test('model lease waits for a follow-up and avoids an immediate switch', () => {
 });
 
 test('batch request limit causes reevaluation and a model switch', () => {
-  const { scheduler, add } = harness({ models: {
+  const { scheduler, add } = harness({ scheduler: { mode: 'balanced' }, models: {
     'od-model': { idle_hold: '0ms', max_batch_requests: 2, max_batch_time: '2s' },
     'f-model': { idle_hold: '0ms', max_batch_requests: 10, max_batch_time: '2s' },
   } });
@@ -200,4 +200,146 @@ test('client-wide model policy applies to an arbitrary requested model', () => {
   scheduler.complete(scheduler.take().job);
   assert.equal(scheduler.modelPolicy(job.model, job.client).keep_alive, '750ms');
   assert.equal(scheduler.leaseUntil, 50);
+});
+
+test('strict priority never promotes old Frigate work ahead of waiting Odysseus', () => {
+  const { scheduler, add, setNow } = harness({
+    clients: { frigate: { priority: 1000, request_ttl: '2h', max_wait: '1ms' } },
+    scheduler: { priority_aging: true, aging_interval: '1ms', aging_bonus: 100 },
+    models: { 'od-model': { max_batch_requests: 1, max_batch_time: '1ms' } },
+  });
+  add('F1', 'frigate', 'f-model');
+  for (let index = 1; index <= 3; index += 1) {
+    setNow(index * 60_000);
+    add(`O${index}`, 'odysseus', 'od-model');
+    const job = scheduler.take().job;
+    assert.equal(job.id, `O${index}`);
+    assert.equal(job.scheduleReason, 'strict_priority');
+    scheduler.complete(job);
+  }
+  assert.equal(scheduler.take().reason, 'model_lease');
+  setNow(180_050);
+  assert.equal(scheduler.take().job.id, 'F1');
+});
+
+test('strict priority uses FIFO across models and does not favor the loaded model', () => {
+  const { scheduler, add, setNow } = harness();
+  add('O1', 'odysseus', 'od-model');
+  scheduler.complete(scheduler.take().job);
+  setNow(10);
+  add('O2', 'odysseus', 'new-model');
+  add('O3', 'odysseus', 'od-model');
+  assert.equal(scheduler.take().job.id, 'O2');
+});
+
+test('strict idle hold blocks a lower-priority client even when requesting the same model', () => {
+  const { scheduler, add, setNow } = harness();
+  add('O1', 'odysseus', 'od-model');
+  scheduler.complete(scheduler.take().job);
+  add('F1', 'frigate', 'od-model');
+  assert.equal(scheduler.take().reason, 'model_lease');
+  setNow(50);
+  assert.equal(scheduler.take().job.id, 'F1');
+});
+
+test('higher-priority work bypasses another client idle hold for same or different models', () => {
+  for (const model of ['f-model', 'od-model']) {
+    const { scheduler, add } = harness({ models: { 'f-model': { idle_hold: '1m' } } });
+    add('F1', 'frigate', 'f-model');
+    scheduler.complete(scheduler.take().job);
+    add('O1', 'odysseus', model);
+    assert.equal(scheduler.take().job.id, 'O1');
+  }
+});
+
+test('active work is never preempted and other live clients use priority then FIFO', () => {
+  const { scheduler, add } = harness();
+  add('F1', 'frigate', 'f-model');
+  const active = scheduler.take().job;
+  add('F2', 'frigate', 'f-model');
+  add('D1', 'default', 'default-model');
+  add('D2', 'default', 'another-model');
+  add('O1', 'odysseus', 'od-model');
+  assert.equal(scheduler.take().job, null);
+  assert.equal(scheduler.active, active);
+  scheduler.complete(active);
+  const next = scheduler.take().job;
+  assert.equal(next.id, 'O1');
+  scheduler.cancel(scheduler.jobs.find((job) => job.id === 'F2'));
+  scheduler.complete(next);
+  scheduler.leaseUntil = 0;
+  assert.equal(scheduler.take().job.id, 'D1');
+  scheduler.complete(scheduler.active);
+  assert.equal(scheduler.take().job.id, 'D2');
+});
+
+test('background readiness accounts for live queue, active work, idle hold, pause and stop', () => {
+  const { scheduler, add, setNow } = harness();
+  assert.equal(scheduler.canRunBackground(), true);
+  add('O1', 'odysseus', 'od-model');
+  assert.equal(scheduler.backgroundReadiness().reason, 'live_requests_queued');
+  scheduler.take();
+  assert.equal(scheduler.backgroundReadiness().reason, 'active_request');
+  scheduler.complete(scheduler.active);
+  assert.deepEqual(scheduler.backgroundReadiness(), { ready: false, reason: 'model_lease', wait_seconds: 0.05 });
+  setNow(50);
+  assert.equal(scheduler.canRunBackground(), true);
+  scheduler.pause();
+  assert.equal(scheduler.backgroundReadiness().reason, 'maintenance_paused');
+  scheduler.resume();
+  scheduler.stop();
+  assert.equal(scheduler.backgroundReadiness().reason, 'shutting_down');
+});
+
+test('aggregate body memory includes active work and frees it after completion or cancellation', () => {
+  const { scheduler, add } = harness({ scheduler: { max_queue_bytes: 10 } });
+  add('O1', 'odysseus', 'od-model', { body: Buffer.alloc(6) });
+  scheduler.take();
+  const queued = add('O2', 'odysseus', 'od-model', { body: Buffer.alloc(4) });
+  const rejected = createJob({ id: 'O3', client: 'odysseus', model: 'od-model', body: Buffer.alloc(1), enqueuedAt: 0 });
+  assert.equal(scheduler.enqueue(rejected).code, 'queue_bytes_exceeded');
+  assert.equal(scheduler.status().total_request_bytes, 10);
+  assert.equal(scheduler.status().active_bytes, 6);
+  scheduler.cancel(queued);
+  assert.equal(scheduler.status().queue_bytes, 0);
+  assert.equal(scheduler.enqueue(rejected).accepted, true);
+  scheduler.complete(scheduler.active);
+  assert.equal(scheduler.status().total_request_bytes, 1);
+});
+
+test('memory rejection leaves existing work intact even for drop_oldest or deduplication', () => {
+  for (const dedupeKey of [null, 'duplicate']) {
+    const { scheduler, add } = harness({ scheduler: { max_queue_bytes: 10 }, clients: { frigate: { queue_limit: 1 } } });
+    const original = add('F1', 'frigate', 'f-model', { body: Buffer.alloc(4), dedupeKey });
+    const rejected = createJob({ id: 'F2', client: 'frigate', model: 'f-model', body: Buffer.alloc(11), dedupeKey, enqueuedAt: 0 });
+    assert.equal(scheduler.enqueue(rejected).code, 'queue_bytes_exceeded');
+    assert.equal(original.state, 'queued');
+    assert.deepEqual(scheduler.jobs, [original]);
+  }
+});
+
+test('balanced mode max_wait zero disables forced dispatch', () => {
+  const { scheduler, add, setNow } = harness({ scheduler: { mode: 'balanced' }, clients: { frigate: { max_wait: '0ms' } } });
+  add('O1', 'odysseus', 'od-model');
+  scheduler.complete(scheduler.take().job);
+  const queued = add('F1', 'frigate', 'f-model');
+  assert.equal(queued.maxWaitAt, Infinity);
+  setNow(10);
+  assert.equal(scheduler.take().reason, 'model_lease');
+});
+
+test('arbitrary model names cannot resolve inherited policies or corrupt queue summaries', () => {
+  const { scheduler, add } = harness();
+  for (const name of ['__proto__', 'constructor', 'toString']) {
+    add(name, 'odysseus', name);
+    assert.equal(scheduler.modelPolicy(name, 'odysseus').group, 'odysseus');
+    assert.equal(scheduler.status().model_queues[name], 1);
+  }
+  assert.equal(scheduler.take().job.id, '__proto__');
+});
+
+test('client identity must be an actual configured key, not an inherited property', () => {
+  const classifier = new Classifier(testConfig());
+  const request = { headers: { 'x-ollama-client': 'constructor' }, socket: { remoteAddress: '127.0.0.1' } };
+  assert.deepEqual(classifier.identify(request, { model: 'new-model' }, '__proto__'), { client: 'default', method: 'fallback' });
 });

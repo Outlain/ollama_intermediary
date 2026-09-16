@@ -24,8 +24,9 @@ function issue(path, code, message, severity = 'error', uiFixable = false) {
 async function restartForSettings() {
   if (restartingForSettings) return;
   restartingForSettings = true;
-  logger.warn('validated settings were committed; restarting intermediary');
+  logger.warn('validated settings were committed; waiting for active work before restart');
   try {
+    await service?.waitForIdle?.();
     await service?.stop();
   } catch (error) {
     logger.error('graceful settings restart cleanup failed', { error: error.stack ?? error.message });
@@ -79,6 +80,15 @@ try {
 }
 
 let settingsPath = requestedSettingsPath;
+// Host-managed credentials work even with older operator-owned config.yml files.
+// Browser overrides never contain these values.
+baseRaw.frigate = { ...baseRaw.frigate };
+for (const [field, variable] of Object.entries({
+  url: 'FRIGATE_URL', username: 'FRIGATE_USERNAME', password: 'FRIGATE_PASSWORD', auth_token: 'FRIGATE_AUTH_TOKEN',
+})) {
+  if (process.env[variable]) baseRaw.frigate[field] = process.env[variable];
+}
+baseRaw.gpu_safety = { state_path: '/app/state/gpu-recovery.json', ...baseRaw.gpu_safety };
 let settingsStore;
 try {
   settingsStore = new SettingsStore({

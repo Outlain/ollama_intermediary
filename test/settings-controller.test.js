@@ -291,6 +291,7 @@ test('authenticated reset repairs an unreadable saved override document without 
   assert.equal(response.status, 202);
   const body = await response.json();
   assert.equal(body.restart_required, true);
+  assert.equal(body.restart_pending, true);
   await waitFor(() => restartCalls === 1);
   assert.equal(store.snapshot().valid, true);
   assert.equal(store.snapshot().source, 'base');

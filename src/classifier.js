@@ -25,10 +25,10 @@ export class Classifier {
   }
 
   identify(request, parsedBody, forcedClient = null) {
-    if (forcedClient && this.config.clients[forcedClient]) return { client: forcedClient, method: 'listener' };
+    if (forcedClient && Object.hasOwn(this.config.clients, forcedClient)) return { client: forcedClient, method: 'listener' };
     const header = request.headers['x-ollama-client'];
     const named = Array.isArray(header) ? header[0] : header;
-    if (named && this.config.clients[named]) return { client: named, method: 'header' };
+    if (named && Object.hasOwn(this.config.clients, named)) return { client: named, method: 'header' };
     const model = parsedBody?.model;
     if (model && this.modelClients.has(model)) return { client: this.modelClients.get(model), method: 'model' };
     const address = clientIp(request, this.config.server.trusted_proxy);
@@ -60,16 +60,20 @@ export class Classifier {
 export function classifyEndpoint(method, pathname) {
   if (method === 'POST' && [
     '/api/generate', '/api/chat', '/api/embed', '/api/embeddings',
-    '/v1/chat/completions', '/v1/embeddings',
+    '/v1/chat/completions', '/v1/completions', '/v1/responses', '/v1/embeddings',
   ].includes(pathname)) return 'generation';
-  if (['/api/pull', '/api/push', '/api/create', '/api/delete', '/api/copy'].includes(pathname)) return 'management';
-  return 'metadata';
+  if (method === 'POST' && ['/api/pull', '/api/push', '/api/create', '/api/copy'].includes(pathname)) return 'management';
+  if (method === 'DELETE' && pathname === '/api/delete') return 'management';
+  if (method === 'POST' && /^\/api\/blobs\/sha256:[a-f0-9]{64}$/.test(pathname)) return 'management';
+  return isSafeMetadataEndpoint(method, pathname) ? 'metadata' : 'unknown';
 }
 
 export function isSafeMetadataEndpoint(method, pathname) {
+  if (['GET', 'HEAD'].includes(method) && pathname === '/') return true;
   if (method === 'GET' && ['/api/tags', '/api/ps', '/api/version', '/v1/models'].includes(pathname)) return true;
+  if (method === 'GET' && /^\/v1\/models\/[^/]+$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/show') return true;
-  if (method === 'HEAD' && pathname.startsWith('/api/blobs/')) return true;
+  if (method === 'HEAD' && /^\/api\/blobs\/sha256:[a-f0-9]{64}$/.test(pathname)) return true;
   return false;
 }
 

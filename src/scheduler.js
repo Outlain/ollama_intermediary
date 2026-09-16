@@ -31,6 +31,8 @@ export class Scheduler {
     this.active = null;
     this.currentModel = null;
     this.currentModelGroup = null;
+    this.currentClient = null;
+    this.leaseClient = null;
     this.lastActivity = null;
     this.leaseUntil = 0;
     this.batchModel = null;
@@ -44,26 +46,46 @@ export class Scheduler {
   }
 
   modelPolicy(model, client = null) {
-    return this.config.models[model]
+    return (Object.hasOwn(this.config.models, model) ? this.config.models[model] : null)
       ?? (client ? this.config.clients[client]?.model_policy : null)
       ?? this.config.clients.default.model_policy;
+  }
+
+  get strictPriority() {
+    return this.config.scheduler.mode !== 'balanced';
+  }
+
+  requestBytes(job) {
+    if (!job) return 0;
+    if (typeof job.body === 'string') return Buffer.byteLength(job.body);
+    return job.body?.byteLength ?? job.requestSummary?.body_bytes ?? 0;
+  }
+
+  memoryUsage() {
+    const queued = this.jobs.reduce((total, job) => total + (job.state === 'queued' ? this.requestBytes(job) : 0), 0);
+    const active = this.requestBytes(this.active);
+    return { queued, active, total: queued + active, limit: this.config.scheduler.max_queue_bytes ?? 128 * 1024 * 1024 };
   }
 
   enqueue(job) {
     if (!this.accepting) return { accepted: false, status: 503, code: 'shutting_down', message: 'proxy is shutting down' };
     if (this.paused) return { accepted: false, status: 503, code: 'maintenance_paused', message: 'inference is paused for GPU maintenance' };
+    this.expire();
     const clientPolicy = this.config.clients[job.client];
     let sameClient = this.jobs.filter((item) => item.client === job.client && item.state === 'queued');
+    const replacements = [];
 
     if (job.dedupeKey) {
       const duplicate = sameClient.find((item) => item.dedupeKey === job.dedupeKey);
-      if (duplicate) this.drop(duplicate, 429, 'superseded', 'request was superseded by a newer equivalent request');
-      sameClient = this.jobs.filter((item) => item.client === job.client && item.state === 'queued');
+      if (duplicate) {
+        replacements.push({ job: duplicate, code: 'superseded', message: 'request was superseded by a newer equivalent request' });
+        sameClient = sameClient.filter((item) => item !== duplicate);
+      }
     }
 
     if (sameClient.length >= clientPolicy.queue_limit) {
       if (clientPolicy.overflow_policy === 'drop_oldest') {
-        this.drop(sameClient[0], 429, 'queue_overflow_drop_oldest', 'request was dropped to admit newer work');
+        replacements.push({ job: sameClient[0], code: 'queue_overflow_drop_oldest', message: 'request was dropped to admit newer work' });
       } else {
         const code = clientPolicy.overflow_policy === 'drop_newest' ? 'queue_overflow_drop_newest' : 'queue_full';
         this.metrics.increment('proxy_requests_dropped_total', { client: job.client, reason: code });
@@ -71,9 +93,17 @@ export class Scheduler {
       }
     }
 
+    const memory = this.memoryUsage();
+    const replacedBytes = replacements.reduce((total, replacement) => total + this.requestBytes(replacement.job), 0);
+    if (memory.total - replacedBytes + this.requestBytes(job) > memory.limit) {
+      this.metrics.increment('proxy_requests_dropped_total', { client: job.client, reason: 'queue_bytes_exceeded' });
+      return { accepted: false, status: 429, code: 'queue_bytes_exceeded', message: 'aggregate request body memory limit reached; retry later' };
+    }
+    for (const replacement of replacements) this.drop(replacement.job, 429, replacement.code, replacement.message);
+
     job.state = 'queued';
     job.deadline = job.enqueuedAt + clientPolicy.requestTtlMs;
-    job.maxWaitAt = job.enqueuedAt + clientPolicy.maxWaitMs;
+    job.maxWaitAt = clientPolicy.maxWaitMs > 0 ? job.enqueuedAt + clientPolicy.maxWaitMs : Infinity;
     this.jobs.push(job);
     this.metrics.increment('proxy_requests_total', { client: job.client, endpoint: job.pathname });
     this.logger.info('request queued', {
@@ -144,7 +174,7 @@ export class Scheduler {
 
   effectivePriority(job, now) {
     const client = this.config.clients[job.client];
-    if (!this.config.scheduler.priority_aging) return client.priority;
+    if (this.strictPriority || !this.config.scheduler.priority_aging) return client.priority;
     const intervals = Math.floor((now - job.enqueuedAt) / this.config.scheduler.agingIntervalMs);
     return client.priority + intervals * this.config.scheduler.aging_bonus;
   }
@@ -164,9 +194,35 @@ export class Scheduler {
 
   best(candidates, now) {
     return [...candidates].sort((left, right) => {
+      if (this.strictPriority && left.client !== right.client) {
+        if (left.client === 'odysseus') return -1;
+        if (right.client === 'odysseus') return 1;
+      }
       const priority = this.effectivePriority(right, now) - this.effectivePriority(left, now);
       return priority || left.enqueuedAt - right.enqueuedAt || left.sequence - right.sequence;
     })[0];
+  }
+
+  lowerPriorityThanLease(job) {
+    if (!this.leaseClient || job.client === this.leaseClient) return false;
+    if (job.client === 'odysseus') return false;
+    if (this.leaseClient === 'odysseus') return true;
+    return this.config.clients[job.client].priority < this.config.clients[this.leaseClient].priority;
+  }
+
+  backgroundReadiness(now = this.clock()) {
+    if (!this.accepting) return { ready: false, reason: 'shutting_down', wait_seconds: null };
+    if (this.paused) return { ready: false, reason: 'maintenance_paused', wait_seconds: null };
+    if (this.active) return { ready: false, reason: 'active_request', wait_seconds: null };
+    if (this.jobs.some((job) => job.state === 'queued' && !job.signal?.aborted && job.deadline > now)) {
+      return { ready: false, reason: 'live_requests_queued', wait_seconds: null };
+    }
+    if (now < this.leaseUntil) return { ready: false, reason: 'model_lease', wait_seconds: (this.leaseUntil - now) / 1000 };
+    return { ready: true, reason: 'idle', wait_seconds: 0 };
+  }
+
+  canRunBackground(now = this.clock()) {
+    return this.backgroundReadiness(now).ready;
   }
 
   take(now = this.clock()) {
@@ -180,7 +236,13 @@ export class Scheduler {
     let chosen;
     let reason;
 
-    if (forcedOther.length) {
+    if (this.strictPriority) {
+      chosen = this.best(candidates, now);
+      if (now < this.leaseUntil && this.lowerPriorityThanLease(chosen)) {
+        return { job: null, delayMs: Math.max(1, this.leaseUntil - now), reason: 'model_lease' };
+      }
+      reason = 'strict_priority';
+    } else if (forcedOther.length) {
       chosen = forcedOther.sort((a, b) => a.maxWaitAt - b.maxWaitAt || a.sequence - b.sequence)[0];
       reason = 'max_wait_exceeded';
     } else {
@@ -226,7 +288,9 @@ export class Scheduler {
     }
     this.currentModel = chosen.model;
     this.currentModelGroup = this.modelPolicy(chosen.model, chosen.client).group;
+    this.currentClient = chosen.client;
     this.leaseUntil = 0;
+    this.leaseClient = null;
     this.batchCount += 1;
     this.jobs.splice(this.jobs.indexOf(chosen), 1);
     chosen.state = 'active';
@@ -258,6 +322,7 @@ export class Scheduler {
     this.active = null;
     this.lastActivity = now;
     this.leaseUntil = now + this.modelPolicy(job.model, job.client).idleHoldMs;
+    this.leaseClient = job.client;
     this.wake();
   }
 
@@ -272,19 +337,22 @@ export class Scheduler {
     });
     this.currentModel = normalized;
     this.currentModelGroup = normalized ? this.modelPolicy(normalized).group : null;
+    this.currentClient = null;
     this.batchModel = normalized;
     this.batchPolicy = null;
     this.batchStartedAt = this.clock();
     this.batchCount = 0;
     this.leaseUntil = 0;
+    this.leaseClient = null;
     this.wake();
   }
 
   status(now = this.clock()) {
+    const memory = this.memoryUsage();
     const queues = {};
     const oldestWait = {};
-    const modelQueues = {};
-    const oldestModelWait = {};
+    const modelQueues = Object.create(null);
+    const oldestModelWait = Object.create(null);
     for (const client of Object.keys(this.config.clients)) {
       const jobs = this.jobs.filter((job) => job.client === client && job.state === 'queued');
       queues[client] = jobs.length;
@@ -299,6 +367,8 @@ export class Scheduler {
     return {
       current_model: this.currentModel,
       current_model_group: this.currentModelGroup,
+      current_client: this.currentClient,
+      scheduling_mode: this.strictPriority ? 'strict_priority' : 'balanced',
       active_client: this.active?.client ?? null,
       active_request_id: this.active ? `r-${this.active.sequence}` : null,
       active_request_duration: this.active ? (now - this.active.dispatchedAt) / 1000 : 0,
@@ -308,6 +378,11 @@ export class Scheduler {
       oldest_wait_seconds: oldestWait,
       model_queues: modelQueues,
       oldest_model_wait_seconds: oldestModelWait,
+      queue_bytes: memory.queued,
+      active_bytes: memory.active,
+      total_request_bytes: memory.total,
+      max_queue_bytes: memory.limit,
+      background: this.backgroundReadiness(now),
       last_activity: this.lastActivity ? new Date(this.lastActivity).toISOString() : null,
       model_lease_remaining: Math.max(0, this.leaseUntil - now) / 1000,
       model_switches: this.switches,
@@ -346,7 +421,7 @@ export class Scheduler {
       running_seconds: active ? Math.max(0, now - job.dispatchedAt) / 1000 : null,
       waiting_seconds: active ? null : Math.max(0, now - job.enqueuedAt) / 1000,
       ttl_remaining_seconds: active ? null : Math.max(0, job.deadline - now) / 1000,
-      max_wait_remaining_seconds: active ? null : Math.max(0, job.maxWaitAt - now) / 1000,
+      max_wait_remaining_seconds: active || this.strictPriority || !Number.isFinite(job.maxWaitAt) ? null : Math.max(0, job.maxWaitAt - now) / 1000,
       effective_priority: active ? null : this.effectivePriority(job, now),
       schedule_reason: job.scheduleReason ?? null,
       model_switch_expected: Boolean(job.switching),
@@ -358,8 +433,8 @@ export class Scheduler {
   details(now = this.clock()) {
     const status = this.status(now);
     const queued = this.jobs.filter((job) => job.state === 'queued');
-    const byModel = {};
-    const oldestByModel = {};
+    const byModel = Object.create(null);
+    const oldestByModel = Object.create(null);
     for (const [model, depth] of Object.entries(status.model_queues)) {
       const safeModel = safeDisplay(model);
       byModel[safeModel] = (byModel[safeModel] ?? 0) + depth;
@@ -368,6 +443,8 @@ export class Scheduler {
     return {
       current_model: safeDisplay(status.current_model),
       current_model_group: safeDisplay(status.current_model_group),
+      scheduling_mode: status.scheduling_mode,
+      background: status.background,
       model_lease_remaining: status.model_lease_remaining,
       model_switches: status.model_switches,
       upstream_draining: status.upstream_draining,
@@ -376,6 +453,10 @@ export class Scheduler {
       active_request: this.active ? this.requestDetails(this.active, now) : null,
       queue: {
         total: queued.length,
+        body_bytes: status.queue_bytes,
+        active_body_bytes: status.active_bytes,
+        total_request_bytes: status.total_request_bytes,
+        max_bytes: status.max_queue_bytes,
         by_client: status.queues,
         by_model: byModel,
         oldest_wait_seconds: Math.max(0, ...Object.values(status.oldest_wait_seconds)),

@@ -1,7 +1,9 @@
 FROM node:24-alpine
 
+ARG INTERMEDIARY_BUILD=unknown
 ENV NODE_ENV=production \
-    CONFIG_PATH=/app/config.yml
+    CONFIG_PATH=/app/config.yml \
+    INTERMEDIARY_BUILD=${INTERMEDIARY_BUILD}
 
 WORKDIR /app
 

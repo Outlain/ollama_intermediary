@@ -4,12 +4,19 @@ services:
     container_name: ollama-scheduler
     restart: unless-stopped
     init: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # Slightly longer than server.shutdown_grace so Node can finish cleanup.
     stop_grace_period: 3m
     ports:
       - "11435:11434"
     environment:
       CONFIG_PATH: /app/config.yml
+      SETTINGS_PATH: /app/state/settings.json
+      SETTINGS_RECOVERY_LISTEN: 0.0.0.0:11434
       LOG_LEVEL: info
     env_file:
       - ./secrets.env

@@ -78,6 +78,8 @@ export function requestType(pathname) {
   if (pathname === '/api/generate') return 'generate';
   if (pathname === '/api/embed' || pathname === '/api/embeddings') return 'embedding';
   if (pathname === '/v1/chat/completions') return 'openai_chat';
+  if (pathname === '/v1/completions') return 'openai_completion';
+  if (pathname === '/v1/responses') return 'openai_response';
   if (pathname === '/v1/embeddings') return 'openai_embedding';
   return 'generation';
 }
@@ -204,7 +206,12 @@ export class ResponseStatsCollector {
       }
       if (usage) break;
     }
-    return { response_bytes: this.bytes, ...usage };
+    return {
+      response_bytes: this.bytes,
+      usage_available: Boolean(usage),
+      summary_truncated: !usage && this.bytes > this.limit,
+      ...usage,
+    };
   }
 }
 
