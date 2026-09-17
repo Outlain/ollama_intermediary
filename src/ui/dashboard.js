@@ -547,11 +547,17 @@
     var host = data.host_gpu || {};
     var fresh = host.enabled === true && host.available === true && host.stale === false;
     var gpus = Array.isArray(host.gpus) ? host.gpus : [];
-    setText('host-gpu-state', !host.enabled ? 'Disabled' : host.stale ? 'Stale · unknown' : fresh ? 'Available' : 'Unavailable');
+    var setupErrors = {
+      host_helper_socket_missing: 'The helper socket is not visible in this container. The helper may not be installed, or its socket directory is not mounted. Run the host installer on ubuntu-ai; the container cannot determine which host-side step is missing.',
+      host_helper_permission_denied: 'The helper socket is present but access is denied. Check the container’s supplementary helper group and socket permissions. Do not make the socket world-writable.',
+      host_helper_not_listening: 'The socket is visible but no helper is accepting connections. Check the host helper service and its directory mount.',
+      host_backend_mismatch: 'The helper is reachable but manages a different Ollama origin. Its configured origin must match Settings → Backend; recovery remains blocked.',
+    };
+    setText('host-gpu-state', !host.enabled ? 'Disabled · not checked' : setupErrors[host.error] ? 'Setup required' : host.stale ? 'Stale · unknown' : fresh ? 'Available' : 'Unavailable');
     byId('host-gpu-state').className = fresh ? 'tag tag-good' : 'tag tag-warning';
-    setText('host-gpu-detail', !host.enabled ? 'Install and enable the read-only host helper to display physical GPU metrics. Ollama model allocations alone cannot provide total VRAM usage.'
-      : !fresh ? 'Fresh host telemetry is unavailable. Hardware values are unknown, not zero; no safety decision should rely on this display.'
-        : gpus.length ? 'Physical GPU usage includes driver allocations and other processes, not just Ollama models.' : 'The host helper returned no GPU devices. No hardware measurements are available.');
+    setText('host-gpu-detail', !host.enabled ? 'Host monitoring is disabled, so helper availability is not being checked. Run python3 integrations/host/install.py on the Ollama host for setup, then enable monitoring in Settings.'
+      : setupErrors[host.error] || (!fresh ? 'Fresh host telemetry is unavailable. Hardware values are unknown, not zero; no safety decision should rely on this display.'
+        : gpus.length ? 'Physical GPU usage includes driver allocations and other processes, not just Ollama models.' : 'The host helper returned no GPU devices. No hardware measurements are available.'));
     setText('host-gpu-sampled', host.sampled_at ? 'Last hardware sample: ' + formatRelativeDate(host.sampled_at) + (fresh ? '' : ' · not current') : 'No hardware sample available.');
     setHidden('host-gpu-error', !host.error);
     setText('host-gpu-error', host.error);

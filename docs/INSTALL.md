@@ -141,8 +141,24 @@ Acknowledgment does not reset hardware and does not resume inference by itself. 
 
 **Updating the intermediary container alone does not enable host monitoring or service restarts.** Those require the optional helper on the same Linux host as the real Ollama service, not the Frigate host. No new Frigate image or bridge rebuild is needed for this upgrade.
 
+For the standard local Ubuntu/Compose deployment, update the intermediary, pause
+inference, leave automatic recovery off, and run this as your normal Docker user:
+
+```bash
+cd /opt/ollama_intermediary
+python3 integrations/host/install.py
+```
+
+The interactive installer automates the account/service/permission setup and
+safe Compose merge below, asks for confirmation before sudo, validates telemetry
+from the host and container, and preserves the paused state. It never restarts
+Ollama during setup. Use `--check` for a non-installing preflight. After success,
+verify monitoring in Settings, then explicitly enable automatic recovery. See
+the [installer prerequisites and safeguards](../integrations/host/README.md#recommended-interactive-one-command-setup)
+for supported deployments; advanced layouts use the manual procedure below.
+
 1. Update the intermediary while safely drained using your existing source or release installation method. Preserve `config.yml`, `secrets.env`, saved settings, and all state volumes. Version 1.4 keeps host monitoring and automatic recovery disabled until explicitly enabled.
-2. Follow [the host helper installation guide](../integrations/host/README.md) on the Ollama host. Its manual steps install an unprivileged, Unix-socket-only helper and narrowly scoped permission to restart **only `ollama.service`**, with an independent persisted limit of two restarts per hour and a five-minute cooldown. It has no GPU-reset or reboot permission. Review the service, environment, and sudoers artifacts before installing them; there is no automatic privileged installer.
+2. Follow [the host helper installation guide](../integrations/host/README.md) on the Ollama host. Its manual steps install an unprivileged, Unix-socket-only helper and narrowly scoped permission to restart **only `ollama.service`**, with an independent persisted limit of two restarts per hour and a five-minute cooldown. It has no GPU-reset or reboot permission. Review the service, environment, and sudoers artifacts before installing them; the interactive installer above automates these steps only after your confirmation.
 3. Merge the supplied host-helper Compose example into the existing `docker-compose.override.yml`, preserving other overrides. Mount only the helper runtime directory and add its numeric socket group. Do not mount the Docker socket, host filesystem root, or GPU devices into the intermediary. Do not make the helper socket world-writable. If Ollama runs on a different host from the intermediary, this local-socket integration cannot be used as-is.
 4. Enable only host monitoring first. Use **Settings → GPU safety** or the host-managed `HOST_HELPER_ENABLED=true` environment opt-in. Recreate the container after adding socket mounts/groups or changing environment variables. Inspect the dashboard for fresh physical VRAM/process telemetry and the correct Ollama service identity.
 5. Configure a distinct `MAINTENANCE_TOKEN` if not already set. Once the helper is verified, enable `auto_recovery.enabled` in Settings, or establish the base opt-in with `AUTO_RECOVERY_ENABLED=true` in `secrets.env`. Environment values do not override previously saved UI overrides. Validate/apply, then explicitly resume a deliberate maintenance pause when ready; automatic recovery never resumes it for you.

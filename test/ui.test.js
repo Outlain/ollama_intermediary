@@ -202,6 +202,20 @@ test('a disconnected dashboard does not keep presenting cached hardware readings
   assert.doesNotMatch(nodes.get('host-gpu-list').textContent, /1 KB|utilization0%/);
 });
 
+test('helper setup diagnosis does not confuse disabled monitoring or missing mounts with proven host absence', () => {
+  const { ui, nodes } = harness('dashboard');
+  ui.render({ host_gpu: { enabled: false } });
+  assert.equal(nodes.get('host-gpu-state').textContent, 'Disabled · not checked');
+  assert.match(nodes.get('host-gpu-detail').textContent, /availability is not being checked/);
+  ui.render({ host_gpu: { enabled: true, available: false, stale: true, error: 'host_helper_socket_missing' } });
+  assert.equal(nodes.get('host-gpu-state').textContent, 'Setup required');
+  assert.match(nodes.get('host-gpu-detail').textContent, /may not be installed.*not mounted/);
+  ui.render({ host_gpu: { enabled: true, error: 'host_helper_permission_denied' } });
+  assert.match(nodes.get('host-gpu-detail').textContent, /access is denied/);
+  ui.render({ host_gpu: { enabled: true, error: 'host_backend_mismatch' } });
+  assert.match(nodes.get('host-gpu-detail').textContent, /different Ollama origin/);
+});
+
 test('recovery actions require maintenance authorization and explicit paused host acknowledgment', async () => {
   const { ui, context, nodes } = harness('dashboard');
   const data = { backend: { recovery_required: true }, recovery: { enabled: true, state: 'needs_attention' }, maintenance: { state: 'running', control_available: true } };

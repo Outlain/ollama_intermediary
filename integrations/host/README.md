@@ -53,7 +53,79 @@ latch. The changed service incarnation and old-worker termination are the
 recovery boundary. Manual pause remains a separate state; recovery must not
 resume inference while an operator pause is active.
 
-## Install manually on ubuntu-ai
+## Recommended: interactive one-command setup
+
+The helper is **custom code in this repository**, not a service supplied by AMD
+or Ollama. It uses the installed AMD SMI tool for readings and systemd for the
+single allowed restart operation. It does not install or update GPU drivers.
+
+Update the intermediary container to version 1.4 or later first. In the dashboard,
+pause inference **until manually resumed** and wait for the active request to finish. Leave automatic
+recovery disabled during installation. Then, as your normal Docker-capable user
+on the Ollama VM (**not** inside the container and **not** prefixed with sudo):
+
+```bash
+cd /opt/ollama_intermediary
+python3 integrations/host/install.py
+```
+
+The script performs preflight, displays a plan, asks you to type `INSTALL`, and
+then asks for sudo authorization. For preflight without installation:
+
+```bash
+python3 integrations/host/install.py --check
+```
+
+It detects the effective Ollama URL through the running intermediary's local
+settings API (including saved UI overrides), checks that it resolves to this VM,
+locates a root-owned AMD SMI executable, and checks the native Ollama service.
+Settings/observability credentials stay inside the container; they are never
+printed or passed on the host command line. Existing tokens must be configured.
+If AMD SMI is not on PATH, supply `--amd-smi /absolute/path/to/amd-smi`.
+
+After confirmation it creates the restricted account, installs the reviewed
+helper/service/sudoers files, verifies dedicated-account GPU access, and starts
+only the **helper**. It then safely merges the helper socket/group into
+`docker-compose.override.yml`, validates the effective Compose configuration,
+and recreates **only the paused intermediary**. It verifies helper access from
+inside the recreated container. No Ollama restart, inference, GPU reset, host
+reboot, driver installation, or deletion of persisted state is part of setup.
+
+Existing Compose settings are preserved. The script checks the complete resolved
+Compose configuration and refuses unrelated changes, including a different state
+volume. Backups are in a private directory under
+`~/.local/state/ollama-intermediary-installer/`; preserve them if setup stops.
+The recovery journals, `config.yml`, and `secrets.env` are not rewritten.
+Existing helper environment settings are preserved if they match; custom paths
+or a different backend require manual review rather than automatic overwrite.
+Rerunning does not duplicate helper mounts/groups or reset any restart limits.
+
+The automated path supports the repository's standard `docker-compose.yml` plus
+optional `docker-compose.override.yml`, a local Docker engine, native systemd
+Ollama over HTTP port 11434, and ordinary YAML mappings/lists. Custom Compose file
+lists, remote backends, YAML aliases/custom tags, proxies, or custom ports stop
+with instructions to use the manual guide below. It does not guess or flatten
+advanced deployment configuration. A failed installation may leave safely
+installed components in place; it reports that rather than deleting them during
+an automatic rollback.
+
+After success, open **Settings → Host telemetry & automatic recovery**. Enable
+host monitoring if a saved UI override kept it disabled, verify fresh metrics,
+then explicitly enable automatic recovery. The installer leaves automatic
+recovery off. Your manual pause is preserved; use **Check recovery now** for an
+existing recovery lock, then resume separately once recovery succeeds.
+
+### What the container can detect
+
+With monitoring disabled, it does not poll for the helper. With monitoring
+enabled, it continuously checks its mounted Unix socket. The dashboard reports
+missing socket/mount, permission denied, no listener, origin mismatch, stale
+readings, or available telemetry. A missing socket **cannot prove** the service
+is absent from the VM—it could be installed without a container mount. The host
+installer can inspect the actual systemd service. The Settings page describes
+setup but intentionally has no privileged install endpoint or Docker socket.
+
+## Manual installation / advanced deployments
 
 Do not run this on the Frigate host. These commands deliberately install a new
 local service and a narrowly scoped privilege rule. Review the files first,

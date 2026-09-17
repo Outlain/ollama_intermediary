@@ -30,6 +30,7 @@ mkdir -p "${bundle_directory}/integrations/frigate"
 cp integrations/frigate/README.md integrations/frigate/Dockerfile integrations/frigate/apply_bridge.py integrations/frigate/bridge.py "${bundle_directory}/integrations/frigate/"
 mkdir -p "${bundle_directory}/integrations/host"
 cp integrations/host/README.md integrations/host/host_helper.py integrations/host/ollama-intermediary-host.service integrations/host/ollama-intermediary-host.sudoers integrations/host/host-helper.env.example integrations/host/compose.host-helper.example.yml "${bundle_directory}/integrations/host/"
+cp integrations/host/install.py integrations/host/installer-compose.mjs "${bundle_directory}/integrations/host/"
 printf '%s\n' "$version" > "${bundle_directory}/VERSION"
 
 tar -C "$output" -czf "${output}/${bundle_name}.tar.gz" "$bundle_name"

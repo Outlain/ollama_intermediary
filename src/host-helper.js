@@ -11,6 +11,13 @@ export class HostHelperError extends Error {
   constructor(code) { super(code); this.code = code; }
 }
 
+export function hostConnectionError(error) {
+  if (error instanceof HostHelperError) return error;
+  const codes = { ENOENT: 'host_helper_socket_missing', EACCES: 'host_helper_permission_denied',
+    EPERM: 'host_helper_permission_denied', ECONNREFUSED: 'host_helper_not_listening' };
+  return new HostHelperError(codes[error?.code] ?? 'host_helper_unreachable');
+}
+
 // A local Unix socket, never a user-selected network destination. No shell,
 // Docker socket, host process execution, or host command input lives here.
 export class HostHelperClient {
@@ -42,7 +49,7 @@ export class HostHelperClient {
         settled = true;
         clearTimeout(timer);
         for (const item of signals) item.removeEventListener('abort', abort);
-        if (error) reject(error instanceof HostHelperError ? error : new HostHelperError('host_helper_unreachable'));
+        if (error) reject(hostConnectionError(error));
         else resolve(value);
       };
       for (const item of signals) {
