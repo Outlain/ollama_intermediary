@@ -29,7 +29,7 @@
   var CATCHUP_PAGE_SIZE = 30;
   var CATCHUP_VIEWS = {
     waiting: ['Waiting · newest event first', 'Jobs not yet handed off. Odysseus and live Frigate work always have priority.'],
-    awaiting: ['Awaiting saved result', 'One handoff at a time. Completion is confirmed only when Frigate saves a description.'],
+    awaiting: ['Generation / awaiting saved result', 'Rows distinguish native generation from saved-result verification. Completion is confirmed only when Frigate saves a description.'],
     retrying: ['Retrying · newest event first', 'Retry times are earliest eligible times, not promised start times. Delays increase after unsuccessful attempts.'],
     attention: ['Needs attention · still retrying', 'These jobs have remained unsuccessful past the configured attention threshold. Automatic retries continue; waiting behind live work alone is not a failure.'],
     completed: ['Completed · retained history', 'Descriptions are saved in Frigate. Removing old history rows here never removes descriptions or recordings.'],
@@ -504,6 +504,9 @@
     setText('catchup-completed', formatInteger((data.totals || {}).completed || 0));
     var support = data.capabilities || {};
     setText('catchup-capabilities', 'Objects: ' + (support.object ? 'supported' : 'not verified') + ' · Reviews: ' + (support.review ? 'supported' : 'not verified'));
+    setText('catchup-bridge', data.bridge_mode === 'correlated'
+      ? 'Frigate bridge connected · One native generation at a time · Awaiting save: ' + formatInteger(data.verifying_count || 0) + ' / ' + formatInteger(data.max_verifying || 4) + ' · GPU inference remains one at a time.'
+      : 'Compatibility mode · The version-pinned Frigate bridge is required for faster, correlated catch-up. Without it, one unconfirmed handoff is the safe limit.');
     setText('catchup-detail', data.enabled
       ? (data.blocked_reason ? titleCase(data.blocked_reason) : data.scan && data.scan.blocked_reason ? titleCase(data.scan.blocked_reason) : 'Background recovery runs only when live work and its idle hold are finished.')
       : 'Enable recovery and configure the Frigate connection in Settings.');
@@ -549,7 +552,11 @@
       shutting_down: 'The intermediary is shutting down.'
     };
     if (reasons[reason]) return reasons[reason];
-    if (data.active_job) return 'Waiting for Frigate to save the outstanding description. No second catch-up handoff is sent.';
+    if (data.requires_recovery) return 'A previous inference outcome is uncertain. Verify GPU recovery before allowing another catch-up generation.';
+    if (data.active_job) {
+      if (data.active_job.phase && data.active_job.phase !== 'legacy_confirmation') return 'Frigate has one active native generation attempt: ' + catchupPhase(data.active_job) + '. Saved-result checks run separately; no second native attempt starts until this one finishes safely.';
+      return 'Waiting for Frigate to save the outstanding description. This uncorrelated handoff retains the conservative one-at-a-time guard.';
+    }
     if (reason === 'active_request') {
       var active = snapshot && snapshot.active_request;
       return 'Waiting for ' + titleCase(active && active.client || 'the active request') + ' to finish. Running inference is not preempted.';
@@ -559,6 +566,8 @@
       return 'Waiting behind ' + (queues.odysseus ? 'Odysseus' : queues.frigate ? 'live Frigate requests' : 'live requests') + '.';
     }
     if (reason === 'model_lease') return 'Waiting for the short model idle hold' + (background.wait_seconds == null ? '' : ' (' + formatDuration(background.wait_seconds) + ')') + '. This is separate from model keep-alive.';
+    if (data.bridge_mode === 'correlated' && data.verifying_count >= (data.max_verifying || 4)) return 'Saved-result verification limit reached. Checking Frigate for saved descriptions before starting another native generation.';
+    if (data.bridge_mode === 'correlated' && data.verifying_count) return 'Finished generations are awaiting saved descriptions. They do not hold the GPU; another eligible job can start when live priority and safety checks permit.';
     if (data.scan && data.scan.blocked_reason) return 'Catch-up: ' + titleCase(data.scan.blocked_reason) + '.';
     if (!data.total_queued) return 'No unfinished descriptions are queued.';
     return 'The next eligible job may start when its live grace / retry delay and all safety checks permit.';
@@ -566,15 +575,33 @@
 
   function renderCatchupConfirmation() {
     var active = catchupData.active_job;
-    setText('catchup-active', active ? titleCase(active.kind) + ' · ' + (active.camera || '') + ' · ' + titleCase(active.state || active.status) : 'No background handoff.');
-    setHidden('catchup-confirmation', !active);
+    var verifying = catchupData.verifying_count || 0;
+    setText('catchup-active', active ? titleCase(active.kind) + ' · ' + (active.camera || '') + ' · ' + catchupPhase(active) : 'No active background generation.');
+    setHidden('catchup-confirmation', !active && !verifying);
+    if (active && active.phase && active.phase !== 'legacy_confirmation') {
+      setText('catchup-confirmation', active.phase === 'uncertain'
+        ? 'The native attempt outcome is uncertain. Catch-up is holding its generation slot until safe recovery; an idle dashboard alone is not proof that upstream work stopped.'
+        : 'Waiting for the Frigate bridge to report the full native attempt outcome. A single Ollama HTTP response is not that completion report. Confirmed failures enter retry backoff promptly; successful attempts move to separate saved-result verification.');
+      return;
+    }
     if (active) {
       var remaining = Math.max(0, (Number(active.next_attempt_at) - Date.now()) / 1000);
       setText('catchup-confirmation', (remaining > 0
         ? 'Waiting for Frigate to save the description. Confirmation window: ' + formatDuration(remaining) + ' remaining. '
         : 'Confirmation window elapsed. Checking the saved result before arranging an idle-only retry. ')
-        + 'This is not proof that the model is still generating. Confirmation is checked separately from discovery; no second catch-up handoff starts meanwhile.');
+        + 'This is not proof that the model is still generating. This uncorrelated attempt uses compatibility mode; no second catch-up handoff starts meanwhile.');
+    } else if (verifying) {
+      setText('catchup-confirmation', formatInteger(verifying) + ' finished generation(s) awaiting Frigate\'s saved description. Verification runs independently of GPU work. '
+        + (verifying >= (catchupData.max_verifying || 4) ? 'The verification limit is full; new handoffs wait for space.' : 'There is room for the next eligible generation; live work still has priority.'));
     }
+  }
+
+  function catchupPhase(job) {
+    var labels = {
+      handed_off: 'Preparing in Frigate', queued: 'Queued for GPU', running: 'Generating',
+      verifying_saved: 'Awaiting saved description', uncertain: 'Outcome uncertain', legacy_confirmation: 'Waiting result (compatibility mode)'
+    };
+    return labels[job.phase] || titleCase(job.state || job.status);
   }
 
   function renderCatchupJobs(id, emptyId, jobs) {
@@ -584,7 +611,7 @@
       setHidden(emptyId, jobs.length > 0);
       jobs.forEach(function (job) {
         var item = create('li', 'queue-item' + (job.needs_attention ? ' catchup-attention' : job.state === 'retrying' ? ' catchup-retrying' : ''));
-        item.appendChild(create('strong', '', titleCase(job.kind) + ' · ' + (job.camera || '') + ' · ' + titleCase(job.state || job.status)));
+        item.appendChild(create('strong', '', titleCase(job.kind) + ' · ' + (job.camera || '') + ' · ' + catchupPhase(job)));
         var eventTime = Number(job.event_time);
         var details = compactId(job.id || job.event_id) + (Number.isFinite(eventTime) && eventTime > 0 ? ' · Recorded ' + new Date(eventTime * 1000).toLocaleString() : '');
         if (job.reason) details += ' · ' + titleCase(job.reason);
@@ -596,6 +623,7 @@
         if (job.last_attempt_at) attempts.push('Last attempt: ' + new Date(job.last_attempt_at).toLocaleString());
         if (job.first_failed_at) attempts.push('First unsuccessful attempt: ' + new Date(job.first_failed_at).toLocaleString());
         if (job.state === 'retrying' && job.next_attempt_at) attempts.push('Earliest retry: ' + new Date(job.next_attempt_at).toLocaleString() + ' (when idle, not a promised start)');
+        if (job.phase === 'verifying_saved' && job.next_attempt_at) attempts.push('Saved-result check deadline: ' + new Date(job.next_attempt_at).toLocaleString() + ' (not active GPU work)');
         if (attempts.length) item.appendChild(create('p', 'muted', attempts.join(' · ')));
         var action = job.state === 'retrying' ? 'retry' : (job.state || job.status) === 'skipped' ? 'recheck' : null;
         if (action) {

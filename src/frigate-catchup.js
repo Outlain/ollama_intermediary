@@ -1,9 +1,15 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { FrigateClient, FrigateError } from './frigate-client.js';
 
-const SCHEMA = 1;
+const SCHEMA = 2;
+const ATTEMPT_PHASES = new Set(['handed_off', 'queued', 'running', 'verifying_saved', 'uncertain', 'retired']);
+const REQUEST_STATES = new Set(['queued', 'running', 'finished', 'uncertain']);
+const ticketHash = (ticket) => typeof ticket === 'string' && /^[a-f0-9]{64}$/.test(ticket)
+  ? createHash('sha256').update(ticket).digest('hex') : null;
+const outstanding = (attempt) => attempt?.requests.some((request) => request.state !== 'finished');
+const holdsSlot = (job) => job.state === 'waiting_result' && job.attempt?.phase !== 'verifying_saved';
 const KINDS = ['object', 'review'];
 const STATES = new Set(['pending', 'waiting_live', 'waiting_result', 'retrying']);
 const HISTORY_LIMIT = 1_000;
@@ -22,6 +28,7 @@ const JOB_REASONS = new Set([
   'connection_failed', 'request_timeout', 'stopped', 'response_interrupted', 'response_too_large',
   'authentication_failed', 'invalid_json_response', 'invalid_event_response', 'invalid_recording_list',
   'invalid_media_response', 'invalid_camera_configuration', 'generation_not_accepted', 'frigate_operation_failed',
+  'generation_failed', 'generation_finished', 'generation_uncertain', 'bridge_result_timeout', 'recovery_verified', 'native_error',
 ]);
 const text = (value, limit = 120) => String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, limit);
 const seconds = (value) => Number.isFinite(Number(value)) && value !== null ? Number(value) : null;
@@ -40,10 +47,18 @@ const restoredJob = (job) => ({
   first_failed_at: Number.isFinite(job.first_failed_at) ? job.first_failed_at : null,
   last_attempt_at: Number.isFinite(job.last_attempt_at) ? job.last_attempt_at : null,
   next_attempt_at: job.next_attempt_at, ...(Number.isFinite(job.completed_at) ? { completed_at: job.completed_at } : {}),
+  ...(job.attempt ? { attempt: restoredAttempt(job.attempt) } : {}),
+});
+const restoredAttempt = (attempt) => ({
+  ticket_hash: attempt.ticket_hash, phase: attempt.phase,
+  requests: attempt.requests.map((request) => ({ id: request.id, state: request.state, status: request.status ?? null })),
+  native_outcome: attempt.native_outcome ?? null, native_reason: safeReason(attempt.native_reason),
+  deadline: attempt.deadline, revoked: Boolean(attempt.revoked),
 });
 const publicJob = (job, now, attentionAfterMs) => ({
   kind: job.kind, id: text(job.id, 256), camera: text(job.camera), event_time: job.event_time,
   state: job.state, reason: safeReason(job.reason), attempts: job.attempts,
+  phase: job.state === 'waiting_result' ? job.attempt?.phase ?? 'legacy_confirmation' : null,
   failures: counter(job.failures), first_failed_at: job.first_failed_at ?? null,
   last_attempt_at: job.last_attempt_at ?? null,
   needs_attention: STATES.has(job.state) && Number.isFinite(job.first_failed_at)
@@ -106,8 +121,9 @@ function emptyState(now, origin) {
 }
 
 /** Persistent descriptions-to-do list, never an archive of HTTP/image payloads.
- * Native regeneration is an asynchronous handoff. At most one handoff is
- * outstanding; completion is confirmed by reading Frigate's saved metadata.
+ * Native regeneration is an asynchronous handoff. Correlated bridge attempts
+ * separate serial execution from bounded saved-result verification. Without
+ * that verified capability, the original conservative single handoff remains.
  */
 export class FrigateCatchup {
   constructor(config, { logger, canRun = () => false, clock = () => Date.now(), client, onChange = () => {} } = {}) {
@@ -158,20 +174,47 @@ export class FrigateCatchup {
       return;
     }
     try {
-      if (raw.schema_version === SCHEMA && typeof raw.origin === 'string' && raw.origin !== this.origin) {
+      if ([1, SCHEMA].includes(raw.schema_version) && typeof raw.origin === 'string' && raw.origin !== this.origin) {
         this.storeError = 'backlog_origin_changed';
         return;
       }
-      if (raw.schema_version !== SCHEMA || raw.origin !== this.origin || !Number.isFinite(raw.enabled_at)
+      if (![1, SCHEMA].includes(raw.schema_version) || raw.origin !== this.origin || !Number.isFinite(raw.enabled_at)
         || !raw.watermarks || !raw.scans?.automatic || !raw.scans?.manual || !Array.isArray(raw.jobs)
         || !Array.isArray(raw.recent) || raw.jobs.length > 100_000) throw new Error('invalid');
       const ids = new Set();
+      const attempts = new Set();
       for (const job of raw.jobs) {
         if (!KINDS.includes(job.kind) || typeof job.id !== 'string' || !job.id || job.id.length > 256
           || typeof job.camera !== 'string' || job.camera.length > 256 || !STATES.has(job.state)
           || !Number.isFinite(job.event_time) || !Number.isFinite(job.next_attempt_at)
           || !Number.isSafeInteger(job.attempts) || job.attempts < 0 || ids.has(key(job.kind, job.id))) throw new Error('invalid_job');
         ids.add(key(job.kind, job.id));
+        if (job.attempt) {
+          const attempt = job.attempt;
+          if (raw.schema_version !== SCHEMA || !/^[a-f0-9]{64}$/.test(attempt.ticket_hash)
+            || attempts.has(attempt.ticket_hash)
+            || !ATTEMPT_PHASES.has(attempt.phase) || !Number.isFinite(attempt.deadline)
+            || !Array.isArray(attempt.requests) || attempt.requests.length > 16
+            || ![null, 'success', 'failed'].includes(attempt.native_outcome ?? null)
+            || new Set(attempt.requests.map((request) => request.id)).size !== attempt.requests.length
+            || attempt.requests.some((request) => typeof request.id !== 'string' || !request.id || request.id.length > 256
+              || !REQUEST_STATES.has(request.state) || (request.status !== null && request.status !== undefined
+                && (!Number.isInteger(request.status) || request.status < 100 || request.status > 599)))) throw new Error('invalid_attempt');
+          if (attempt.phase === 'verifying_saved' && (attempt.native_outcome !== 'success' || outstanding(attempt))) {
+            throw new Error('invalid_verification');
+          }
+          if (job.state !== 'waiting_result' && attempt.phase !== 'retired') throw new Error('invalid_attempt_state');
+          if ((attempt.phase === 'retired' || attempt.phase === 'verifying_saved') && outstanding(attempt)) {
+            throw new Error('invalid_terminal_attempt');
+          }
+          if (Boolean(attempt.revoked) !== ['retired', 'verifying_saved'].includes(attempt.phase)
+            || (attempt.phase === 'handed_off' && (attempt.native_outcome || outstanding(attempt)))
+            || (['queued', 'running'].includes(attempt.phase) && !outstanding(attempt))
+            || (attempt.phase === 'uncertain' && !attempt.requests.some((request) => request.state === 'uncertain'))) {
+            throw new Error('invalid_attempt_phase');
+          }
+          attempts.add(attempt.ticket_hash);
+        }
         // Keep waiting_result intact: a restart is not evidence the earlier
         // native request stopped. Verify it before contemplating another PUT.
       }
@@ -185,7 +228,8 @@ export class FrigateCatchup {
               || scan.seen.some((id) => typeof id !== 'string' || id.length > 264))))) throw new Error('invalid_scan');
         }
       }
-      if (raw.jobs.filter((job) => job.state === 'waiting_result').length > 1) throw new Error('multiple_handoffs');
+      if (raw.jobs.filter(holdsSlot).length > 1) throw new Error('multiple_handoffs');
+      if (raw.jobs.filter((job) => job.attempt?.phase === 'verifying_saved').length > 16) throw new Error('too_many_verifications');
       if (raw.suppressed !== undefined && (!Array.isArray(raw.suppressed) || raw.suppressed.length > SUPPRESSION_LIMIT
         || raw.suppressed.some((entry) => !KINDS.includes(entry.kind) || typeof entry.id !== 'string'
           || !entry.id || entry.id.length > 256 || !MEDIA_REASONS.has(entry.reason)
@@ -203,6 +247,16 @@ export class FrigateCatchup {
         totals: Object.fromEntries(['completed', 'skipped', 'retry_attempts'].map((name) => [name, counter(raw.totals?.[name])])),
         eligibility_skipped: Object.fromEntries([...ELIGIBILITY_REASONS].map((reason) => [reason, counter(raw.eligibility_skipped?.[reason])])),
       };
+      let changedOnRestore = raw.schema_version !== SCHEMA;
+      for (const job of this.state.jobs) {
+        if (job.attempt?.requests.some((request) => ['queued', 'running'].includes(request.state))) {
+          for (const request of job.attempt.requests) if (['queued', 'running'].includes(request.state)) request.state = 'uncertain';
+          job.attempt.phase = 'uncertain';
+          job.reason = 'generation_uncertain';
+          job.first_failed_at ??= this.clock();
+          changedOnRestore = true;
+        }
+      }
       for (const mode of ['automatic', 'manual']) for (const kind of KINDS) {
         const scan = raw.scans[mode][kind];
         if (scan) this.state.scans[mode][kind] = {
@@ -217,6 +271,9 @@ export class FrigateCatchup {
           recheck_after: (job.completed_at ?? this.clock()) + SUPPRESSION_TTL,
         })).filter((entry) => entry.recheck_after > this.clock());
       }
+      // Persist migration and the first time restart uncertainty was observed;
+      // repeated restarts must not reset the needs-attention clock.
+      if (changedOnRestore) this.persist();
     } catch {
       this.storeError = 'backlog_state_invalid';
     }
@@ -340,11 +397,15 @@ export class FrigateCatchup {
         : this.lastError ? 'degraded' : 'running',
       enabled_at: this.state?.enabled_at ?? null,
       capabilities: { ...this.capabilities }, counts,
+      bridge_mode: this.capabilities.bridge === true ? 'correlated' : 'conservative',
+      verifying_count: (this.state?.jobs ?? []).filter((job) => job.state === 'waiting_result' && job.attempt?.phase === 'verifying_saved').length,
+      max_verifying: this.settings.max_verifying ?? 4,
+      requires_recovery: this.requiresRecovery,
       views, attention_count: views.attention, history_limit: this.settings.history_limit ?? HISTORY_LIMIT,
       total_queued: Object.values(counts).reduce((sum, value) => sum + value, 0),
       totals: { ...(this.state?.totals ?? {}) },
-      active_job: this.state?.jobs.find((job) => job.state === 'waiting_result')
-        ? this.publicJob(this.state.jobs.find((job) => job.state === 'waiting_result')) : null,
+      active_job: this.state?.jobs.find(holdsSlot)
+        ? this.publicJob(this.state.jobs.find(holdsSlot)) : null,
       recent_jobs: (this.state?.recent ?? []).slice(-30).reverse().map((job) => this.publicJob(job)),
       pending_jobs: queueItems, queue_items: queueItems,
       eligibility_skipped: { ...(this.state?.eligibility_skipped ?? {}) },
@@ -367,6 +428,116 @@ export class FrigateCatchup {
 
   publicJob(job) {
     return publicJob(job, this.clock(), this.settings.attentionAfterMs ?? 86_400_000);
+  }
+
+  get requiresRecovery() {
+    return (this.state?.jobs ?? []).some((job) => job.attempt?.requests.some((request) => request.state === 'uncertain'));
+  }
+
+  findAttempt(reference) {
+    return reference && this.state?.jobs.find((job) => job.attempt?.ticket_hash === reference);
+  }
+
+  requireAttempt(ticket, allowRetired = false) {
+    if (!this.running || this.storeError || !this.state) throw new FrigateError('catchup_unavailable', 503);
+    const hash = ticketHash(ticket);
+    if (!hash) throw new FrigateError('invalid_attempt_ticket', 401);
+    const job = this.findAttempt(hash) ?? (allowRetired
+      ? this.state.recent.findLast((entry) => entry.attempt?.ticket_hash === hash) : null);
+    if (!job || (!allowRetired && job.attempt.revoked)) throw new FrigateError('stale_attempt_ticket', 409);
+    return job;
+  }
+
+  claimInference(ticket, requestId) {
+    const job = this.requireAttempt(ticket);
+    const attempt = job.attempt;
+    if (job.state !== 'waiting_result' || attempt.native_outcome || this.requiresRecovery
+      || outstanding(attempt) || this.clock() >= attempt.deadline || attempt.requests.length >= 16
+      || typeof requestId !== 'string' || !requestId || requestId.length > 256
+      || attempt.requests.some((request) => request.id === requestId)) throw new FrigateError('attempt_not_accepting', 409);
+    attempt.requests.push({ id: requestId, state: 'queued', status: null });
+    attempt.phase = 'queued';
+    if (!this.persist()) throw new FrigateError('catchup_unavailable', 503);
+    return attempt.ticket_hash;
+  }
+
+  inferenceStarted(reference, requestId) {
+    const job = this.findAttempt(reference);
+    const request = job?.attempt.requests.find((entry) => entry.id === requestId);
+    if (!job || !this.running || this.storeError || request?.state !== 'queued') {
+      throw new FrigateError('attempt_not_accepting', this.storeError ? 503 : 409);
+    }
+    request.state = 'running';
+    job.attempt.phase = 'running';
+    if (!this.persist()) throw new FrigateError('catchup_unavailable', 503);
+  }
+
+  inferenceFinished(reference, requestId, { certain, status } = {}) {
+    const job = this.findAttempt(reference);
+    const request = job?.attempt.requests.find((entry) => entry.id === requestId);
+    if (!request || request.state === 'finished' || request.state === 'uncertain') return;
+    request.state = certain === true ? 'finished' : 'uncertain';
+    request.status = Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
+    if (certain !== true) {
+      job.attempt.phase = 'uncertain';
+      job.reason = 'generation_uncertain';
+      job.first_failed_at ??= this.clock();
+    } else if (!outstanding(job.attempt)) {
+      job.attempt.phase = 'handed_off';
+      // The bridge may still process this response or make a further serial
+      // provider call. Its final callback, not one HTTP result, ends the attempt.
+      job.attempt.deadline = this.clock() + (this.settings.generationTimeoutMs ?? 600_000);
+      job.next_attempt_at = job.attempt.deadline;
+    }
+    this.reconcileAttempt(job);
+    if (!this.persist()) throw new FrigateError('catchup_unavailable', 503);
+    this.scheduleConfirmation(0);
+  }
+
+  reportAttempt(ticket, { outcome, reason } = {}) {
+    const job = this.requireAttempt(ticket, true);
+    if (!['success', 'failed'].includes(outcome)) throw new FrigateError('invalid_attempt_outcome', 400);
+    const attempt = job.attempt;
+    if (attempt.native_outcome) {
+      if (attempt.native_outcome !== outcome) throw new FrigateError('attempt_already_reported', 409);
+      return { accepted: true };
+    }
+    if (attempt.revoked) throw new FrigateError('stale_attempt_ticket', 409);
+    attempt.native_outcome = outcome;
+    attempt.native_reason = outcome === 'failed' ? safeReason(reason || 'generation_failed') : null;
+    attempt.deadline = this.clock() + (this.settings.generationTimeoutMs ?? 600_000);
+    this.reconcileAttempt(job);
+    if (!this.persist()) throw new FrigateError('catchup_unavailable', 503);
+    this.scheduleConfirmation(0);
+    return { accepted: true };
+  }
+
+  reconcileAttempt(job) {
+    const attempt = job.attempt;
+    if (!attempt || job.state !== 'waiting_result' || !attempt.native_outcome || outstanding(attempt)) return;
+    attempt.revoked = true;
+    if (attempt.native_outcome === 'failed') {
+      const failedRequest = attempt.requests.findLast((request) => request.status >= 400);
+      this.retry(job, failedRequest ? `http_${failedRequest.status}` : attempt.native_reason || 'generation_failed');
+    } else {
+      attempt.phase = 'verifying_saved';
+      job.reason = 'generation_finished';
+      job.next_attempt_at = attempt.deadline;
+    }
+  }
+
+  acknowledgeRecovery() {
+    if (!this.requiresRecovery) return this.status();
+    this.requireAvailable();
+    for (const job of this.state.jobs) {
+      if (!job.attempt?.requests.some((request) => request.state === 'uncertain')) continue;
+      for (const request of job.attempt.requests) if (request.state === 'uncertain') request.state = 'finished';
+      job.attempt.revoked = true;
+      this.retry(job, 'recovery_verified');
+    }
+    if (!this.persist()) throw new FrigateError('catchup_unavailable', 503);
+    this.scheduleConfirmation(0);
+    return this.status();
   }
 
   jobs({ view = 'all', offset = 0, limit = 30 } = {}) {
@@ -594,6 +765,7 @@ export class FrigateCatchup {
 
   readiness() {
     if (!this.running || this.storeError) return false;
+    if (this.requiresRecovery) { this.blockedReason = 'generation_recovery_required'; return false; }
     const result = this.canRun();
     const allowed = typeof result === 'boolean' ? result : result?.allowed === true || result?.ready === true;
     if (!allowed) this.blockedReason = typeof result === 'object' ? text(result.reason, 80) || 'foreground_busy' : 'foreground_busy';
@@ -602,6 +774,12 @@ export class FrigateCatchup {
 
   finish(job, state, reason) {
     if (!this.state.jobs.includes(job)) return;
+    // Saved metadata can arrive before the provider HTTP response has drained.
+    // Keep the correlation guard until the actual request is terminal.
+    if (outstanding(job.attempt)) return;
+    if (job.state === 'waiting_result' && job.attempt && !job.attempt.native_outcome
+      && this.clock() < job.attempt.deadline) return;
+    if (job.attempt) { job.attempt.revoked = true; job.attempt.phase = 'retired'; }
     this.state.jobs = this.state.jobs.filter((other) => other !== job);
     this.state.recent.push({ ...job, state, reason, completed_at: this.clock(), next_attempt_at: null });
     this.state.recent = this.state.recent.slice(-(this.settings.history_limit ?? HISTORY_LIMIT));
@@ -616,6 +794,8 @@ export class FrigateCatchup {
   }
 
   retry(job, reason) {
+    if (outstanding(job.attempt)) return;
+    if (job.attempt) { job.attempt.revoked = true; job.attempt.phase = 'retired'; }
     const base = this.settings.retryIntervalMs ?? 60_000;
     job.failures = (job.failures ?? 0) + 1;
     job.first_failed_at ??= this.clock();
@@ -642,16 +822,24 @@ export class FrigateCatchup {
   }
 
   async runProcessJobs() {
-    const active = this.state.jobs.find((job) => job.state === 'waiting_result');
-    if (active) {
+    this.blockedReason = null;
+    const awaiting = this.state.jobs.filter((job) => job.state === 'waiting_result');
+    for (const active of awaiting) {
       await this.checkJob(active, true);
       // A confirmed saved description releases the handoff immediately. Merely
       // reaching its timeout never confirms failure, and still keeps retry grace.
-      if (this.state.jobs.some((job) => job.state === 'waiting_result')) return;
+    }
+    if (this.state.jobs.some(holdsSlot)) {
+      this.blockedReason = this.requiresRecovery ? 'generation_recovery_required' : 'generation_in_progress';
+      return;
+    }
+    if (this.state.jobs.filter((job) => job.state === 'waiting_result').length >= (this.settings.max_verifying ?? 4)) {
+      this.blockedReason = 'verification_capacity_reached';
+      return;
     }
     if (!this.runtimeConfig || !this.capabilities.checked) return;
     if (!this.readiness()) return;
-    const jobs = this.state.jobs.filter((job) => job.next_attempt_at <= this.clock())
+    const jobs = this.state.jobs.filter((job) => job.state !== 'waiting_result' && job.next_attempt_at <= this.clock())
       .sort((a, b) => b.event_time - a.event_time || a.id.localeCompare(b.id));
     // Bound metadata checks in one poll, including expired/disabled jobs.
     for (const job of jobs.slice(0, 10)) {
@@ -752,6 +940,16 @@ export class FrigateCatchup {
         return false;
       }
       if (verifyOnly) {
+        if (job.state !== 'waiting_result') return false;
+        if (job.attempt) {
+          if (outstanding(job.attempt)) return true;
+          if (this.clock() < job.next_attempt_at) return true;
+          // Revocation prevents a late bridge provider request from being
+          // accepted after this attempt's execution/confirmation deadline.
+          job.attempt.revoked = true;
+          this.retry(job, job.attempt.phase === 'verifying_saved' ? 'description_not_confirmed' : 'bridge_result_timeout');
+          return true;
+        }
         if (this.clock() < job.next_attempt_at) return true;
         // A timeout is not proof of failure. Require a foreground-idle window
         // before releasing our native handoff, then impose another retry grace.
@@ -813,15 +1011,24 @@ export class FrigateCatchup {
       job.attempts += 1;
       job.last_attempt_at = this.clock();
       job.next_attempt_at = this.clock() + (this.settings.generationTimeoutMs ?? 600_000);
+      const ticket = this.capabilities.bridge === true ? randomBytes(32).toString('hex') : undefined;
+      if (ticket) job.attempt = {
+        ticket_hash: ticketHash(ticket), phase: 'handed_off', requests: [], native_outcome: null,
+        native_reason: null, deadline: job.next_attempt_at, revoked: false,
+      };
+      else delete job.attempt;
       if (!this.persist() || !this.readiness()) {
-        if (!this.storeError) { job.state = 'pending'; this.persist(); }
+        if (!this.storeError) { job.state = 'pending'; delete job.attempt; this.persist(); }
         return false;
       }
       try {
-        await this.client.regenerate(job.kind, job.id, eligibility.source);
+        await this.client.regenerate(job.kind, job.id, eligibility.source, ticket);
         this.confirmationFailures = 0;
         this.confirmationBackoffUntil = 0;
       } catch (error) {
+        // Provider calls or a native callback may race the asynchronous PUT's
+        // response. Do not overwrite more authoritative correlated progress.
+        if (job.attempt?.native_outcome || job.attempt?.requests.length) return true;
         if ([400, 401, 403, 404, 405, 422, 429].includes(error.statusCode)) {
           // A missing regeneration route is not proof the event was deleted.
           // The next preflight GET will confirm deletion if that is the cause.

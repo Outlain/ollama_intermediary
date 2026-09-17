@@ -96,6 +96,7 @@ const DEFAULTS = {
     attention_after: '24h',
     request_timeout: '15s',
     generation_timeout: '10m',
+    max_verifying: 4,
     page_size: 100,
     max_jobs: 10000,
     history_limit: 1000,
@@ -239,6 +240,9 @@ function validate(config) {
   }
   if (!Number.isInteger(config.frigate.max_jobs) || config.frigate.max_jobs < 1 || config.frigate.max_jobs > 100000) {
     throw new Error('frigate.max_jobs must be between 1 and 100000');
+  }
+  if (!Number.isInteger(config.frigate.max_verifying) || config.frigate.max_verifying < 1 || config.frigate.max_verifying > 16) {
+    throw new Error('frigate.max_verifying must be between 1 and 16');
   }
   if (config.frigate.confirmationIntervalMs < 1000) {
     throw new Error('frigate.confirmation_interval must be at least 1s');

@@ -53,8 +53,8 @@ class FakeFrigate {
     return row;
   }
   async hasMedia() { return this.media; }
-  async regenerate(kind, id, source) {
-    this.calls.push({ kind, id, source });
+  async regenerate(kind, id, source, ticket) {
+    this.calls.push({ kind, id, source, ...(ticket ? { ticket } : {}) });
     if (this.regenerateError) throw this.regenerateError;
     return { accepted: true };
   }
@@ -82,7 +82,7 @@ function setup(t, overlay = {}, existing = {}) {
   clearTimers();
   t.after(() => worker.stop());
   const manual = () => { worker.scanMissing(); clearTimers(); };
-  return { worker, client, gate, clock, settings, directory, manual };
+  return { worker, client, gate, clock, settings, directory, manual, clearTimers };
 }
 
 test('changing the Frigate origin preserves old backlog and reports a specific host-change diagnostic', async (t) => {
@@ -884,4 +884,238 @@ test('malformed last-moment camera configuration cannot discard or dispatch a re
   assert.equal(job.reason, 'invalid_camera_configuration');
   assert.equal(context.worker.status().totals.skipped, 0);
   assert.equal(context.client.calls.length, 0);
+});
+
+function correlated(t, overlay = {}, count = 3) {
+  const context = setup(t, overlay);
+  for (let i = 0; i < count; i += 1) readyJob(context, `correlated-${i}`, 300 - i);
+  context.worker.capabilities.bridge = true;
+  context.client.support.bridge = true;
+  return context;
+}
+
+test('correlated native failure releases catch-up immediately but an unrelated HTTP failure cannot', async (t) => {
+  const context = correlated(t);
+  await context.worker.processJobs();
+  const { ticket } = context.client.calls[0];
+  const reference = context.worker.claimInference(ticket, 'request-1');
+  context.worker.inferenceStarted(reference, 'request-1');
+  context.worker.inferenceFinished('unrelated', 'request-1', { certain: true, status: 400 });
+  assert.equal(context.worker.status().active_job.phase, 'running');
+  context.worker.inferenceFinished(reference, 'request-1', { certain: true, status: 400 });
+  await context.worker.processJobs();
+  assert.equal(context.client.calls.length, 1, 'one HTTP failure is not the native attempt lifecycle');
+  context.worker.reportAttempt(ticket, { outcome: 'failed', reason: 'http_400' });
+  context.clearTimers();
+  assert.equal(context.worker.jobs({ view: 'retrying' }).items[0].reason, 'http_400');
+  assert.equal(context.worker.status().counts.retrying, 1);
+  await context.worker.processJobs();
+  assert.equal(context.client.calls.length, 2, 'next job does not wait for the old ten-minute window');
+  assert.equal(context.worker.state.jobs[0].failures, 1);
+  context.worker.reportAttempt(ticket, { outcome: 'failed', reason: 'http_400' });
+  context.clearTimers();
+  assert.equal(context.worker.state.jobs[0].failures, 1, 'duplicate callback cannot increment backoff twice');
+  assert.throws(() => context.worker.claimInference(ticket, 'late'), (error) => error.statusCode === 409);
+});
+
+test('native final before drained inference retains the slot, then verification pipelines bounded saved results', async (t) => {
+  const context = correlated(t, { max_verifying: 2 }, 4);
+  for (let i = 0; i < 2; i += 1) {
+    await context.worker.processJobs();
+    const { ticket } = context.client.calls[i];
+    const reference = context.worker.claimInference(ticket, `r-${i}`);
+    context.worker.reportAttempt(ticket, { outcome: 'success' });
+    context.clearTimers();
+    assert.ok(context.worker.status().active_job, 'native callback does not prove the HTTP stream has drained');
+    assert.throws(() => context.worker.claimInference(ticket, 'after-final'), (error) => error.statusCode === 409);
+    context.worker.inferenceFinished(reference, `r-${i}`, { certain: true, status: 200 });
+    context.clearTimers();
+    assert.equal(context.worker.status().active_job, null);
+    assert.equal(context.worker.status().verifying_count, i + 1);
+  }
+  await context.worker.processJobs();
+  assert.equal(context.client.calls.length, 2, 'verification capacity stops more handoffs');
+  assert.equal(context.worker.status().scan.blocked_reason, 'verification_capacity_reached');
+  context.client.rows.object[0].data.description = 'saved';
+  await context.worker.processJobs();
+  assert.equal(context.client.calls.length, 3);
+  assert.equal(context.worker.status().totals.completed, 1);
+  assert.equal(context.worker.status().verifying_count, 1);
+});
+
+test('one correlated native attempt can make multiple serial provider calls, never concurrent claims', async (t) => {
+  const context = correlated(t);
+  await context.worker.processJobs();
+  const { ticket } = context.client.calls[0];
+  const reference = context.worker.claimInference(ticket, 'first');
+  assert.throws(() => context.worker.claimInference(ticket, 'second'), (error) => error.statusCode === 409);
+  context.worker.inferenceFinished(reference, 'first', { certain: true, status: 200 });
+  context.clearTimers();
+  context.worker.claimInference(ticket, 'second');
+  context.worker.inferenceFinished(reference, 'second', { certain: true, status: 200 });
+  context.worker.reportAttempt(ticket, { outcome: 'success' });
+  context.clearTimers();
+  assert.equal(context.worker.status().verifying_count, 1);
+  assert.equal(context.worker.state.jobs[0].attempt.requests.length, 2);
+});
+
+test('saved metadata cannot erase an active or uncertain inference correlation; verified recovery is required', async (t) => {
+  const context = correlated(t);
+  await context.worker.processJobs();
+  const { ticket } = context.client.calls[0];
+  const reference = context.worker.claimInference(ticket, 'draining');
+  context.client.rows.object[0].data.description = 'already saved';
+  await context.worker.processJobs();
+  assert.equal(context.worker.status().totals.completed, 0);
+  context.worker.inferenceFinished(reference, 'draining', { certain: false, status: 200 });
+  context.worker.reportAttempt(ticket, { outcome: 'success' });
+  context.clearTimers();
+  context.clock.now += 100_000;
+  await context.worker.processJobs();
+  assert.equal(context.client.calls.length, 1);
+  assert.equal(context.worker.requiresRecovery, true);
+  assert.equal(context.worker.status().active_job.phase, 'uncertain');
+  context.worker.acknowledgeRecovery();
+  context.clearTimers();
+  assert.equal(context.worker.requiresRecovery, false);
+  assert.throws(() => context.worker.claimInference(ticket, 'stale'), (error) => error.statusCode === 409);
+  await context.worker.processJobs();
+  assert.equal(context.client.calls.length, 2);
+});
+
+test('restart restores in-flight correlation as uncertain but restores verification without blocking execution', async (t) => {
+  const context = correlated(t);
+  await context.worker.processJobs();
+  const first = context.client.calls[0].ticket;
+  const reference = context.worker.claimInference(first, 'first');
+  context.worker.inferenceFinished(reference, 'first', { certain: true, status: 200 });
+  context.worker.reportAttempt(first, { outcome: 'success' });
+  context.clearTimers();
+  await context.worker.processJobs();
+  context.worker.claimInference(context.client.calls[1].ticket, 'second');
+  await context.worker.stop();
+  const resumed = setup(t, {}, context);
+  assert.equal(resumed.worker.requiresRecovery, true);
+  assert.equal(resumed.worker.status().verifying_count, 1);
+  assert.equal(resumed.worker.status().active_job.phase, 'uncertain');
+  await resumed.worker.tick();
+  assert.equal(context.client.calls.length, 2);
+  resumed.worker.acknowledgeRecovery();
+  resumed.clearTimers();
+  await resumed.worker.processJobs();
+  assert.equal(context.client.calls.length, 3);
+});
+
+test('legacy schema migrates without discarding backlog or relaxing its conservative handoff', async (t) => {
+  const context = setup(t);
+  readyJob(context, 'legacy', 200);
+  await context.worker.processJobs();
+  await context.worker.stop();
+  const saved = JSON.parse(fs.readFileSync(context.settings.state_path, 'utf8'));
+  saved.schema_version = 1;
+  fs.writeFileSync(context.settings.state_path, JSON.stringify(saved));
+  const resumed = setup(t, {}, context);
+  assert.equal(resumed.worker.state.schema_version, 2);
+  assert.equal(resumed.worker.status().active_job.phase, 'legacy_confirmation');
+  assert.equal(resumed.worker.status().bridge_mode, 'conservative');
+  await resumed.worker.processJobs();
+  assert.equal(context.client.calls.length, 1);
+});
+
+test('bridge tickets are persisted only hashed and never exposed by public APIs', async (t) => {
+  const context = correlated(t);
+  await context.worker.processJobs();
+  const { ticket } = context.client.calls[0];
+  assert.match(ticket, /^[a-f0-9]{64}$/);
+  const reference = context.worker.claimInference(ticket, 'private-request');
+  assert.notEqual(reference, ticket);
+  const saved = fs.readFileSync(context.settings.state_path, 'utf8');
+  assert.ok(!saved.includes(ticket));
+  assert.ok(saved.includes(reference));
+  assert.ok(!JSON.stringify(context.worker.status()).includes(reference));
+  assert.ok(!JSON.stringify(context.worker.jobs()).includes(ticket));
+  assert.throws(() => context.worker.claimInference('bad-ticket', 'bad'), (error) => error.statusCode === 401);
+});
+
+test('expired bridge preparation or lost final callback revokes the ticket only with no outstanding request', async (t) => {
+  const context = correlated(t);
+  await context.worker.processJobs();
+  const { ticket } = context.client.calls[0];
+  context.clock.now += context.settings.generationTimeoutMs;
+  assert.throws(() => context.worker.claimInference(ticket, 'too-late'), (error) => error.statusCode === 409);
+  await context.worker.processJobs();
+  assert.equal(context.worker.state.jobs[0].reason, 'bridge_result_timeout');
+  assert.equal(context.client.calls.length, 2);
+  const second = context.client.calls[1].ticket;
+  const reference = context.worker.claimInference(second, 'second');
+  context.worker.inferenceFinished(reference, 'second', { certain: true, status: 200 });
+  context.clearTimers();
+  context.clock.now += context.settings.generationTimeoutMs;
+  await context.worker.processJobs();
+  assert.equal(context.worker.state.jobs[1].reason, 'bridge_result_timeout');
+  assert.throws(() => context.worker.reportAttempt(second, { outcome: 'success' }), (error) => error.statusCode === 409);
+});
+
+test('failed attempt persistence prevents native handoff or correlated inference admission', async (t) => {
+  const context = correlated(t);
+  const original = context.worker.persist.bind(context.worker);
+  context.worker.persist = () => { context.worker.storeError = 'backlog_state_write_failed'; return false; };
+  await context.worker.processJobs();
+  assert.equal(context.client.calls.length, 0);
+  context.worker.storeError = null;
+  context.worker.state.jobs[0].state = 'pending';
+  delete context.worker.state.jobs[0].attempt;
+  context.worker.persist = original;
+  await context.worker.processJobs();
+  context.worker.persist = () => { context.worker.storeError = 'backlog_state_write_failed'; return false; };
+  assert.throws(() => context.worker.claimInference(context.client.calls[0].ticket, 'request'), (error) => error.statusCode === 503);
+  await context.worker.processJobs();
+  assert.equal(context.client.calls.length, 1);
+});
+
+test('saved metadata before native final does not release a preparing bridge attempt', async (t) => {
+  const context = correlated(t);
+  await context.worker.processJobs();
+  const { ticket } = context.client.calls[0];
+  context.client.rows.object[0].data.description = 'saved early';
+  await context.worker.processJobs();
+  assert.equal(context.client.calls.length, 1);
+  assert.equal(context.worker.status().active_job.phase, 'handed_off');
+  context.worker.reportAttempt(ticket, { outcome: 'success' });
+  context.clearTimers();
+  await context.worker.processJobs();
+  assert.equal(context.client.calls.length, 2);
+  assert.equal(context.worker.status().totals.completed, 1);
+  assert.deepEqual(context.worker.reportAttempt(ticket, { outcome: 'success' }), { accepted: true });
+});
+
+test('final lifecycle persistence failure is surfaced and empty recovery acknowledgement is harmless', async (t) => {
+  const disabled = new FrigateCatchup({ enabled: false });
+  assert.doesNotThrow(() => disabled.acknowledgeRecovery());
+  const context = correlated(t);
+  await context.worker.processJobs();
+  const reference = context.worker.claimInference(context.client.calls[0].ticket, 'r');
+  context.worker.persist = () => { context.worker.storeError = 'backlog_state_write_failed'; return false; };
+  assert.throws(() => context.worker.inferenceFinished(reference, 'r', { certain: true, status: 400 }),
+    (error) => error.statusCode === 503);
+});
+
+test('invalid duplicate tickets and terminal attempts with outstanding requests fail closed on restore', async (t) => {
+  for (const mutation of ['duplicate', 'outstanding', 'unrevoked']) {
+    const context = correlated(t);
+    await context.worker.processJobs();
+    context.worker.reportAttempt(context.client.calls[0].ticket, { outcome: 'success' });
+    context.clearTimers();
+    await context.worker.stop();
+    const saved = JSON.parse(fs.readFileSync(context.settings.state_path, 'utf8'));
+    const attempt = saved.jobs[0].attempt;
+    if (mutation === 'duplicate') {
+      saved.jobs[1].state = 'waiting_result';
+      saved.jobs[1].attempt = structuredClone(attempt);
+    } else if (mutation === 'outstanding') attempt.requests = [{ id: 'r', state: 'queued', status: null }];
+    else attempt.revoked = false;
+    fs.writeFileSync(context.settings.state_path, JSON.stringify(saved));
+    const resumed = setup(t, {}, context);
+    assert.equal(resumed.worker.status().last_error, 'backlog_state_invalid');
+  }
 });

@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { BackendClient, BackendState, OperationGate } from './backend.js';
 import { Classifier, classifyEndpoint, isSafeMetadataEndpoint, isStreaming } from './classifier.js';
@@ -123,6 +124,9 @@ export class ProxyService {
     this.running = true;
     this.backend.start();
     this.catchup.start();
+    if (this.catchup.requiresRecovery) {
+      this.backend.requireRecovery('A restored catch-up inference has unknown completion; verify Ollama and GPU idle state before resuming');
+    }
     this.workerPromise = this.dispatchLoop();
     this.expiryTimer = setInterval(() => this.scheduler.expire(), Math.min(1_000, this.config.ollama.healthIntervalMs));
     this.expiryTimer.unref?.();
@@ -170,7 +174,9 @@ export class ProxyService {
       return this.settingsController.handle(request, response, url, id);
     }
     if (this.frigateController.handles(url.pathname)) {
-      if (this.settingsRestartPending && request.method !== 'GET') return sendJson(response, 503, { error: 'Settings restart pending.' }, id);
+      if (this.settingsRestartPending && request.method !== 'GET' && url.pathname !== '/_intermediary/v1/frigate/attempt') {
+        return sendJson(response, 503, { error: 'Settings restart pending.' }, id);
+      }
       return this.frigateController.handle(request, response, url, id);
     }
     if (url.pathname === '/_intermediary/v1/recovery/acknowledge') {
@@ -285,6 +291,7 @@ export class ProxyService {
       if (!this.maintenance.paused || this.maintenance.revision !== pauseRevision || this.settingsRestartPending) {
         return sendJson(response, 409, { error: 'Pause or settings state changed during verification. Recovery was not cleared; pause and verify again.', code: 'recovery_state_changed' }, id);
       }
+      if (this.catchup.requiresRecovery) this.catchup.acknowledgeRecovery();
       this.backend.clearRecovery();
       this.scheduler.reconcile(null);
       this.observability.record('gpu_recovery_acknowledged', { reason: 'operator_verified_gpu_and_empty_ollama' });
@@ -793,7 +800,10 @@ export class ProxyService {
       return sendJson(response, 400, { error: `model ${parsed.model} is not configured`, code: 'unknown_model' }, id);
     }
 
-    const identification = this.classifier.identify(request, parsed, forcedClient);
+    const ticket = request.headers['x-ollama-intermediary-attempt'];
+    const identification = ticket !== undefined
+      ? { client: 'frigate', method: 'catchup_attempt' }
+      : this.classifier.identify(request, parsed, forcedClient);
     const client = identification.client;
     const streaming = isStreaming(url.pathname, parsed);
     const originalBodyBytes = body.length;
@@ -806,11 +816,32 @@ export class ProxyService {
       requestSummary = minimalRequestSummary(originalBodyBytes);
     }
 
+    let attemptRef = null;
+    const attemptRequestId = ticket !== undefined ? randomUUID() : null;
+    if (ticket !== undefined) {
+      try {
+        if (!Object.hasOwn(this.config.clients, 'frigate')) {
+          return sendJson(response, 503, { error: 'Configure a Frigate client scheduling policy before using correlated catch-up.', code: 'catchup_policy_missing' }, id);
+        }
+        if (typeof ticket !== 'string' || !/^[a-f0-9]{64}$/.test(ticket) || !this.catchup.claimInference) {
+          return sendJson(response, 401, { error: 'A valid current catch-up attempt is required.', code: 'invalid_attempt_ticket' }, id);
+        }
+        attemptRef = this.catchup.claimInference(ticket, attemptRequestId);
+      } catch (error) {
+        return sendJson(response, [401, 409, 503].includes(error.statusCode) ? error.statusCode : 503, {
+          error: 'Catch-up attempt is unknown, expired, or unavailable.', code: 'catchup_attempt_rejected',
+        }, id);
+      }
+    }
+
     const upstreamController = new AbortController();
     const job = createJob({
       id,
       sequence: ++this.sequence,
       client,
+      trafficClass: attemptRef ? 'catchup' : 'live',
+      attemptRef,
+      attemptRequestId,
       identificationMethod: identification.method,
       model: parsed.model,
       pathname: url.pathname,
@@ -824,7 +855,7 @@ export class ProxyService {
       signal: upstreamController.signal,
       abortController: upstreamController,
       downstreamDisconnected: false,
-      dedupeKey: this.classifier.dedupeKey(client, request, parsed),
+      dedupeKey: attemptRef ? null : this.classifier.dedupeKey(client, request, parsed),
     });
     // Only the serialized body needs to survive a potentially long queue wait.
     // Do not retain a second object tree of prompts/base64 images in this frame.
@@ -869,6 +900,7 @@ export class ProxyService {
     const admission = this.scheduler.enqueue(job);
     if (!admission.accepted) {
       removeDisconnectListeners();
+      this.finishCatchupInference(job, { certain: true, status: admission.status });
       return sendJson(response, admission.status, { error: admission.message, code: admission.code }, id);
     }
     if (request.aborted || response.destroyed) disconnect();
@@ -876,6 +908,9 @@ export class ProxyService {
     const result = await job.result;
     if (result.type === 'local_error') {
       removeDisconnectListeners();
+      // Dispatched jobs are reported by dispatchLoop only after the physical
+      // gate is released. Queue rejections/cancellations never touched Ollama.
+      if (!job.dispatchedAt) this.finishCatchupInference(job, { certain: true, status: result.status });
       return sendJson(response, result.status, { error: result.message, code: result.code }, id);
     }
 
@@ -998,6 +1033,19 @@ export class ProxyService {
     return this.handlePassthrough(request, response, url, id, release);
   }
 
+  finishCatchupInference(job, outcome) {
+    if (!job.attemptRef || job.attemptReported) return;
+    job.attemptReported = true;
+    try {
+      this.catchup.inferenceFinished(job.attemptRef, job.attemptRequestId, outcome);
+    } catch {
+      // Never let a bookkeeping error break the dispatch loop or expose a
+      // ticket. Fail closed: an unrecorded terminal boundary needs recovery.
+      this.backend.requireRecovery('Catch-up inference completion could not be persisted');
+      this.scheduler.failQueued(503, 'gpu_recovery_required', 'GPU recovery verification is required before inference can resume');
+    }
+  }
+
   async dispatchLoop() {
     const signal = this.workerController.signal;
     while (!signal.aborted) {
@@ -1019,6 +1067,7 @@ export class ProxyService {
       job.phase = 'waiting_for_gate';
       let release;
       let finalEvent = null;
+      let catchupOutcome = null;
       const startedAt = Date.now();
       try {
         release = await this.gate.acquire('inference', job.signal);
@@ -1026,6 +1075,7 @@ export class ProxyService {
           await this.scheduler.waitForChange(Math.min(1_000, this.config.ollama.healthIntervalMs), job.signal);
         }
         if (job.signal.aborted) throw job.signal.reason;
+        if (job.attemptRef) this.catchup.inferenceStarted?.(job.attemptRef, job.attemptRequestId);
         if (job.switching && job.previousModel && this.config.gpu_safety.unload_on_model_switch) {
           job.phase = 'unloading_model';
           const unloadStartedAt = Date.now();
@@ -1108,6 +1158,7 @@ export class ProxyService {
         }
         const failed = outcome.status >= 400 || Boolean(outcome.inferenceError || outcome.error);
         const finalStatus = failed && outcome.status < 400 ? 502 : outcome.status;
+        catchupOutcome = { certain: !outcome.completionUncertain, status: finalStatus };
         const failureReason = outcome.completionUncertain ? 'upstream_completion_uncertain'
           : outcome.inferenceError ? 'upstream_inference_error' : 'upstream_http_error';
         this.logger[failed ? 'error' : 'info'](failed ? 'request failed' : 'request completed', {
@@ -1128,6 +1179,10 @@ export class ProxyService {
           response: outcome.responseStats,
         })];
       } catch (error) {
+        catchupOutcome = {
+          certain: !['connecting', 'running', 'streaming'].includes(job.phase),
+          status: 502,
+        };
         // A transport failure after sending the request does not establish that
         // Ollama stopped working. Even an abandoned client must hold admission
         // closed until recovery has been explicitly verified.
@@ -1175,6 +1230,7 @@ export class ProxyService {
       } finally {
         release?.();
         this.scheduler.complete(job);
+        this.finishCatchupInference(job, catchupOutcome ?? { certain: false, status: 502 });
         if (finalEvent) this.observability.record(finalEvent[0], finalEvent[1]);
       }
     }

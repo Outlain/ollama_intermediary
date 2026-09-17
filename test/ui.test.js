@@ -271,8 +271,41 @@ test('waiting result explains the confirmation window instead of implying active
   assert.equal(nodes.get('catchup-confirmation').hidden, false);
   assert.match(nodes.get('catchup-confirmation').textContent, /Confirmation window/);
   assert.match(nodes.get('catchup-confirmation').textContent, /not proof that the model is still generating/);
+  assert.match(nodes.get('catchup-bridge').textContent, /version-pinned Frigate bridge is required/);
   ui.renderCatchup({ enabled: true, active_job: { state: 'waiting_result', next_attempt_at: 1 } });
   assert.match(nodes.get('catchup-confirmation').textContent, /elapsed/);
+});
+
+test('correlated catch-up distinguishes active native generation from independent saved-result verification', async () => {
+  const { context, ui, nodes } = harness('dashboard');
+  ui.renderCatchup({ enabled: true, bridge_mode: 'correlated', max_verifying: 4, verifying_count: 2,
+    active_job: { kind: 'review', camera: 'Yard', state: 'waiting_result', phase: 'running' } });
+  assert.match(nodes.get('catchup-bridge').textContent, /Frigate bridge connected/);
+  assert.match(nodes.get('catchup-bridge').textContent, /Awaiting save: 2 \/ 4/);
+  assert.match(nodes.get('catchup-active').textContent, /Generating/);
+  assert.match(nodes.get('catchup-confirmation').textContent, /full native attempt outcome/);
+  assert.doesNotMatch(nodes.get('catchup-confirmation').textContent, /Confirmation window/);
+  ui.renderCatchup({ enabled: true, bridge_mode: 'correlated', max_verifying: 4, verifying_count: 2 });
+  assert.match(nodes.get('catchup-active').textContent, /No active background generation/);
+  assert.match(nodes.get('catchup-blocker').textContent, /another eligible job can start/);
+  assert.match(nodes.get('catchup-confirmation').textContent, /room for the next eligible generation/);
+  context.fetch = async () => ({ ok: true, json: async () => ({ offset: 0, total: 1,
+    items: [{ kind: 'review', id: 'one', state: 'waiting_result', phase: 'verifying_saved', next_attempt_at: Date.now() + 600000 }] }) });
+  await ui.changeCatchupView('awaiting');
+  assert.match(nodes.get('catchup-pending-jobs').textContent, /Awaiting saved description/);
+  assert.match(nodes.get('catchup-pending-jobs').textContent, /not active GPU work/);
+});
+
+test('verification capacity and uncertain recovery are explicit instead of implying an idle stall', () => {
+  const { ui, nodes } = harness('dashboard');
+  ui.renderCatchup({ enabled: true, bridge_mode: 'correlated', max_verifying: 4, verifying_count: 4 });
+  assert.match(nodes.get('catchup-blocker').textContent, /verification limit reached/);
+  assert.match(nodes.get('catchup-confirmation').textContent, /new handoffs wait for space/);
+  ui.renderCatchup({ enabled: true, bridge_mode: 'correlated', requires_recovery: true,
+    active_job: { kind: 'object', state: 'waiting_result', phase: 'uncertain' } });
+  assert.match(nodes.get('catchup-blocker').textContent, /Verify GPU recovery/);
+  assert.match(nodes.get('catchup-active').textContent, /Outcome uncertain/);
+  assert.match(nodes.get('catchup-confirmation').textContent, /idle dashboard alone is not proof/);
 });
 
 test('open API authentication does not become a red infrastructure error and explains no login', () => {

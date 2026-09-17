@@ -76,7 +76,8 @@ export class Scheduler {
     const replacements = [];
 
     if (job.dedupeKey) {
-      const duplicate = sameClient.find((item) => item.dedupeKey === job.dedupeKey);
+      const duplicate = sameClient.find((item) => item.dedupeKey === job.dedupeKey
+        && (item.trafficClass === 'catchup') === (job.trafficClass === 'catchup'));
       if (duplicate) {
         replacements.push({ job: duplicate, code: 'superseded', message: 'request was superseded by a newer equivalent request' });
         sameClient = sameClient.filter((item) => item !== duplicate);
@@ -84,8 +85,10 @@ export class Scheduler {
     }
 
     if (sameClient.length >= clientPolicy.queue_limit) {
-      if (clientPolicy.overflow_policy === 'drop_oldest') {
-        replacements.push({ job: sameClient[0], code: 'queue_overflow_drop_oldest', message: 'request was dropped to admit newer work' });
+      const victim = sameClient.find((item) => item.trafficClass === 'catchup')
+        ?? (job.trafficClass === 'catchup' ? null : sameClient[0]);
+      if (clientPolicy.overflow_policy === 'drop_oldest' && victim) {
+        replacements.push({ job: victim, code: 'queue_overflow_drop_oldest', message: 'request was dropped to admit newer work' });
       } else {
         const code = clientPolicy.overflow_policy === 'drop_newest' ? 'queue_overflow_drop_newest' : 'queue_full';
         this.metrics.increment('proxy_requests_dropped_total', { client: job.client, reason: code });
@@ -184,12 +187,15 @@ export class Scheduler {
     const result = [];
     for (const job of this.jobs) {
       if (job.state !== 'queued' || job.signal?.aborted) continue;
-      const key = `${job.client}\u0000${job.model}`;
+      const key = `${job.client}\u0000${job.model}\u0000${job.trafficClass === 'catchup' ? 'catchup' : 'live'}`;
       if (seen.has(key)) continue;
       seen.add(key);
       result.push(job);
     }
-    return result;
+    // Native catch-up may arrive after a live request was admitted. Do not let
+    // model affinity, aging, or an older same-model job hide live work.
+    const live = result.filter((job) => job.trafficClass !== 'catchup');
+    return live.length ? live : result;
   }
 
   best(candidates, now) {
@@ -230,6 +236,9 @@ export class Scheduler {
     this.expire(now);
     const candidates = this.candidates();
     if (!candidates.length) return { job: null, delayMs: null };
+    if (candidates.every((job) => job.trafficClass === 'catchup') && now < this.leaseUntil) {
+      return { job: null, delayMs: Math.max(1, this.leaseUntil - now), reason: 'model_lease' };
+    }
 
     const forced = candidates.filter((job) => job.maxWaitAt <= now);
     const forcedOther = forced.filter((job) => job.model !== this.currentModel);
@@ -321,7 +330,9 @@ export class Scheduler {
     const now = this.clock();
     this.active = null;
     this.lastActivity = now;
-    this.leaseUntil = now + this.modelPolicy(job.model, job.client).idleHoldMs;
+    // An idle hold protects follow-up live work, not a background batch from
+    // itself. Ollama keep_alive remains unchanged and keeps the model warm.
+    this.leaseUntil = now + (job.trafficClass === 'catchup' ? 0 : this.modelPolicy(job.model, job.client).idleHoldMs);
     this.leaseClient = job.client;
     this.wake();
   }

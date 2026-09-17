@@ -29,6 +29,50 @@ test('FIFO is preserved within a client and model', () => {
   assert.equal(scheduler.take().job.id, 'O2');
 });
 
+for (const mode of ['strict_priority', 'balanced']) {
+  test(`correlated catch-up cannot hide same-model live work in ${mode} mode`, () => {
+    const { scheduler, add, setNow } = harness({ scheduler: { mode }, models: { 'od-model': { idle_hold: '0ms' } },
+      clients: { frigate: { request_ttl: '30s' } } });
+    add('background', 'frigate', 'f-model', { trafficClass: 'catchup' });
+    setNow(10_000); // Even aged work never gains background precedence.
+    add('live', 'frigate', 'f-model');
+    add('interactive', 'odysseus', 'od-model');
+    const order = [];
+    while (scheduler.jobs.length) {
+      const selected = scheduler.take().job;
+      assert.ok(selected);
+      order.push(selected.id);
+      scheduler.complete(selected);
+    }
+    assert.deepEqual(order, ['interactive', 'live', 'background']);
+  });
+}
+
+test('background admission cannot evict live Frigate but fresh live work can evict background', async () => {
+  const { scheduler, add } = harness({ clients: { frigate: { queue_limit: 1 } } });
+  const live = add('live', 'frigate', 'f-model');
+  const background = createJob({ id: 'background', client: 'frigate', model: 'f-model', trafficClass: 'catchup', enqueuedAt: 0 });
+  assert.equal(scheduler.enqueue(background).accepted, false);
+  assert.equal(live.state, 'queued');
+  scheduler.cancel(live);
+  assert.equal(scheduler.enqueue(background).accepted, true);
+  add('fresh-live', 'frigate', 'f-model');
+  assert.equal((await background.result).code, 'queue_overflow_drop_oldest');
+});
+
+test('catch-up respects live idle holds but does not create an idle hold between background jobs', () => {
+  const { scheduler, add, setNow } = harness({ models: { 'f-model': { idle_hold: '3s' } },
+    clients: { frigate: { request_ttl: '30s' } } });
+  add('live', 'frigate', 'f-model');
+  scheduler.complete(scheduler.take().job);
+  add('background-1', 'frigate', 'f-model', { trafficClass: 'catchup' });
+  assert.equal(scheduler.take().reason, 'model_lease');
+  setNow(3_000);
+  scheduler.complete(scheduler.take().job);
+  add('background-2', 'frigate', 'f-model', { trafficClass: 'catchup' });
+  assert.equal(scheduler.take().job.id, 'background-2');
+});
+
 test('interactive priority wins when models begin queued together', () => {
   const { scheduler, add } = harness();
   add('F1', 'frigate', 'f-model');

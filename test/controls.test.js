@@ -45,7 +45,7 @@ test('catch-up status accepts read/admin tokens but historical scans require adm
   assert.equal(scans, 1);
   const snapshot = await (await fetch(`${base}/_intermediary/v1/status`, { headers: { authorization: 'Bearer read-test' } })).json();
   assert.equal(snapshot.frigate.enabled, true);
-  assert.equal(snapshot.build.version, '1.2.0');
+  assert.equal(snapshot.build.version, JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version);
 });
 
 test('GPU recovery acknowledgment requires admin, pause, empty models, and explicit host confirmation', async (t) => {

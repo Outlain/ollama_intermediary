@@ -68,6 +68,113 @@ test('only one generation request reaches Ollama at a time', async (t) => {
   assert.equal(mock.maxActive, 1);
 });
 
+test('correlated inference stays background, strips its ticket, and reports only after releasing the GPU gate', async (t) => {
+  const { mock, service, proxyUrl } = await setup(t, { models: { 'od-model': { idle_hold: '0ms' } } });
+  const ticket = 'b'.repeat(64);
+  const claims = [];
+  const completions = [];
+  const headers = [];
+  mock.server.on('request', (req) => headers.push(req.headers));
+  service.catchup.claimInference = (received, id) => {
+    assert.equal(received, ticket);
+    claims.push(id);
+    return 'test-attempt-reference';
+  };
+  service.catchup.inferenceStarted = () => {};
+  service.catchup.inferenceFinished = (ref, id, outcome) => {
+    assert.equal(ref, 'test-attempt-reference');
+    assert.equal(service.gate.active, false);
+    assert.equal(service.scheduler.active, null);
+    completions.push({ id, ...outcome });
+  };
+  const active = requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'active', delay_ms: 180 });
+  await waitFor(() => mock.order.includes('active'));
+  const background = requestJson(`${proxyUrl}/api/generate`, { model: 'f-model', id: 'background' }, {
+    'x-ollama-intermediary-attempt': ticket, 'x-request-id': 'caller-controlled-id', 'x-ollama-client': 'odysseus',
+  });
+  await waitFor(() => service.scheduler.jobs.length === 1);
+  assert.equal(service.scheduler.jobs[0].trafficClass, 'catchup');
+  assert.equal(service.scheduler.jobs[0].client, 'frigate');
+  const live = requestJson(`${proxyUrl}/api/generate`, { model: 'f-model', id: 'live' });
+  const interactive = requestJson(`${proxyUrl}/api/generate`, { model: 'od-model', id: 'interactive' });
+  await Promise.all((await Promise.all([active, background, live, interactive])).map((r) => r.text()));
+  await waitFor(() => completions.length === 1);
+  assert.deepEqual(mock.order, ['active', 'interactive', 'live', 'background']);
+  assert.equal(mock.maxActive, 1);
+  assert.equal(completions[0].certain, true);
+  assert.equal(completions[0].status, 200);
+  assert.notEqual(claims[0], 'caller-controlled-id');
+  assert.ok(headers.every((header) => !header['x-ollama-intermediary-attempt']));
+});
+
+test('invalid or stale attempt tickets never fall through as live inference', async (t) => {
+  const { mock, service, proxyUrl } = await setup(t);
+  service.catchup.claimInference = () => { throw Object.assign(new Error('stale'), { statusCode: 409 }); };
+  for (const [ticket, code] of [['bad', 401], ['c'.repeat(64), 409]]) {
+    const result = await requestJson(`${proxyUrl}/api/generate`, { model: 'f-model', id: 'forged' }, {
+      'x-ollama-intermediary-attempt': ticket,
+    });
+    assert.equal(result.status, code);
+    assert.doesNotMatch(await result.text(), new RegExp(ticket));
+  }
+  assert.deepEqual(mock.order, []);
+});
+
+test('missing Frigate scheduling policy is rejected before claiming an attempt', async (t) => {
+  const { service, proxyUrl, mock } = await setup(t);
+  delete service.config.clients.frigate;
+  let claims = 0;
+  service.catchup.claimInference = () => { claims += 1; return 'ref'; };
+  const result = await requestJson(`${proxyUrl}/api/generate`, { model: 'f-model' }, {
+    'x-ollama-intermediary-attempt': 'a'.repeat(64),
+  });
+  assert.equal(result.status, 503);
+  assert.equal((await result.json()).code, 'catchup_policy_missing');
+  assert.equal(claims, 0);
+  assert.equal(mock.order.length, 0);
+});
+
+test('native terminal reports use per-attempt authority rather than settings tokens, including during drain', async (t) => {
+  const { service, proxyUrl } = await setup(t);
+  const ticket = 'd'.repeat(64);
+  const reports = [];
+  service.catchup.reportAttempt = (received, outcome) => {
+    if (received !== ticket) throw Object.assign(new Error('unknown'), { statusCode: 409 });
+    reports.push(outcome);
+  };
+  const endpoint = `${proxyUrl}/_intermediary/v1/frigate/attempt`;
+  assert.equal((await requestJson(endpoint, { outcome: 'failed' })).status, 401);
+  assert.equal((await requestJson(endpoint, { outcome: 'failed' }, { 'x-ollama-intermediary-attempt': 'e'.repeat(64) })).status, 409);
+  assert.equal((await requestJson(endpoint, { outcome: 'invalid' }, { 'x-ollama-intermediary-attempt': ticket })).status, 400);
+  service.beginSettingsRestart();
+  const result = await requestJson(endpoint, { outcome: 'failed', reason: 'generation_failed' }, { 'x-ollama-intermediary-attempt': ticket });
+  assert.equal(result.status, 202);
+  assert.deepEqual(reports, [{ outcome: 'failed', reason: 'generation_failed' }]);
+});
+
+test('correlated HTTP 400 reports certain failure rather than waiting for a save window', async (t) => {
+  const { mock, service, proxyUrl } = await setup(t);
+  const finished = [];
+  service.catchup.claimInference = () => 'ref';
+  service.catchup.inferenceStarted = () => {};
+  service.catchup.inferenceFinished = (_ref, _id, outcome) => finished.push(outcome);
+  const original = mock.handle.bind(mock);
+  mock.handle = async (req, res) => {
+    if (req.url !== '/api/generate') return original(req, res);
+    await mock.body(req);
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: 'request exceeds available context size' }));
+  };
+  const result = await requestJson(`${proxyUrl}/api/generate`, { model: 'f-model', id: 'failed' }, {
+    'x-ollama-intermediary-attempt': 'f'.repeat(64),
+  });
+  await result.text();
+  await waitFor(() => finished.length === 1);
+  assert.equal(result.status, 400);
+  assert.deepEqual(finished[0], { certain: true, status: 400 });
+  assert.equal(service.backend.recoveryRequired, false);
+});
+
 test('repeated backend HTTP failures open the circuit breaker', async (t) => {
   const { mock, service, proxyUrl } = await setup(t);
   mock.failuresRemaining = 2;

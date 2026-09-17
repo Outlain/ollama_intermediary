@@ -93,7 +93,7 @@ test('catch-up cadence, cleanup, history, and attention options are editable and
   const currentOverrides = { clients: { frigate: { model_policy: { keep_alive: '15s' } } } };
   const draft = { frigate: {
     confirmation_interval: '3s', cleanup_interval: '2m', cleanup_batch_size: 20,
-    history_limit: 1500, attention_after: '24h',
+    history_limit: 1500, attention_after: '24h', max_verifying: 6,
   } };
   const result = validateSettingsDraft({ ...options, currentOverrides, draft });
   assert.equal(result.valid, true);
@@ -101,6 +101,7 @@ test('catch-up cadence, cleanup, history, and attention options are editable and
   assert.equal(result.effectiveConfig.frigate.cleanupIntervalMs, 120000);
   assert.equal(result.settings.frigate.cleanup_batch_size, 20);
   assert.equal(result.settings.frigate.history_limit, 1500);
+  assert.equal(result.settings.frigate.max_verifying, 6);
   assert.equal(result.effectiveConfig.frigate.attentionAfterMs, 24 * 3600000);
   assert.equal(result.effectiveConfig.frigate.maxRetryIntervalMs, 3600000);
   assert.equal(result.effectiveConfig.frigate.state_path, '/app/state/original-backlog.json');
@@ -116,13 +117,13 @@ test('catch-up cadence, cleanup, history, and attention options are editable and
 test('catch-up settings report all independent unsafe cadence and storage fields', (t) => {
   const result = validateSettingsDraft({ ...fixture(t), draft: { frigate: {
     confirmation_interval: '500ms', cleanup_interval: '9s', cleanup_batch_size: 101,
-    history_limit: 5001, attention_after: '0s',
+    history_limit: 5001, attention_after: '0s', max_verifying: 17,
   } } });
   assert.equal(result.valid, false);
   const invalid = result.diagnostics.filter((item) => item.severity === 'error');
   assert.deepEqual(invalid.map((item) => item.path).sort(), [
     'frigate.attention_after', 'frigate.cleanup_batch_size', 'frigate.cleanup_interval',
-    'frigate.confirmation_interval', 'frigate.history_limit',
+    'frigate.confirmation_interval', 'frigate.history_limit', 'frigate.max_verifying',
   ]);
   assert.ok(invalid.every((item) => item.code === 'out_of_range'));
 });

@@ -106,6 +106,7 @@ const EDITABLE_TREE = Object.freeze({
     attention_after: duration({ greaterThanZero: true }),
     request_timeout: duration({ greaterThanZero: true }),
     generation_timeout: duration({ greaterThanZero: true }),
+    max_verifying: integer({ min: 1, max: 16 }),
     page_size: integer({ min: 1, max: 1000 }),
     max_jobs: integer({ min: 1, max: 100000 }),
     history_limit: integer({ min: 1, max: 5000 }),

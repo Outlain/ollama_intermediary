@@ -161,7 +161,7 @@ frigate:
   auth_token: "${FRIGATE_AUTH_TOKEN:-}"
   verify_tls: true
   state_path: /app/state/frigate-backlog.json
-  # Discover new candidates slowly; confirm the single outstanding result faster.
+  # Discover new candidates slowly; confirm saved results independently.
   poll_interval: 30s
   confirmation_interval: 2s
   # Metadata/media availability cleanup does not use the GPU.
@@ -174,6 +174,9 @@ frigate:
   attention_after: 24h
   request_timeout: 15s
   generation_timeout: 10m
+  # With the pinned Frigate bridge: bounded completed attempts awaiting DB save.
+  # This never permits concurrent GPU inference or concurrent native attempts.
+  max_verifying: 4
   page_size: 100
   max_jobs: 10000
   # Completed/skipped metadata history; pending jobs have a separate limit above.

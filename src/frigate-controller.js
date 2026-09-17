@@ -26,6 +26,7 @@ export class FrigateController {
 
   async handle(request, response, url, id) {
     response.setHeader('cache-control', 'no-store');
+    if (url.pathname === `${PREFIX}/attempt`) return this.handleAttempt(request, response, id);
     if (request.method === 'GET' && [PREFIX, `${PREFIX}/status`, `${PREFIX}/jobs`].includes(url.pathname)) {
       if (!authorized(request, this.readToken) && !(this.controlToken && authorized(request, this.controlToken))) {
         return sendJson(response, 401, { error: 'Observability or settings token required.', code: 'unauthorized' }, id);
@@ -71,6 +72,34 @@ export class FrigateController {
       const code = ACTION_ERRORS.has(error.code) ? error.code : 'catchup_action_unavailable';
       const status = [404, 409, 503].includes(error.statusCode || error.status) ? error.statusCode || error.status : 409;
       return sendJson(response, status, { error: 'The action could not be scheduled. Check the job state and catch-up status.', code }, id);
+    }
+  }
+
+  async handleAttempt(request, response, id) {
+    if (request.method !== 'POST') {
+      response.setHeader('allow', 'POST');
+      return sendJson(response, 405, { error: 'Use POST.' }, id);
+    }
+    const ticket = request.headers['x-ollama-intermediary-attempt'];
+    if (typeof ticket !== 'string' || !/^[a-f0-9]{64}$/.test(ticket)) {
+      return sendJson(response, 401, { error: 'A valid attempt ticket is required.', code: 'invalid_attempt_ticket' }, id);
+    }
+    if (!String(request.headers['content-type'] || '').toLowerCase().startsWith('application/json')) {
+      return sendJson(response, 415, { error: 'Use application/json.' }, id);
+    }
+    let body;
+    try { body = JSON.parse((await readBody(request, 1024)).toString('utf8')); }
+    catch (error) { return sendJson(response, error.statusCode || 400, { error: 'Invalid attempt report.' }, id); }
+    if (!body || !['success', 'failed'].includes(body.outcome)
+      || (body.reason !== undefined && (typeof body.reason !== 'string' || !/^(?:[a-z_]{1,64}|http_[1-5][0-9]{2})$/.test(body.reason)))) {
+      return sendJson(response, 400, { error: 'Invalid attempt outcome.' }, id);
+    }
+    try {
+      await this.catchup.reportAttempt(ticket, { outcome: body.outcome, reason: body.reason });
+      return sendJson(response, 202, { accepted: true }, id);
+    } catch (error) {
+      const status = [401, 409, 503].includes(error.statusCode) ? error.statusCode : 503;
+      return sendJson(response, status, { error: 'Attempt report rejected; it is unknown, expired, or unavailable.', code: 'attempt_report_rejected' }, id);
     }
   }
 }

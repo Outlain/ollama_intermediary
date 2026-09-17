@@ -24,7 +24,8 @@ export async function readBody(request, limit) {
 export function copyRequestHeaders(headers, backendUrl, requestIdValue) {
   const result = {};
   for (const [name, value] of Object.entries(headers)) {
-    if (!HOP_BY_HOP.has(name.toLowerCase()) && name.toLowerCase() !== 'host' && value !== undefined) result[name] = value;
+    if (!HOP_BY_HOP.has(name.toLowerCase()) && name.toLowerCase() !== 'host'
+      && name.toLowerCase() !== 'x-ollama-intermediary-attempt' && value !== undefined) result[name] = value;
   }
   result.host = new URL(backendUrl).host;
   result['x-request-id'] = requestIdValue;

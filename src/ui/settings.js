@@ -569,8 +569,11 @@
         setText('catchup-status', 'Objects: ' + (data.capabilities && data.capabilities.object ? 'supported' : 'not verified')
           + ' · Reviews: ' + (data.capabilities && data.capabilities.review ? 'supported' : 'not verified')
           + ' · Waiting: ' + ((counts.pending || 0) + (counts.waiting_live || 0))
-          + ' · Awaiting saved result: ' + (counts.waiting_result || 0) + ' · Retrying: ' + (counts.retrying || 0)
+          + ' · Generation / unconfirmed: ' + (counts.waiting_result || 0) + ' · Retrying: ' + (counts.retrying || 0)
           + ' · Needs attention: ' + (data.attention_count || 0)
+          + (data.bridge_mode === 'correlated'
+            ? ' · Frigate bridge connected · Awaiting save: ' + (data.verifying_count || 0) + ' / ' + (data.max_verifying || 4)
+            : ' · Compatibility mode: install the pinned Frigate bridge for faster correlated catch-up; otherwise one unconfirmed handoff is the safe limit.')
           + (data.last_error ? ' · ' + (data.last_error.message || data.last_error.code || data.last_error) : ''));
       } catch (_) {
         if (workspaceVisible && !document.hidden) setText('catchup-status', 'Catch-up status could not refresh. Retrying automatically; your draft is unchanged.');

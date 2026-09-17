@@ -16,6 +16,7 @@ test('catch-up is opt-in and strict scheduling defaults preserve arbitrary model
   assert.equal(config.frigate.cleanupIntervalMs, 60000);
   assert.equal(config.frigate.cleanup_batch_size, 25);
   assert.equal(config.frigate.history_limit, 1000);
+  assert.equal(config.frigate.max_verifying, 4);
   assert.equal(config.frigate.maxRetryIntervalMs, 5 * 60 * 60 * 1000);
   assert.equal(config.frigate.attentionAfterMs, 24 * 60 * 60 * 1000);
   assert.equal(config.scheduler.mode, 'strict_priority');
@@ -29,11 +30,13 @@ test('catch-up cadence, cleanup, and retained history bounds prevent unbounded w
     cleanup_interval: ['0s', '9999ms'],
     cleanup_batch_size: [0, 101, 1.5],
     history_limit: [0, 5001, 1.5],
+    max_verifying: [0, 17, 1.5],
     attention_after: ['0s'],
   })) {
     for (const value of values) assert.throws(() => normalized({ [field]: value }), new RegExp(`frigate\\.${field}`));
   }
   assert.doesNotThrow(() => normalized({ confirmation_interval: '1s', cleanup_interval: '10s', cleanup_batch_size: 100, history_limit: 5000 }));
+  assert.doesNotThrow(() => normalized({ max_verifying: 16 }));
 });
 
 test('new catch-up defaults do not replace existing retry or model policies', () => {

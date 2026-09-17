@@ -54,6 +54,30 @@ test('Frigate native generation uses PUT for objects and reviews and never force
   ]);
 });
 
+test('correlation requires the explicit supported bridge contract and keeps tickets out of URLs', async (t) => {
+  let protocol = 'ollama-intermediary-v1';
+  const { client, requests } = await server(t, (request, response) => {
+    if (request.url.endsWith('/openapi.json')) return json(response, { paths: {
+      '/events/{event_id}/description/regenerate': { put: {} },
+      '/review/{review_id}/regenerate_description': { put: {} },
+      '/intermediary/capabilities': { get: {} },
+    } });
+    if (request.url.endsWith('/intermediary/capabilities')) return json(response, {
+      protocol, object: true, review: true, completion_reports: true,
+    });
+    return json(response, { success: true });
+  });
+  assert.deepEqual(await client.capabilities(), { object: true, review: true, bridge: true });
+  protocol = 'unknown-version';
+  assert.equal((await client.capabilities()).bridge, false);
+  const ticket = 'a'.repeat(64);
+  await client.regenerate('review', 'review-1', 'recordings', ticket);
+  assert.equal(requests.at(-1).headers['x-ollama-intermediary-attempt'], ticket);
+  assert.doesNotMatch(requests.at(-1).url, /aaaa/);
+  assert.equal(requests.at(-1).body, '');
+  await assert.rejects(client.regenerate('review', 'review-1', 'recordings', 'not-a-ticket'), { code: 'invalid_attempt_ticket' });
+});
+
 test('Frigate login uses native user/password body, cookie and one refresh after 401', async (t) => {
   let loginCount = 0;
   let getCount = 0;

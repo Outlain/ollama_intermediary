@@ -45,7 +45,7 @@ export class FrigateClient {
     this.httpsAgent.destroy();
   }
 
-  async raw(route, { method = 'GET', query, body, discard = false, media = false, authenticated = true } = {}) {
+  async raw(route, { method = 'GET', query, body, discard = false, media = false, authenticated = true, attemptTicket } = {}) {
     if (this.closed) throw new FrigateError('stopped');
     const url = new URL(route.replace(/^\//, ''), this.base);
     if (query) for (const [key, value] of Object.entries(query)) {
@@ -55,6 +55,10 @@ export class FrigateClient {
     // Frigate's nginx otherwise caches successful API GETs for five seconds.
     // A cached empty description can race a live completion and cause overwrite.
     const headers = { accept: discard ? '*/*' : 'application/json', 'x-cache-bypass': '1' };
+    if (attemptTicket !== undefined) {
+      if (typeof attemptTicket !== 'string' || !/^[a-f0-9]{64}$/.test(attemptTicket)) throw new FrigateError('invalid_attempt_ticket');
+      headers['x-ollama-intermediary-attempt'] = attemptTicket;
+    }
     if (authenticated) {
       if (this.authMode === 'token' && this.settings.auth_token) headers.authorization = `Bearer ${this.settings.auth_token}`;
       else if (this.authMode === 'password' && this.cookie) headers.cookie = this.cookie;
@@ -148,7 +152,15 @@ export class FrigateClient {
     const schema = await this.request('openapi.json');
     if (!schema?.paths || typeof schema.paths !== 'object') throw new FrigateError('invalid_api_schema');
     const supports = (route) => Boolean(schema.paths[route]?.put || schema.paths[`/api${route}`]?.put);
-    return { object: supports(ROUTES.object), review: supports(ROUTES.review) };
+    const result = { object: supports(ROUTES.object), review: supports(ROUTES.review) };
+    // Stock builds remain conservative. Only an explicit versioned contract,
+    // never a Frigate version string or a successful PUT, enables pipelining.
+    if (schema.paths['/intermediary/capabilities']?.get || schema.paths['/api/intermediary/capabilities']?.get) {
+      const bridge = await this.request('intermediary/capabilities');
+      result.bridge = bridge?.protocol === 'ollama-intermediary-v1' && bridge.completion_reports === true
+        && bridge.object === true && bridge.review === true;
+    }
+    return result;
   }
 
   getConfig() { return this.request('config'); }
@@ -201,11 +213,11 @@ export class FrigateClient {
     }
   }
 
-  async regenerate(kind, id, source) {
+  async regenerate(kind, id, source, attemptTicket) {
     const result = await this.request(kind === 'object'
       ? `events/${encodeURIComponent(id)}/description/regenerate`
       : `review/${encodeURIComponent(id)}/regenerate_description`, {
-      method: 'PUT', ...(kind === 'object' ? { query: { source, force: false } } : {}),
+      method: 'PUT', attemptTicket, ...(kind === 'object' ? { query: { source, force: false } } : {}),
     });
     if (result?.success !== true) throw new FrigateError('generation_not_accepted');
     // Both 200 (objects) and 202 (reviews) only acknowledge dispatch, not completion.
