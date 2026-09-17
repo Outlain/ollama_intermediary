@@ -29,6 +29,7 @@ jobs:
         run: |
           npm run check:public
           npm test
+          python3 -m unittest discover -s integrations/host -p 'test_*.py' -v
 
       - name: Compute image name
         id: image

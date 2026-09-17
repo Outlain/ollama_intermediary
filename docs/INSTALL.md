@@ -112,14 +112,14 @@ docker compose up -d
 
 The supplied configuration enables GPU-safety draining, unload-before-switch, and latched ROCm OOM recovery. Keep the `gpu_safety` section enabled unless you are deliberately diagnosing one of those mechanisms.
 
-If `/readyz` later reports `recovery_required`, inspect the host with:
+If `/readyz` later reports `recovery_required` and optional automatic recovery is not enabled or is blocked, inspect the host with:
 
 ```sh
 ollama ps
 sudo rocm-smi --showmeminfo vram --showpids
 ```
 
-Pause the intermediary and wait until no inference/management request is active. Restart Ollama if needed. If `rocm-smi` still shows an `UNKNOWN` process retaining substantial VRAM, reboot the host. Once physical GPU memory is clean and `ollama ps` is empty, acknowledge the recovery using the separate maintenance credential. The endpoint requires maintenance to remain paused and independently checks the current loaded-model list:
+Pause the intermediary and wait until no inference/management request is active. Restart Ollama if needed. If `rocm-smi` still shows an `UNKNOWN` process retaining substantial VRAM, stop and investigate the driver/host before acknowledging recovery. This project does not authorize an automatic GPU reset or reboot. Once physical GPU memory is back to its expected idle baseline and `ollama ps` is empty, acknowledge the recovery using the separate maintenance credential. The endpoint requires maintenance to remain paused and independently checks the current loaded-model list:
 
 ```sh
 read -rsp 'Maintenance token: ' MAINTENANCE_TOKEN; printf '\n'
@@ -136,6 +136,32 @@ curl http://127.0.0.1:11435/readyz
 ```
 
 Acknowledgment does not reset hardware and does not resume inference by itself. The separate resume command above deliberately reopens admission only after the acknowledgment succeeds. Run these commands one at a time and stop if acknowledgment returns an error.
+
+## Enable physical GPU monitoring and bounded self-recovery (1.4)
+
+**Updating the intermediary container alone does not enable host monitoring or service restarts.** Those require the optional helper on the same Linux host as the real Ollama service, not the Frigate host. No new Frigate image or bridge rebuild is needed for this upgrade.
+
+1. Update the intermediary while safely drained using your existing source or release installation method. Preserve `config.yml`, `secrets.env`, saved settings, and all state volumes. Version 1.4 keeps host monitoring and automatic recovery disabled until explicitly enabled.
+2. Follow [the host helper installation guide](../integrations/host/README.md) on the Ollama host. Its manual steps install an unprivileged, Unix-socket-only helper and narrowly scoped permission to restart **only `ollama.service`**, with an independent persisted limit of two restarts per hour and a five-minute cooldown. It has no GPU-reset or reboot permission. Review the service, environment, and sudoers artifacts before installing them; there is no automatic privileged installer.
+3. Merge the supplied host-helper Compose example into the existing `docker-compose.override.yml`, preserving other overrides. Mount only the helper runtime directory and add its numeric socket group. Do not mount the Docker socket, host filesystem root, or GPU devices into the intermediary. Do not make the helper socket world-writable. If Ollama runs on a different host from the intermediary, this local-socket integration cannot be used as-is.
+4. Enable only host monitoring first. Use **Settings → GPU safety** or the host-managed `HOST_HELPER_ENABLED=true` environment opt-in. Recreate the container after adding socket mounts/groups or changing environment variables. Inspect the dashboard for fresh physical VRAM/process telemetry and the correct Ollama service identity.
+5. Configure a distinct `MAINTENANCE_TOKEN` if not already set. Once the helper is verified, enable `auto_recovery.enabled` in Settings, or establish the base opt-in with `AUTO_RECOVERY_ENABLED=true` in `secrets.env`. Environment values do not override previously saved UI overrides. Validate/apply, then explicitly resume a deliberate maintenance pause when ready; automatic recovery never resumes it for you.
+6. Check the recovery panel after the next real failure. A protected **Check recovery now** action may be used for an already latched incident. It cannot bypass the **two-attempt limit for that incident**, the **two-per-rolling-hour limit**, or the **five-minute cooldown**; it is not a force-reset button. After two unsuccessful attempts, waiting another hour does not grant more attempts for that incident. Investigate the persistent failure and acknowledge recovery manually only after verifying the host. Never deliberately crash or exhaust production VRAM just to test the feature.
+
+Default verification requires three fresh stable samples, no loaded Ollama models, no reported GPU processes, and no more than 512 MiB used VRAM per GPU after a confirmed service restart. The application baseline can be lowered for stricter checks, but increasing its setting above 512 does not bypass the helper's independent 512 MiB ceiling. Do not raise thresholds to hide a stuck process. Missing or stale telemetry is unknown, not a healthy reading. Persistent driver faults, non-Ollama GPU workloads, helper failures, and exhausted restart limits keep admission locked for operator investigation.
+
+The automatic recovery ledger lives at `/app/state/auto-recovery.json`, alongside the existing GPU safety latch and catch-up state. Preserve it during updates. The helper maintains its own host-side ledger independently. Deleting either ledger to bypass a cooldown defeats the safety boundary and is not a recovery procedure. Restarts of Ollama interrupt every direct Ollama client, so route production clients through the intermediary to preserve the single-inference and pause guarantees.
+
+For AMD systems with `amd-smi` already installed, read-only checks are:
+
+```sh
+amd-smi version
+amd-smi metric --mem-usage --usage --temperature --power
+amd-smi process --general
+ollama ps
+```
+
+One-at-a-time scheduling prevents overlapping admitted inference, but it cannot prevent every driver or transport failure. This feature adds bounded recovery when it can be established safely; it never resets a GPU or reboots Ubuntu. Context-overflow requests still need Frigate/model input configuration fixes, not service restart loops.
 
 ## Install from source instead
 

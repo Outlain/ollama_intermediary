@@ -96,6 +96,60 @@ test('changing the Frigate origin preserves old backlog and reports a specific h
   assert.equal(fs.readFileSync(first.settings.state_path, 'utf8'), original);
 });
 
+test('manual capability refresh detects a new bridge immediately without changing outstanding work or scans', async (t) => {
+  const context = setup(t);
+  context.client.rows.review = [review('outstanding-review')];
+  context.manual();
+  await context.worker.tick();
+  context.clearTimers();
+  assert.equal(context.worker.status().bridge_mode, 'conservative');
+  assert.equal(context.client.calls.length, 1);
+  const before = structuredClone(context.worker.state);
+  const savedBefore = fs.readFileSync(context.settings.state_path, 'utf8');
+  const listCalls = context.client.listCalls.length;
+  context.gate.ready = false;
+  context.client.support = { object: true, review: true, bridge: true };
+  context.clock.now += 1;
+  const result = await context.worker.refreshCapabilities();
+  assert.equal(result.bridge_mode, 'correlated');
+  assert.equal(result.capability_checked_at, new Date(context.clock.now).toISOString());
+  assert.deepEqual(context.worker.state, before);
+  assert.equal(fs.readFileSync(context.settings.state_path, 'utf8'), savedBefore);
+  assert.equal(context.client.calls.length, 1);
+  assert.equal(context.client.listCalls.length, listCalls);
+  assert.equal(context.gate.ready, false);
+  await assert.rejects(context.worker.refreshCapabilities(), (error) => error.code === 'capability_refresh_cooldown' && error.statusCode === 429);
+  context.clock.now += 5000;
+  assert.equal((await context.worker.refreshCapabilities()).capabilities.bridge, true);
+});
+
+test('manual and automatic capability probes coalesce without overlapping API reads', async (t) => {
+  const context = setup(t);
+  let calls = 0;
+  let finish;
+  context.client.capabilities = async () => { calls++; await new Promise((resolve) => { finish = resolve; }); return { object: true, review: true, bridge: true }; };
+  const automatic = context.worker.probeCapabilities();
+  const manual = context.worker.refreshCapabilities();
+  assert.equal(calls, 1);
+  finish();
+  await Promise.all([automatic, manual]);
+  assert.equal(context.worker.status().bridge_mode, 'correlated');
+  assert.equal(calls, 1);
+});
+
+test('failed manual capability probe leaves queue and last verified capabilities intact', async (t) => {
+  const context = setup(t);
+  await context.worker.probeCapabilities();
+  const before = structuredClone(context.worker.state);
+  const checkedAt = context.worker.status().capability_checked_at;
+  context.client.capabilities = async () => { throw new FrigateError('connection_failed', 503); };
+  context.clock.now += 50;
+  await assert.rejects(context.worker.refreshCapabilities(), (error) => error.code === 'connection_failed');
+  assert.equal(context.worker.status().capability_checked_at, checkedAt);
+  assert.deepEqual(context.worker.state, before);
+  assert.equal(context.client.calls.length, 0);
+});
+
 test('backlog pagination exposes every saved job in bounded newest-first metadata pages', (t) => {
   const { worker } = setup(t);
   worker.state.jobs = Array.from({ length: 258 }, (_, i) => ({

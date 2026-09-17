@@ -17,8 +17,8 @@ The release workflow runs for semantic version tags matching `v*.*.*`:
 ```sh
 npm run check:public
 npm test
-git tag -a v1.3.0 -m "Release v1.3.0"
-git push origin v1.3.0
+git tag -a v1.4.0 -m "Release v1.4.0"
+git push origin v1.4.0
 ```
 
 The workflow:
@@ -49,8 +49,10 @@ Once public, GHCR permits anonymous pulls and release-bundle users do not need a
 
 ## Release verification
 
-Do not describe a release as published until the workflow has succeeded and its image/bundle are available. Source version 1.3.0 is not itself proof that a `v1.3.0` release exists.
+Do not describe a release as published until the workflow has succeeded and its image/bundle are available. Source version 1.4.0 is not itself proof that a `v1.4.0` release exists.
 
 Before release, test both object and ended-review regeneration against the intended Frigate build, confirm live-work priority, verify settings and backlog survive container recreation, and confirm real media-retention failure reporting. Automated mocks exercise protocol and state-machine behavior but do not certify Frigate deployment permissions or ROCm driver recovery. Keep that distinction in release notes.
 
 The source and release Compose templates must retain matching state mounts, security options, settings recovery listener, and bounded logging. Deployment bundles contain examples only: update instructions must preserve users' `config.yml`, `secrets.env`, ignored Compose overrides, and named state volume.
+
+Version 1.4 bundles the optional `integrations/host` helper and installation guide. Verify its tests and deployment artifacts separately: helper sockets stay local/group-restricted, sudoers permits only the fixed Ollama service operation, application and helper restart budgets persist, the existing maintenance pause is preserved, and no GPU reset/reboot/general command route exists. Neither a source push nor a container update installs host privileges. Host telemetry/recovery remain explicitly opt-in; deployment acceptance on the target AMD driver must verify reported telemetry without deliberately inducing a production GPU fault. The pinned Frigate bridge is unchanged by this feature.

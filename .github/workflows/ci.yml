@@ -30,6 +30,9 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Test isolated host helper with mocked hardware
+        run: python3 -m unittest discover -s integrations/host -p 'test_*.py' -v
+
       - name: Fetch exact Frigate bridge test sources
         shell: bash
         run: |

@@ -163,14 +163,30 @@ main { padding-block: 28px 16px; }
 }
 .card-header { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 20px; }
 .maintenance-card { grid-column: 1 / -1; grid-row: 1; }
-.catchup-card { grid-column: 1 / -1; grid-row: 4; }
+.recovery-card { grid-column: 1 / -1; grid-row: 2; }
+.host-gpu-card { grid-column: 1 / -1; grid-row: 5; }
+.catchup-card { grid-column: 1 / -1; grid-row: 6; }
 .catchup-card > p { overflow-wrap: anywhere; }
 .catchup-card h3 { margin-bottom: 12px; }
 .catchup-card .queue-item p { margin-block: 8px 0; overflow-wrap: anywhere; }
-.current-card { grid-column: 1; grid-row: 2; }
-.queue-card { grid-column: 2; grid-row: 2; }
-.backend-card { grid-column: 1; grid-row: 3; }
-.events-card { grid-column: 2; grid-row: 3; }
+.current-card { grid-column: 1; grid-row: 3; }
+.queue-card { grid-column: 2; grid-row: 3; }
+.backend-card { grid-column: 1; grid-row: 4; }
+.events-card { grid-column: 2; grid-row: 4; }
+.recovery-card p, .host-gpu-card p, .host-gpu-item h3 { overflow-wrap: anywhere; }
+.recovery-card .detail-grid, .host-gpu-item .detail-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.recovery-controls { display: grid; justify-items: start; gap: 16px; margin-block: 18px; }
+.recovery-controls details { width: 100%; padding: 12px; border: 1px solid var(--border); border-radius: 10px; }
+.recovery-controls summary { cursor: pointer; color: var(--muted); }
+.recovery-controls details p { margin-top: 12px; }
+.recovery-confirm { display: flex; align-items: flex-start; gap: 9px; margin-block: 12px; font-size: 0.83rem; }
+.recovery-confirm input { flex: 0 0 auto; margin-top: 4px; accent-color: var(--accent); }
+.recovery-controls button { max-width: 100%; white-space: normal; text-align: left; }
+.host-gpu-list { display: grid; gap: 16px; }
+.host-gpu-item { min-width: 0; padding: 16px; border: 1px solid var(--border); border-radius: 12px; }
+.host-gpu-item h3 { margin-bottom: 14px; }
+.gpu-process-list { max-height: 180px; overflow-y: auto; padding-left: 20px; color: var(--muted); font-size: 0.8rem; }
+.gpu-process-list li { overflow-wrap: anywhere; margin-block: 7px; }
 
 .tag { padding: 5px 9px; color: var(--accent); border-color: rgba(100, 220, 165, 0.26); background: var(--accent-soft); font-size: 0.69rem; font-weight: 750; text-transform: uppercase; letter-spacing: 0.055em; }
 .tag-neutral { color: var(--muted); border-color: var(--border); background: rgba(145, 160, 180, 0.06); }
@@ -321,13 +337,15 @@ main { padding-block: 28px 16px; }
 
 @media (max-width: 900px) {
   .dashboard-grid { grid-template-columns: 1fr; }
-  .maintenance-card, .current-card, .queue-card, .backend-card, .events-card, .catchup-card { grid-column: 1; grid-row: auto; }
+  .maintenance-card, .recovery-card, .host-gpu-card, .current-card, .queue-card, .backend-card, .events-card, .catchup-card { grid-column: 1; grid-row: auto; }
   .maintenance-card { order: 1; }
-  .current-card { order: 2; }
-  .queue-card { order: 3; }
-  .backend-card { order: 4; }
-  .events-card { order: 5; }
-  .catchup-card { order: 6; }
+  .recovery-card { order: 2; }
+  .current-card { order: 3; }
+  .queue-card { order: 4; }
+  .backend-card { order: 5; }
+  .host-gpu-card { order: 6; }
+  .events-card { order: 7; }
+  .catchup-card { order: 8; }
   .maintenance-layout { grid-template-columns: 1fr; }
   .metadata-strip { grid-template-columns: repeat(4, minmax(70px, 1fr)); }
 }
@@ -349,6 +367,8 @@ main { padding-block: 28px 16px; }
   .request-title-row { display: block; }
   .duration-block { margin-top: 16px; text-align: left; }
   .detail-grid { grid-template-columns: repeat(2, 1fr); }
+  .recovery-card .detail-grid, .host-gpu-item .detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .recovery-card .card-header, .host-gpu-card .card-header { flex-wrap: wrap; }
   .detail-grid div:nth-child(2n) { border-right: 0; }
   .detail-grid div:nth-child(n+3) { border-top: 1px solid var(--border-soft); }
   .detail-grid div:nth-child(3) { padding-left: 0; }

@@ -132,6 +132,24 @@ test('valid configuration starts the normal proxy and exposes settings in runnin
   assert.equal(instance.logs.some((entry) => entry.message === 'configuration recovery listener started'), false);
 });
 
+test('host environment opt-ins are parsed strictly and invalid values enter host-fix recovery', async (t) => {
+  const instance = await startIntermediary(t, VALID_CONFIG, { HOST_HELPER_ENABLED: '"1"' });
+  const started = await instance.waitForLog('configuration recovery listener started');
+  const response = await fetch(`http://127.0.0.1:${started.address.port}${SETTINGS_API}`, { headers: authenticatedHeaders() });
+  const snapshot = await response.json();
+  assert.equal(snapshot.mode, 'configuration_error');
+  assert.ok(snapshot.diagnostics.some((item) => item.code === 'invalid_host_environment'));
+});
+
+test('explicit false environment recovery opt-in does not enable host operations', async (t) => {
+  const instance = await startIntermediary(t, VALID_CONFIG, { HOST_HELPER_ENABLED: 'false', AUTO_RECOVERY_ENABLED: '0' });
+  const started = await instance.waitForLog('proxy listener started');
+  const response = await fetch(`http://127.0.0.1:${started.address.port}${SETTINGS_API}`, { headers: authenticatedHeaders() });
+  const snapshot = await response.json();
+  assert.equal(snapshot.settings.host_helper.enabled, false);
+  assert.equal(snapshot.settings.auto_recovery.enabled, false);
+});
+
 test('startup expands environment-backed YAML values exactly once', async (t) => {
   const literalToken = 'literal-${NESTED_VALUE}-token';
   const instance = await startIntermediary(t, `

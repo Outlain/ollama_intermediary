@@ -4,6 +4,7 @@ import { readBody, sendJson } from './http-utils.js';
 const PREFIX = '/_intermediary/v1/frigate';
 const VIEWS = new Set(['all', 'waiting', 'awaiting', 'retrying', 'attention', 'completed', 'skipped']);
 const ACTIONS = new Map([
+  [`${PREFIX}/refresh`, { method: 'refreshCapabilities', message: 'Frigate capabilities rechecked. Existing work and safety guards are unchanged.' }],
   [`${PREFIX}/scan`, { method: 'scanMissing', message: 'Historical discovery requested; descriptions run later when idle.' }],
   [`${PREFIX}/retry`, { method: 'retryJob', message: 'Retry queued; live priority, pause, and GPU safety still apply.' }],
   [`${PREFIX}/recheck`, { method: 'recheckJob', message: 'Availability recheck queued; saved descriptions and media will be checked before generation.' }],
@@ -11,6 +12,7 @@ const ACTIONS = new Map([
 const ACTION_ERRORS = new Set([
   'job_not_found', 'job_not_retryable', 'job_not_recheckable', 'handoff_outstanding',
   'operation_in_progress', 'backlog_capacity_reached', 'catchup_unavailable',
+  'capability_refresh_cooldown',
 ]);
 
 export class FrigateController {
@@ -60,7 +62,7 @@ export class FrigateController {
     try { body = JSON.parse((await readBody(request, 4096)).toString('utf8')); }
     catch (error) { return sendJson(response, error.statusCode || 400, { error: 'Invalid JSON body.' }, id); }
     if (body?.confirm !== true) return sendJson(response, 400, { error: 'Set confirm:true to request this catch-up action.' }, id);
-    if (action.method !== 'scanMissing' && (!['object', 'review'].includes(body.kind)
+    if (!['scanMissing', 'refreshCapabilities'].includes(action.method) && (!['object', 'review'].includes(body.kind)
       || typeof body.id !== 'string' || !body.id.trim() || body.id.length > 256 || /[\u0000-\u001f\u007f]/.test(body.id))) {
       return sendJson(response, 400, { error: 'Provide an object/review kind and a valid saved job ID.', code: 'invalid_job' }, id);
     }
@@ -70,7 +72,7 @@ export class FrigateController {
     } catch (error) {
       // Do not expose arbitrary upstream text, URLs, credentials, or payloads.
       const code = ACTION_ERRORS.has(error.code) ? error.code : 'catchup_action_unavailable';
-      const status = [404, 409, 503].includes(error.statusCode || error.status) ? error.statusCode || error.status : 409;
+      const status = [404, 409, 429, 503].includes(error.statusCode || error.status) ? error.statusCode || error.status : 409;
       return sendJson(response, status, { error: 'The action could not be scheduled. Check the job state and catch-up status.', code }, id);
     }
   }

@@ -79,6 +79,23 @@ const EDITABLE_TREE = Object.freeze({
     recovery_on_oom: boolean(),
     error_body_limit_bytes: integer({ min: 1, max: 16 * 1024 * 1024 }),
   }),
+  host_helper: Object.freeze({
+    enabled: boolean(),
+    poll_interval: duration({ minMs: 1000, maxMs: 60000 }),
+    request_timeout: duration({ minMs: 1000, maxMs: 60000 }),
+    stale_after: duration({ minMs: 1000, maxMs: 300000 }),
+  }),
+  auto_recovery: Object.freeze({
+    enabled: boolean(),
+    check_interval: duration({ minMs: 1000, maxMs: 60000 }),
+    restart_timeout: duration({ minMs: 10000, maxMs: 300000 }),
+    verification_timeout: duration({ minMs: 10000, maxMs: 300000 }),
+    cooldown: duration({ minMs: 300000, maxMs: 86400000 }),
+    window: duration({ minMs: 3600000, maxMs: 604800000 }),
+    max_restarts: integer({ min: 1, max: 2 }),
+    stable_samples: integer({ min: 2, max: 10 }),
+    max_idle_vram_mb: integer({ min: 64, max: 4096 }),
+  }),
   observability: Object.freeze({
     enabled: boolean(),
     ui_enabled: boolean(),
@@ -129,6 +146,8 @@ export const SETTINGS_SCHEMA = Object.freeze({
     'maintenance.auth_token',
     'maintenance.state_path',
     'gpu_safety.state_path',
+    'host_helper.socket_path',
+    'auto_recovery.state_path',
     'frigate.state_path',
     'frigate.username',
     'frigate.password',
@@ -236,6 +255,7 @@ function validateDescriptor(value, field, spec, diagnostics) {
         const milliseconds = parseDuration(value, field);
         if (spec.greaterThanZero && milliseconds <= 0) invalid('out_of_range', 'Must be greater than zero.');
         else if (spec.minMs !== undefined && milliseconds < spec.minMs) invalid('out_of_range', `Must be at least ${spec.minMs / 1000}s.`);
+        else if (spec.maxMs !== undefined && milliseconds > spec.maxMs) invalid('out_of_range', `Must not exceed ${spec.maxMs / 1000}s.`);
       } catch {
         invalid('invalid_duration', 'Use a duration such as 500ms, 20s, 5m, or 2h.');
       }

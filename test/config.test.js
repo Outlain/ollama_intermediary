@@ -1,6 +1,58 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { normalizeConfig, parseConfigSource, parseDuration } from '../src/config.js';
+import { applyHostEnvironment, normalizeConfig, parseConfigSource, parseDuration } from '../src/config.js';
+
+test('host monitoring and automatic recovery remain disabled on an ordinary upgrade', () => {
+  const config = normalizeConfig({ server: { listen: '127.0.0.1:0' } });
+  assert.equal(config.host_helper.enabled, false);
+  assert.equal(config.auto_recovery.enabled, false);
+  assert.equal(config.host_helper.pollIntervalMs, 5000);
+  assert.equal(config.host_helper.requestTimeoutMs, 15000);
+  assert.equal(config.host_helper.staleAfterMs, 30000);
+  assert.equal(config.auto_recovery.cooldownMs, 300000);
+  assert.equal(config.auto_recovery.windowMs, 3600000);
+  assert.equal(config.auto_recovery.max_restarts, 2);
+  assert.equal(config.auto_recovery.stable_samples, 3);
+});
+
+test('automatic recovery needs explicit helper installation opt-in and maintenance credentials', () => {
+  const normalize = (overlay) => normalizeConfig({ server: { listen: '127.0.0.1:0' }, ...overlay });
+  assert.throws(() => normalize({ auto_recovery: { enabled: true } }), /requires host_helper.enabled/);
+  assert.throws(() => normalize({ host_helper: { enabled: true }, auto_recovery: { enabled: true } }), /maintenance.auth_token/);
+  assert.throws(() => normalize({ host_helper: { enabled: true }, auto_recovery: { enabled: true }, maintenance: { enabled: false, auth_token: 'test' } }), /maintenance.enabled/);
+  assert.doesNotThrow(() => normalize({ host_helper: { enabled: true }, auto_recovery: { enabled: true }, maintenance: { enabled: true, auth_token: 'test' } }));
+});
+
+test('host safety configuration rejects unsafe paths, timings, and restart limits', () => {
+  const normalize = (section, value) => normalizeConfig({ server: { listen: '127.0.0.1:0' }, [section]: value });
+  for (const [section, fields] of Object.entries({
+    host_helper: { enabled: ['true'], socket_path: ['relative.sock', '/tmp/bad\0socket'], poll_interval: ['0s', '61s'], request_timeout: ['0s', '61s'], stale_after: ['999ms', '301s'] },
+    auto_recovery: { enabled: ['false'], state_path: ['relative.json'], check_interval: ['0s', '61s'], restart_timeout: ['9s', '301s'], verification_timeout: ['9s', '301s'], cooldown: ['4m', '25h'], window: ['59m', '169h'], max_restarts: [0, 3, 1.5], stable_samples: [1, 11], max_idle_vram_mb: [63, 4097] },
+  })) {
+    for (const [field, values] of Object.entries(fields)) {
+      for (const value of values) assert.throws(() => normalize(section, { [field]: value }), new RegExp(`${section}\\.${field}`));
+    }
+  }
+  assert.throws(() => normalize('host_helper', { poll_interval: '30s', stale_after: '20s' }), /stale_after/);
+  assert.throws(() => normalize('auto_recovery', { cooldown: '2h', window: '1h' }), /auto_recovery.window/);
+  assert.throws(() => normalize('auto_recovery', { check_interval: '30s', stable_samples: 3, verification_timeout: '60s' }), /verification_timeout.*stable_samples/);
+  assert.doesNotThrow(() => normalize('auto_recovery', { check_interval: '30s', stable_samples: 3, verification_timeout: '120s' }));
+});
+
+test('host environment bootstrap accepts exact booleans without overriding absent values', () => {
+  const raw = { host_helper: { enabled: true }, auto_recovery: { enabled: false } };
+  assert.deepEqual(applyHostEnvironment(raw, {}), raw);
+  assert.deepEqual(applyHostEnvironment(raw, { HOST_HELPER_ENABLED: '', AUTO_RECOVERY_ENABLED: '' }), raw);
+  const enabled = applyHostEnvironment(raw, { HOST_HELPER_ENABLED: '1', AUTO_RECOVERY_ENABLED: 'true', HOST_HELPER_SOCKET_PATH: '/run/custom.sock' });
+  assert.equal(enabled.auto_recovery.enabled, true);
+  assert.equal(enabled.host_helper.socket_path, '/run/custom.sock');
+  assert.equal(applyHostEnvironment(raw, { HOST_HELPER_ENABLED: 'false' }).host_helper.enabled, false);
+  assert.equal(applyHostEnvironment(raw, { HOST_HELPER_ENABLED: '0' }).host_helper.enabled, false);
+  assert.equal(raw.auto_recovery.enabled, false);
+  for (const value of ['"1"', 'yes', 'TRUE', ' true ']) {
+    assert.throws(() => applyHostEnvironment(raw, { AUTO_RECOVERY_ENABLED: value }), /must be exactly/);
+  }
+});
 
 test('duration parsing rejects values that would overflow or make Node timers fire immediately', () => {
   assert.equal(parseDuration('30m'), 1_800_000);

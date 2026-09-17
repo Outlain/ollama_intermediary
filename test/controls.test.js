@@ -16,6 +16,7 @@ async function fixture(t, overlay = {}, options = {}) {
     ollama: { ...overlay.ollama, url: backend.url },
     maintenance: { ...overlay.maintenance, auth_token: 'maintenance-test', state_path: path.join(directory, 'pause.json') },
     gpu_safety: { ...overlay.gpu_safety, state_path: path.join(directory, 'gpu.json') },
+    auto_recovery: { ...overlay.auto_recovery, state_path: path.join(directory, 'automatic-recovery.json') },
   });
   const service = new ProxyService(config, { logger: new SilentLogger(), settingsToken: 'settings-test', ...options });
   await service.start();
@@ -64,6 +65,109 @@ test('GPU recovery acknowledgment requires admin, pause, empty models, and expli
   assert.equal((await post(endpoint, 'maintenance-test', { confirm_gpu_recovered: true })).status, 200);
   assert.equal(service.backend.recoveryRequired, false);
   assert.equal(service.maintenance.paused, true);
+});
+
+test('recovery check requires maintenance authority, POST, JSON and explicit confirmation', async (t) => {
+  const { base, service } = await fixture(t, { observability: { auth_token: 'read-test' } });
+  const endpoint = `${base}/_intermediary/v1/recovery/check`;
+  let checks = 0;
+  service.automaticRecovery.checkNow = () => { checks++; return { enabled: true, state: 'waiting' }; };
+  for (const token of ['', 'read-test', 'settings-test', 'wrong']) {
+    assert.equal((await post(endpoint, token, { confirm: true })).status, 401);
+  }
+  const get = await fetch(endpoint, { headers: { authorization: 'Bearer maintenance-test' } });
+  assert.equal(get.status, 405);
+  assert.equal(get.headers.get('allow'), 'POST');
+  assert.equal((await fetch(endpoint, { method: 'POST', headers: { authorization: 'Bearer maintenance-test' }, body: '{}' })).status, 415);
+  assert.equal((await fetch(endpoint, { method: 'POST', headers: { authorization: 'Bearer maintenance-test', 'content-type': 'application/json' }, body: '{bad' })).status, 400);
+  for (const body of [{}, { confirm: false }, { confirm: 'true' }]) {
+    assert.equal((await post(endpoint, 'maintenance-test', body)).status, 400);
+  }
+  assert.equal(checks, 0);
+  const response = await post(endpoint, 'maintenance-test', { confirm: true });
+  assert.equal(response.status, 202);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  const result = await response.json();
+  assert.equal(result.accepted, true);
+  assert.equal(result.recovery.state, 'waiting');
+  assert.equal(checks, 1);
+});
+
+test('recovery check fails visibly when disabled and cannot operate during settings shutdown', async (t) => {
+  const { base, service } = await fixture(t);
+  const endpoint = `${base}/_intermediary/v1/recovery/check`;
+  let response = await post(endpoint, 'maintenance-test', { confirm: true });
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).code, 'automatic_recovery_disabled');
+  let checks = 0;
+  service.automaticRecovery.checkNow = () => { checks++; return {}; };
+  service.beginSettingsRestart();
+  response = await post(endpoint, 'maintenance-test', { confirm: true });
+  assert.equal(response.status, 409);
+  assert.equal(checks, 0);
+});
+
+test('recovery check cannot run without a configured maintenance credential', async (t) => {
+  const { base, service } = await fixture(t);
+  service.config.maintenance.auth_token = '';
+  let checks = 0;
+  service.automaticRecovery.checkNow = () => { checks++; return {}; };
+  const response = await post(`${base}/_intermediary/v1/recovery/check`, '', { confirm: true });
+  assert.equal(response.status, 503);
+  assert.equal(checks, 0);
+});
+
+test('an explicit recovery check preserves a manual pause and does not acknowledge an unverified fault', async (t) => {
+  const { base, service } = await fixture(t);
+  service.backend.requireRecovery('Ollama request failed after dispatch; upstream completion is unknown', { code: 'upstream_disconnected' });
+  await post(`${base}/_intermediary/v1/maintenance/pause`, 'maintenance-test', {});
+  await waitFor(() => !service.gate.active && !service.maintenanceTask);
+  const revision = service.maintenance.revision;
+  service.automaticRecovery.checkNow = () => ({ enabled: true, state: 'needs_attention', reason: 'restart_limit_reached' });
+  const response = await post(`${base}/_intermediary/v1/recovery/check`, 'maintenance-test', { confirm: true });
+  assert.equal(response.status, 202);
+  const result = await response.json();
+  assert.equal(result.recovery.reason, 'restart_limit_reached');
+  assert.equal(service.backend.recoveryRequired, true);
+  assert.equal(service.maintenance.paused, true);
+  assert.equal(service.maintenance.revision, revision);
+});
+
+test('Frigate capability refresh requires settings authority but no job ID and preserves pause', async (t) => {
+  let refreshes = 0;
+  const catchup = { start() {}, async stop() {}, status: () => ({ enabled: true, state: 'running' }),
+    async refreshCapabilities() { refreshes++; return { capabilities: { checked: true, object: true, review: true, bridge: true } }; } };
+  const { base, service } = await fixture(t, { observability: { auth_token: 'read-test' } }, { catchup });
+  const endpoint = `${base}/_intermediary/v1/frigate/refresh`;
+  for (const token of ['', 'read-test', 'maintenance-test']) assert.equal((await post(endpoint, token, { confirm: true })).status, 401);
+  assert.equal((await fetch(endpoint)).status, 405);
+  assert.equal((await post(endpoint, 'settings-test', {})).status, 400);
+  assert.equal((await fetch(endpoint, { method: 'POST', headers: { authorization: 'Bearer settings-test' }, body: '{}' })).status, 415);
+  assert.equal(refreshes, 0);
+  await post(`${base}/_intermediary/v1/maintenance/pause`, 'maintenance-test', {});
+  await waitFor(() => !service.gate.active && !service.maintenanceTask);
+  const revision = service.maintenance.revision;
+  const response = await post(endpoint, 'settings-test', { confirm: true });
+  assert.equal(response.status, 202);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  const result = await response.json();
+  assert.equal(result.frigate.capabilities.bridge, true);
+  assert.equal(refreshes, 1);
+  assert.equal(service.maintenance.paused, true);
+  assert.equal(service.maintenance.revision, revision);
+});
+
+test('Frigate capability refresh exposes its cooldown but redacts arbitrary upstream errors', async (t) => {
+  let error = Object.assign(new Error('PRIVATE UPSTREAM DETAIL'), { code: 'capability_refresh_cooldown', statusCode: 429 });
+  const catchup = { start() {}, async stop() {}, status: () => ({}), async refreshCapabilities() { throw error; } };
+  const { base } = await fixture(t, {}, { catchup });
+  const endpoint = `${base}/_intermediary/v1/frigate/refresh`;
+  let response = await post(endpoint, 'settings-test', { confirm: true });
+  assert.equal(response.status, 429);
+  assert.equal((await response.json()).code, 'capability_refresh_cooldown');
+  error = Object.assign(new Error('PRIVATE UPSTREAM DETAIL'), { code: 'PRIVATE UPSTREAM DETAIL', statusCode: 500 });
+  response = await post(endpoint, 'settings-test', { confirm: true });
+  assert.doesNotMatch(await response.text(), /PRIVATE/);
 });
 
 test('backlog pages use read authorization and enforce bounded page parameters', async (t) => {

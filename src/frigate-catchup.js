@@ -153,6 +153,8 @@ export class FrigateCatchup {
     this.blockedReason = null;
     this.capabilities = { object: false, review: false, checked: false };
     this.lastCapabilityCheck = 0;
+    this.capabilityProbe = null;
+    this.lastManualCapabilityCheck = null;
     this.nextPollAt = null;
     this.runtimeConfig = null;
     this.state = null;
@@ -397,6 +399,7 @@ export class FrigateCatchup {
         : this.lastError ? 'degraded' : 'running',
       enabled_at: this.state?.enabled_at ?? null,
       capabilities: { ...this.capabilities }, counts,
+      capability_checked_at: this.capabilities.checked ? new Date(this.lastCapabilityCheck).toISOString() : null,
       bridge_mode: this.capabilities.bridge === true ? 'correlated' : 'conservative',
       verifying_count: (this.state?.jobs ?? []).filter((job) => job.state === 'waiting_result' && job.attempt?.phase === 'verifying_saved').length,
       max_verifying: this.settings.max_verifying ?? 4,
@@ -628,6 +631,28 @@ export class FrigateCatchup {
     return this.status();
   }
 
+  async probeCapabilities() {
+    if (this.capabilityProbe) return this.capabilityProbe;
+    this.capabilityProbe = (async () => {
+      this.capabilities = { ...await this.client.capabilities(), checked: true };
+      this.lastCapabilityCheck = this.clock();
+      this.onChange(this.status());
+    })().finally(() => { this.capabilityProbe = null; });
+    return this.capabilityProbe;
+  }
+
+  async refreshCapabilities() {
+    this.requireAvailable();
+    if (this.lastManualCapabilityCheck !== null && this.clock() - this.lastManualCapabilityCheck < 5000) {
+      throw this.actionError('capability_refresh_cooldown', 429);
+    }
+    this.lastManualCapabilityCheck = this.clock();
+    // A read-only reprobe. Outstanding attempts, discovery cursors, queue
+    // contents, GPU safety, and the manual pause are deliberately untouched.
+    await this.probeCapabilities();
+    return this.status();
+  }
+
   newScan(after, until) {
     return { after, before: afterTimestamp(until), until, limit: this.settings.page_size ?? 100, seen: [] };
   }
@@ -647,8 +672,7 @@ export class FrigateCatchup {
   async runTick() {
     this.blockedReason = null;
     if (!this.capabilities.checked || this.clock() - this.lastCapabilityCheck >= 300_000) {
-      this.capabilities = { ...await this.client.capabilities(), checked: true };
-      this.lastCapabilityCheck = this.clock();
+      await this.probeCapabilities();
     }
     this.runtimeConfig = await this.readConfig();
     if (!this.running) return;

@@ -127,6 +127,30 @@ gpu_safety:
   recovery_on_oom: true
   error_body_limit_bytes: 65536
 
+host_helper:
+  # Optional Linux host service. Install integrations/host first and mount only
+  # its group-restricted Unix socket directory; do not mount the Docker socket.
+  enabled: false
+  socket_path: /run/ollama-intermediary-host/control.sock
+  poll_interval: 5s
+  request_timeout: 15s
+  stale_after: 30s
+
+auto_recovery:
+  # Explicit opt-in after the host helper is installed and reports fresh data.
+  # Restarts only ollama.service; never resets the GPU or reboots the host.
+  enabled: false
+  state_path: /app/state/auto-recovery.json
+  check_interval: 5s
+  restart_timeout: 90s
+  verification_timeout: 60s
+  cooldown: 5m
+  window: 1h
+  max_restarts: 2
+  stable_samples: 3
+  # Per-GPU baseline allowance after a verified service restart, not total VRAM.
+  max_idle_vram_mb: 512
+
 maintenance:
   # Administrative pause control is enabled by default, but every mutation requires
   # its own non-empty bearer token. Do not reuse the read-only observability token.

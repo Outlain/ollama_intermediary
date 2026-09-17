@@ -1,5 +1,5 @@
 import process from 'node:process';
-import { readConfigSource } from './config.js';
+import { applyHostEnvironment, readConfigSource } from './config.js';
 import { Logger } from './logger.js';
 import { ProxyService } from './proxy.js';
 import { RecoveryService } from './recovery.js';
@@ -89,6 +89,12 @@ for (const [field, variable] of Object.entries({
   if (process.env[variable]) baseRaw.frigate[field] = process.env[variable];
 }
 baseRaw.gpu_safety = { state_path: '/app/state/gpu-recovery.json', ...baseRaw.gpu_safety };
+try {
+  baseRaw = applyHostEnvironment(baseRaw, process.env);
+} catch (error) {
+  mutationDisabledReason = 'Host helper/recovery environment values are invalid. Correct them on the host and recreate the container.';
+  diagnostics.push(issue('environment.host_helper', 'invalid_host_environment', error.message));
+}
 let settingsStore;
 try {
   settingsStore = new SettingsStore({

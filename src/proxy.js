@@ -1,7 +1,9 @@
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { BackendClient, BackendState, OperationGate } from './backend.js';
+import { BackendClient, BackendState, OperationGate, RECOVERY_REASONS } from './backend.js';
+import { HostHelperClient } from './host-helper.js';
+import { AutomaticRecovery } from './auto-recovery.js';
 import { Classifier, classifyEndpoint, isSafeMetadataEndpoint, isStreaming } from './classifier.js';
 import { copyRequestHeaders, copyResponseHeaders, readBody, ResponseOutcomeCollector, sendJson, streamBody } from './http-utils.js';
 import { Logger, requestId } from './logger.js';
@@ -117,6 +119,16 @@ export class ProxyService {
       readToken: config.observability.auth_token,
       controlToken: options.settingsToken ?? this.settingsController?.token ?? '',
     });
+    this.hostHelper = options.hostHelper ?? new HostHelperClient(config, {
+      clock: this.clock, onChange: () => this.scheduler.wake(),
+    });
+    this.automaticRecovery = new AutomaticRecovery(config, {
+      clock: this.clock, helper: this.hostHelper, backend: this.backend, backendClient: this.backendClient,
+      gate: this.gate, scheduler: this.scheduler, catchup: this.catchup, maintenance: this.maintenance,
+      isStopping: () => !this.running || this.settingsRestartPending,
+      onChange: () => this.scheduler.wake(),
+      onEvent: (event, fields) => this.observability.record(event, fields),
+    });
   }
 
   async start({ listen = true } = {}) {
@@ -125,8 +137,10 @@ export class ProxyService {
     this.backend.start();
     this.catchup.start();
     if (this.catchup.requiresRecovery) {
-      this.backend.requireRecovery('A restored catch-up inference has unknown completion; verify Ollama and GPU idle state before resuming');
+      this.backend.requireRecovery('A restored catch-up inference has unknown completion; verify Ollama and GPU idle state before resuming', { code: 'restored_attempt_uncertain' });
     }
+    this.hostHelper.start();
+    this.automaticRecovery.start();
     this.workerPromise = this.dispatchLoop();
     this.expiryTimer = setInterval(() => this.scheduler.expire(), Math.min(1_000, this.config.ollama.healthIntervalMs));
     this.expiryTimer.unref?.();
@@ -181,6 +195,9 @@ export class ProxyService {
     }
     if (url.pathname === '/_intermediary/v1/recovery/acknowledge') {
       return this.handleRecoveryAcknowledgment(request, response, id);
+    }
+    if (url.pathname === '/_intermediary/v1/recovery/check') {
+      return this.handleRecoveryCheck(request, response, id);
     }
     if ((url.pathname === '/debug' || url.pathname === '/debug/') && request.method !== 'GET') {
       response.setHeader('allow', 'GET');
@@ -264,6 +281,35 @@ export class ProxyService {
     return { allowed: readiness.ready, reason: readiness.reason, wait_seconds: readiness.wait_seconds };
   }
 
+  async handleRecoveryCheck(request, response, id) {
+    response.setHeader('cache-control', 'no-store');
+    const token = this.config.maintenance.auth_token;
+    if (!token) return sendJson(response, 503, { error: 'Configure MAINTENANCE_TOKEN to use recovery controls.' }, id);
+    if (!authorized(request, token)) return sendJson(response, 401, { error: 'Maintenance token required.' }, id);
+    if (request.method !== 'POST') {
+      response.setHeader('allow', 'POST');
+      return sendJson(response, 405, { error: 'Use POST.' }, id);
+    }
+    if (!String(request.headers['content-type'] || '').toLowerCase().startsWith('application/json')) {
+      return sendJson(response, 415, { error: 'Use application/json.' }, id);
+    }
+    let body;
+    try { body = JSON.parse((await readBody(request, 4096)).toString('utf8')); }
+    catch { return sendJson(response, 400, { error: 'Provide a JSON confirmation.' }, id); }
+    if (body?.confirm !== true) return sendJson(response, 400, { error: 'Set confirm:true. Recovery may restart only Ollama.' }, id);
+    if (this.settingsRestartPending || !this.running) return sendJson(response, 409, { error: 'The intermediary is stopping.' }, id);
+    try {
+      const recovery = this.automaticRecovery.checkNow();
+      return sendJson(response, 202, { accepted: true, recovery,
+        message: 'Recovery check scheduled. It may restart Ollama; manual pauses remain unchanged.' }, id);
+    } catch (error) {
+      const codes = new Set(['automatic_recovery_disabled', 'automatic_recovery_state_unreadable', 'automatic_recovery_state_unwritable']);
+      const code = codes.has(error.code) ? error.code : 'recovery_unavailable';
+      return sendJson(response, code === 'automatic_recovery_disabled' ? 409 : 503,
+        { error: 'Enable and configure host-assisted recovery, or resolve its state error first.', code }, id);
+    }
+  }
+
   async handleRecoveryAcknowledgment(request, response, id) {
     response.setHeader('cache-control', 'no-store');
     const token = this.config.maintenance.auth_token;
@@ -337,7 +383,8 @@ export class ProxyService {
     if (status.recovery_required && !previous?.recovery_required) {
       this.observability.record('gpu_recovery_required', {
         state: status.state,
-        reason: 'Ollama reported a GPU fault; host recovery is required.',
+        reason: RECOVERY_REASONS[status.recovery_code] ?? RECOVERY_REASONS.unknown,
+        recovery_code: status.recovery_code,
       });
     }
     if (status.circuit_open && !previous?.circuit_open) {
@@ -359,13 +406,14 @@ export class ProxyService {
     const backend = {
       ...backendRaw,
       recovery_reason: backendRaw.recovery_required
-        ? 'GPU health or upstream completion could not be verified; host recovery verification is required.'
+        ? `${RECOVERY_REASONS[backendRaw.recovery_code] ?? RECOVERY_REASONS.unknown} Host recovery verification is required.`
         : null,
       last_error: backendRaw.last_error ? 'Ollama backend error; inspect intermediary logs for details.' : null,
       last_inference_error: backendRaw.last_inference_error ? 'Ollama inference failed; inspect intermediary logs for details.' : null,
       recovery_storage_error: backendRaw.recovery_storage_error ? 'GPU recovery state could not be persisted or read; inspect intermediary logs.' : null,
     };
     const scheduler = this.scheduler.details(now);
+    const { service: hostService, bound: hostBound, restart_policy: hostPolicy, ...hostGpu } = this.hostHelper.snapshot();
     const maintenance = this.maintenance.status(now);
     const ready = !maintenance.paused && scheduler.accepting && this.backend.canDispatch(now);
     let schedulerState = 'idle';
@@ -389,6 +437,8 @@ export class ProxyService {
         event_clients: this.observability.listeners.size,
       },
       backend,
+      host_gpu: hostGpu,
+      recovery: this.automaticRecovery.status(),
       maintenance,
       frigate: this.catchup.status(),
       scheduler: {
@@ -1239,6 +1289,8 @@ export class ProxyService {
   async stop(graceMs = this.config.server.shutdownGraceMs) {
     if (!this.running) return;
     this.running = false;
+    this.hostHelper.stop();
+    await this.automaticRecovery.stop();
     await this.catchup.stop();
     this.scheduler.stop();
     this.backend.stop();

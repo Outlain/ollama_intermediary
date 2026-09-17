@@ -62,6 +62,25 @@ const DEFAULTS = {
     recovery_on_oom: true,
     error_body_limit_bytes: 65_536,
   },
+  host_helper: {
+    enabled: false,
+    socket_path: '/run/ollama-intermediary-host/control.sock',
+    poll_interval: '5s',
+    request_timeout: '15s',
+    stale_after: '30s',
+  },
+  auto_recovery: {
+    enabled: false,
+    state_path: '/app/state/auto-recovery.json',
+    check_interval: '5s',
+    restart_timeout: '90s',
+    verification_timeout: '60s',
+    cooldown: '5m',
+    window: '1h',
+    max_restarts: 2,
+    stable_samples: 3,
+    max_idle_vram_mb: 512,
+  },
   observability: {
     enabled: true,
     ui_enabled: true,
@@ -146,6 +165,15 @@ function durationFields(config) {
   config.circuit_breaker.openDurationMs = parseDuration(config.circuit_breaker.open_duration, 'circuit_breaker.open_duration');
   config.gpu_safety.unloadTimeoutMs = parseDuration(config.gpu_safety.unload_timeout, 'gpu_safety.unload_timeout');
   config.maintenance.maxPauseMs = parseDuration(config.maintenance.max_pause, 'maintenance.max_pause');
+  for (const [section, fields] of Object.entries({
+    host_helper: { poll_interval: 'pollIntervalMs', request_timeout: 'requestTimeoutMs', stale_after: 'staleAfterMs' },
+    auto_recovery: {
+      check_interval: 'checkIntervalMs', restart_timeout: 'restartTimeoutMs', verification_timeout: 'verificationTimeoutMs',
+      cooldown: 'cooldownMs', window: 'windowMs',
+    },
+  })) {
+    for (const [field, derived] of Object.entries(fields)) config[section][derived] = parseDuration(config[section][field], `${section}.${field}`);
+  }
   for (const [field, derived] of Object.entries({
     poll_interval: 'pollIntervalMs', live_grace: 'liveGraceMs',
     confirmation_interval: 'confirmationIntervalMs', cleanup_interval: 'cleanupIntervalMs',
@@ -206,6 +234,49 @@ function validate(config) {
   if (typeof config.gpu_safety.state_path !== 'string'
     || (config.gpu_safety.state_path && !config.gpu_safety.state_path.startsWith('/'))) {
     throw new Error('gpu_safety.state_path must be empty or an absolute path');
+  }
+  for (const section of ['host_helper', 'auto_recovery']) {
+    if (typeof config[section].enabled !== 'boolean') throw new Error(`${section}.enabled must be true or false`);
+  }
+  for (const [section, field] of [['host_helper', 'socket_path'], ['auto_recovery', 'state_path']]) {
+    const value = config[section][field];
+    if (typeof value !== 'string' || !value.startsWith('/') || /[\x00-\x1f\x7f]/.test(value)) {
+      throw new Error(`${section}.${field} must be an absolute path without control characters`);
+    }
+  }
+  for (const [section, field, derived, min, max] of [
+    ['host_helper', 'poll_interval', 'pollIntervalMs', 1000, 60000],
+    ['host_helper', 'request_timeout', 'requestTimeoutMs', 1000, 60000],
+    ['host_helper', 'stale_after', 'staleAfterMs', 1000, 300000],
+    ['auto_recovery', 'check_interval', 'checkIntervalMs', 1000, 60000],
+    ['auto_recovery', 'restart_timeout', 'restartTimeoutMs', 10000, 300000],
+    ['auto_recovery', 'verification_timeout', 'verificationTimeoutMs', 10000, 300000],
+    ['auto_recovery', 'cooldown', 'cooldownMs', 300000, 86400000],
+    ['auto_recovery', 'window', 'windowMs', 3600000, 604800000],
+  ]) {
+    if (config[section][derived] < min || config[section][derived] > max) {
+      throw new Error(`${section}.${field} must be between ${min / 1000}s and ${max / 1000}s`);
+    }
+  }
+  if (config.host_helper.staleAfterMs < config.host_helper.pollIntervalMs) {
+    throw new Error('host_helper.stale_after must be at least host_helper.poll_interval');
+  }
+  for (const [field, min, max] of [['max_restarts', 1, 2], ['stable_samples', 2, 10], ['max_idle_vram_mb', 64, 4096]]) {
+    if (!Number.isInteger(config.auto_recovery[field]) || config.auto_recovery[field] < min || config.auto_recovery[field] > max) {
+      throw new Error(`auto_recovery.${field} must be between ${min} and ${max}`);
+    }
+  }
+  if (config.auto_recovery.windowMs < config.auto_recovery.cooldownMs) {
+    throw new Error('auto_recovery.window must be at least auto_recovery.cooldown');
+  }
+  if (config.auto_recovery.verificationTimeoutMs < config.auto_recovery.stable_samples * config.auto_recovery.checkIntervalMs) {
+    throw new Error('auto_recovery.verification_timeout must allow stable_samples times check_interval');
+  }
+  if (config.auto_recovery.enabled && !config.host_helper.enabled) {
+    throw new Error('auto_recovery.enabled requires host_helper.enabled');
+  }
+  if (config.auto_recovery.enabled && (!config.maintenance.enabled || typeof config.maintenance.auth_token !== 'string' || !config.maintenance.auth_token.trim())) {
+    throw new Error('auto_recovery.enabled requires maintenance.enabled and a host-managed maintenance.auth_token');
   }
   for (const field of ['enabled', 'verify_tls']) {
     if (typeof config.frigate[field] !== 'boolean') throw new Error(`frigate.${field} must be true or false`);
@@ -377,6 +448,21 @@ export function normalizeConfig(raw = {}) {
   durationFields(config);
   validate(config);
   return config;
+}
+
+/** Host opt-ins also work with an older config.yml; unset environment values never replace operator choices. */
+export function applyHostEnvironment(raw = {}, environment = process.env) {
+  const result = clone(raw);
+  for (const [section, variable] of [['host_helper', 'HOST_HELPER_ENABLED'], ['auto_recovery', 'AUTO_RECOVERY_ENABLED']]) {
+    const value = environment[variable];
+    if (value === undefined || value === '') continue;
+    if (!['true', 'false', '1', '0'].includes(value)) throw new Error(`${variable} must be exactly true, false, 1, or 0`);
+    result[section] = { ...result[section], enabled: value === 'true' || value === '1' };
+  }
+  if (environment.HOST_HELPER_SOCKET_PATH) {
+    result.host_helper = { ...result.host_helper, socket_path: environment.HOST_HELPER_SOCKET_PATH };
+  }
+  return result;
 }
 
 export function expandEnvironment(text, environment = process.env) {

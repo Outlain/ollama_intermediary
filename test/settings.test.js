@@ -87,6 +87,38 @@ test('explicit open Frigate API mode is editable without a missing-credentials w
   assert.equal(result.diagnostics.some((item) => item.code === 'frigate_credentials_missing'), false);
 });
 
+test('host monitoring and recovery controls are editable while socket and state paths stay host-managed', (t) => {
+  const options = fixture(t);
+  const result = validateSettingsDraft({ ...options, draft: {
+    host_helper: { enabled: true, poll_interval: '10s', request_timeout: '20s', stale_after: '40s' },
+    auto_recovery: { enabled: true, check_interval: '10s', restart_timeout: '2m', verification_timeout: '1m', cooldown: '10m', window: '2h', max_restarts: 1, stable_samples: 4, max_idle_vram_mb: 256 },
+  } });
+  assert.equal(result.valid, true);
+  assert.equal(result.effectiveConfig.auto_recovery.cooldownMs, 600000);
+  assert.equal(result.effectiveConfig.host_helper.pollIntervalMs, 10000);
+  assert.equal(result.settings.auto_recovery.enabled, true);
+  assert.equal(result.settings.auto_recovery.state_path, undefined);
+  assert.equal(result.settings.host_helper.socket_path, undefined);
+  assert.equal(result.settings.auto_recovery.cooldownMs, undefined);
+  for (const [section, field] of [['host_helper', 'socket_path'], ['auto_recovery', 'state_path']]) {
+    const blocked = validateSettingsDraft({ ...options, draft: { [section]: { [field]: '/tmp/changed' } } });
+    assert.equal(blocked.valid, false);
+    assert.ok(blocked.diagnostics.some((item) => item.path === `${section}.${field}`));
+  }
+});
+
+test('host recovery settings cannot bypass bounded safety or credential requirements', (t) => {
+  const options = fixture(t);
+  for (const draft of [
+    { auto_recovery: { enabled: true } },
+    { host_helper: { enabled: true }, auto_recovery: { enabled: true }, maintenance: { enabled: false } },
+    { auto_recovery: { max_restarts: 3 } },
+    { auto_recovery: { cooldown: '1m' } },
+    { auto_recovery: { stable_samples: 1 } },
+    { host_helper: { request_timeout: '61s' } },
+  ]) assert.equal(validateSettingsDraft({ ...options, draft }).valid, false);
+});
+
 test('catch-up cadence, cleanup, history, and attention options are editable and preserve saved policies', (t) => {
   const options = fixture(t);
   options.baseRaw.frigate = { max_retry_interval: '1h', state_path: '/app/state/original-backlog.json' };

@@ -15,6 +15,7 @@
   var memoryToken = '';
   var memoryMaintenanceToken = '';
   var maintenanceActionPending = false;
+  var recoveryActionPending = false;
   var refreshPromise = null;
   var pollTimer = null;
   var authBlocked = false;
@@ -148,6 +149,12 @@
     return headers;
   }
 
+  function recoveryIsActive(data) {
+    var state = data && data.recovery && data.recovery.state;
+    return Boolean(data && data.backend && data.backend.recovery_required)
+      || ['restarting', 'verifying'].includes(state);
+  }
+
   function setConnection(kind, label) {
     var badge = byId('connection-status');
     badge.classList.remove('is-live', 'is-offline');
@@ -180,8 +187,8 @@
     var maintenance = data.maintenance || {};
     var maintenanceState = String(maintenance.state || (maintenance.paused ? 'paused' : 'running')).toLowerCase();
     var ready = typeof service.ready === 'boolean' ? service.ready : service.state === 'ready';
-    if (backend.recovery_required) {
-      return { css: 'health-danger', title: 'GPU recovery required', detail: backend.recovery_reason || 'Inference is paused to protect the GPU.' };
+    if (recoveryIsActive(data)) {
+      return { css: 'health-danger', title: data.recovery && ['restarting', 'verifying'].includes(data.recovery.state) ? 'Inference recovery in progress' : 'Inference recovery required', detail: backend.recovery_reason || 'The previous operation could not be verified safe. New inference is blocked during recovery.' };
     }
     if (maintenanceState === 'error') {
       return { css: 'health-danger', title: 'Pause mode needs attention', detail: maintenance.unload_error || maintenance.reason || 'The intermediary could not complete the maintenance transition.' };
@@ -200,6 +207,9 @@
     }
     if (backend.state && backend.state !== 'healthy') {
       return { css: 'health-warning', title: titleCase(backend.state), detail: 'The backend is reachable but is not in its normal healthy state.' };
+    }
+    if (data.recovery && (data.recovery.requires_attention || data.recovery.state === 'needs_attention')) {
+      return { css: 'health-warning', title: 'Automatic recovery needs attention', detail: 'No inference recovery lock is reported. Normal scheduling can continue, but automatic recovery is unavailable until its reported issue is resolved.' };
     }
     if (backend.last_inference_error) {
       return { css: 'health-warning', title: 'Last inference request failed', detail: 'The Ollama API is reachable, but that does not confirm the model ran successfully. Inspect recent activity for the failure.' };
@@ -237,7 +247,7 @@
     var state = String(maintenance.state || (maintenance.paused ? 'paused' : 'running')).toLowerCase();
     var controlAvailable = maintenance.control_available === true;
     var hasToken = Boolean(getMaintenanceToken());
-    var canAct = controlAvailable && hasToken && !maintenanceActionPending;
+    var canAct = controlAvailable && hasToken && !maintenanceActionPending && !recoveryActionPending;
     var tokenInput = byId('maintenance-token-input');
     var tokenSubmit = byId('maintenance-token-submit');
     var duration = byId('pause-duration');
@@ -248,7 +258,7 @@
     if (tokenSubmit) tokenSubmit.disabled = !controlAvailable;
     if (duration) duration.disabled = !canAct || state !== 'running';
     if (pause) pause.disabled = !canAct || state !== 'running';
-    if (resume) resume.disabled = !canAct || (state !== 'paused' && state !== 'pausing' && state !== 'error');
+    if (resume) resume.disabled = !canAct || recoveryIsActive(snapshot) || (state !== 'paused' && state !== 'pausing' && state !== 'error');
 
     if (!snapshot) {
       setText('maintenance-control-availability', 'Waiting for maintenance status…');
@@ -259,22 +269,30 @@
     } else if (maintenanceActionPending) {
       setText('maintenance-control-availability', 'A maintenance request is in progress…');
     } else {
-      setText('maintenance-control-availability', 'Maintenance controls are ready. This token is used only for pause and resume requests.');
+      setText('maintenance-control-availability', recoveryIsActive(snapshot)
+        ? 'Recovery is required. You may pause inference; resume is blocked until recovery completes.'
+        : 'Maintenance controls are ready. This token authorizes pause, resume, and protected recovery actions.');
     }
+    syncRecoveryControls();
   }
 
   function renderMaintenance(data) {
     var maintenance = data.maintenance || {};
     var state = String(maintenance.state || (maintenance.paused ? 'paused' : 'running')).toLowerCase();
     var stateTag = byId('maintenance-state');
+    var recoveryBlocked = recoveryIsActive(data);
     stateTag.className = 'tag tag-neutral';
     if (state === 'running') stateTag.className = 'tag tag-good';
     if (state === 'pausing' || state === 'paused') stateTag.className = 'tag tag-warning';
     if (state === 'error') stateTag.className = 'tag tag-danger';
-    setText('maintenance-state', titleCase(state));
+    setText('maintenance-state', state === 'running' && recoveryBlocked ? 'Recovery blocked' : titleCase(state));
+    if (recoveryBlocked) stateTag.className = 'tag tag-danger';
 
     var reasonPrefix = maintenance.reason ? 'Reason: ' + maintenance.reason + '. ' : '';
-    if (state === 'pausing') {
+    if (recoveryBlocked) {
+      setText('maintenance-title', state === 'paused' || maintenance.paused ? 'Inference is paused · recovery required' : 'Inference is blocked for recovery');
+      setText('maintenance-detail', 'No new inference can start until recovery is verified. Manual pause remains in effect after recovery; it is never automatically resumed.');
+    } else if (state === 'pausing') {
       setText('maintenance-title', 'Finishing the active request');
       setText('maintenance-detail', reasonPrefix + 'No additional inference will start while the active upstream request drains.');
     } else if (state === 'error') {
@@ -304,7 +322,8 @@
       setText('maintenance-resume-at', (state === 'paused' || state === 'pausing') ? 'Manual' : '—');
       setText('maintenance-countdown', (state === 'paused' || state === 'pausing') ? 'Manual' : '—');
     }
-    if (maintenance.gpu_released === true) setText('maintenance-gpu-released', 'Yes');
+    if (recoveryBlocked) setText('maintenance-gpu-released', 'Not verified');
+    else if (maintenance.gpu_released === true) setText('maintenance-gpu-released', 'Yes');
     else if (state === 'pausing') setText('maintenance-gpu-released', 'Waiting for drain');
     else if (state === 'paused' || state === 'error') setText('maintenance-gpu-released', 'No');
     else setText('maintenance-gpu-released', 'Available to Ollama');
@@ -316,7 +335,7 @@
   function renderActive(data) {
     var active = data.active_request;
     var scheduler = data.scheduler || {};
-    var workloadState = String(scheduler.state || (active ? 'busy' : 'idle')).toLowerCase();
+    var workloadState = recoveryIsActive(data) ? 'recovery_required' : String(scheduler.state || (active ? 'busy' : 'idle')).toLowerCase();
     var stateTag = byId('active-state');
     stateTag.className = 'tag tag-neutral';
     if (workloadState === 'busy' || workloadState === 'idle') stateTag.className = 'tag tag-good';
@@ -326,6 +345,11 @@
     setHidden('active-content', !active);
     if (!active) {
       activeClock = null;
+      setText('active-empty-title', recoveryIsActive(data) ? 'New inference is blocked' : 'No request is running');
+      setText('active-empty-detail', recoveryIsActive(data)
+        ? 'Recovery must finish before another request can start. An empty scheduler does not prove upstream work stopped.'
+        : data.maintenance && data.maintenance.paused ? 'Inference remains paused. Resume it only when you are ready.'
+          : workloadState === 'idle' ? 'The scheduler is idle. New requests remain subject to backend and safety checks.' : 'The scheduler is not currently dispatching a request.');
       return;
     }
 
@@ -430,7 +454,7 @@
     setText('backend-draining', scheduler.upstream_draining ? 'Yes' : 'No');
     setText('backend-last-success', formatRelativeDate(backend.last_success_at));
     setHidden('recovery-warning', !backend.recovery_required);
-    setText('recovery-reason', backend.recovery_reason || 'The backend reported an unsafe GPU state.');
+    setText('recovery-reason', backend.recovery_reason || 'The previous operation could not be verified safe.');
     setHidden('inference-warning', !backend.last_inference_error || backend.recovery_required);
     setText('inference-warning', backend.last_inference_error);
     setText('loaded-model-count', formatInteger(models.length));
@@ -438,6 +462,160 @@
     var list = byId('loaded-models');
     list.replaceChildren();
     models.forEach(function (model) { list.appendChild(modelItem(model)); });
+  }
+
+  function syncRecoveryControls() {
+    var data = snapshot || {};
+    var maintenance = data.maintenance || {};
+    var recovery = data.recovery || {};
+    var busy = recoveryActionPending || maintenanceActionPending || ['restarting', 'verifying'].includes(recovery.state);
+    var authorized = maintenance.control_available === true && Boolean(getMaintenanceToken());
+    var paused = maintenance.state === 'paused' || maintenance.paused === true;
+    var locked = recoveryIsActive(data);
+    byId('recovery-check').disabled = !authorized || busy || !recovery.enabled || !locked;
+    byId('recovery-acknowledge').disabled = !authorized || busy || !paused || !locked || !byId('recovery-confirm').checked || Boolean(data.active_request);
+    setText('recovery-control-state', !authorized
+      ? 'Enter the maintenance control token above to use recovery controls. Dashboard and Settings tokens do not authorize recovery.'
+      : busy ? 'A recovery or maintenance action is in progress. Manual pause will be preserved.'
+        : !recovery.enabled ? 'Automatic recovery is disabled. Configure the host helper and automatic recovery in Settings, or verify the host and acknowledge manually while paused.'
+          : 'Check / recover now may restart only Ollama within the configured limits. Manual acknowledgment requires paused inference and explicit host verification. Neither action resumes a manual pause.');
+  }
+
+  function renderRecovery(data) {
+    var recovery = data.recovery || {};
+    var backend = data.backend || {};
+    var state = recovery.state || (recovery.enabled ? 'idle' : 'disabled');
+    var descriptions = {
+      disabled: 'Automatic recovery is disabled. A host helper must be installed before it can be enabled in Settings.',
+      idle: 'No automatic recovery is currently needed. One-at-a-time inference protection remains active.',
+      waiting: 'New inference is blocked while recovery waits for a safe restart boundary. A manual pause is preserved; use Check / recover now to explicitly request recovery while paused.',
+      restarting: 'Restarting only the Ollama service to establish that the previous operation has stopped. No GPU reset or host reboot is performed.',
+      verifying: 'Checking fresh host telemetry and Ollama after restart. Inference remains blocked until verification succeeds.',
+      cooldown: 'Restart cooldown is active. New inference remains blocked; the next check cannot bypass the restart limit.',
+      needs_attention: 'Automatic recovery could not establish a safe state within its limits. Check the reported cause and host before acknowledging recovery.',
+      recovered: 'Recovery was verified. Any manual pause remains in effect; recovery does not resume it.'
+    };
+    setText('recovery-state', titleCase(state));
+    byId('recovery-state').className = recoveryIsActive(data) ? 'tag tag-warning' : 'tag tag-neutral';
+    if (recovery.requires_attention || state === 'needs_attention') byId('recovery-state').className = 'tag tag-danger';
+    setText('recovery-detail', !recoveryIsActive(data) && ['waiting', 'cooldown', 'needs_attention'].includes(state)
+      ? 'No inference recovery lock is reported. Normal scheduling can continue; automatic recovery needs attention before it can handle a future incident.'
+      : descriptions[state] || 'Recovery status is unknown. Do not infer that GPU work has stopped.');
+    var steps = {
+      manual_pause: 'Waiting for your manual pause. Check / recover now explicitly permits bounded recovery while remaining paused.',
+      active_operation: 'Waiting for the current operation to release the exclusive inference gate.',
+      service_stopping: 'The intermediary is stopping; no new recovery operation will start.',
+      restarting_ollama_only: 'Restarting Ollama only; no host reboot or GPU reset.',
+      checking_restart_outcome: 'Checking whether the Ollama service restart finished; it is not yet verified.',
+      checking_gpu_and_ollama: 'Verifying consecutive fresh GPU samples and an empty, reachable Ollama backend after restart.',
+      restart_limit_reached: 'This incident reached its restart limit. Verify the host; repeated clicks do not bypass the limit.',
+      restart_window_limit: 'The restart budget for this time window is exhausted.',
+      restart_cooldown: 'Waiting for the minimum interval between service restarts.',
+      other_gpu_work_or_unknown_processes: 'Other GPU work or unknown process ownership prevents a safe automatic restart.',
+      restart_outcome_unknown: 'The service restart outcome is uncertain. Host verification is required.',
+      manual_pause_preserved: 'Recovery succeeded. Your manual pause remains in effect.',
+      inference_reenabled: 'Recovery succeeded. Normal scheduling and live priority apply.'
+    };
+    setHidden('recovery-step', !recovery.reason);
+    setText('recovery-step', recovery.reason ? 'Current check: ' + (steps[recovery.reason] || titleCase(recovery.reason)) : '');
+    var reason = backend.recovery_reason || recovery.reason;
+    setHidden('recovery-cause', !reason);
+    setText('recovery-cause', reason);
+    setText('recovery-code', backend.recovery_code ? titleCase(backend.recovery_code) : 'Unknown');
+    setText('recovery-enabled', recovery.enabled ? 'Enabled' : 'Disabled');
+    setText('recovery-host', recovery.host_available === true ? 'Reachable' : recovery.host_available === false ? 'Unavailable' : 'Unknown');
+    setText('recovery-attempts', formatInteger(recovery.attempts_in_window) + ' / ' + formatInteger(recovery.max_restarts));
+    setText('recovery-episode-attempts', formatInteger(recovery.episode_attempts) + ' / ' + formatInteger(recovery.max_restarts));
+    setText('recovery-window-label', recovery.window_seconds == null ? 'Restarts in rolling window' : 'Restarts in rolling ' + formatDuration(recovery.window_seconds) + ' window');
+    setText('recovery-cooldown', formatDuration(recovery.cooldown_remaining_seconds));
+    setText('recovery-last-check', formatRelativeDate(recovery.last_check_at));
+    setHidden('recovery-last-error', !recovery.last_error);
+    setText('recovery-last-error', recovery.last_error ? 'Last recovery error: ' + titleCase(recovery.last_error) : '');
+    syncRecoveryControls();
+  }
+
+  function hardwareValue(value, suffix, valid) {
+    if (!valid || value == null || value === '' || !Number.isFinite(Number(value)) || Number(value) < 0) return 'Unknown';
+    return Number(value).toLocaleString(undefined, { maximumFractionDigits: 1 }) + suffix;
+  }
+
+  function hardwareBytes(value, valid) {
+    return !valid || value == null || value === '' || !Number.isFinite(Number(value)) || Number(value) < 0 ? 'Unknown' : formatBytes(value);
+  }
+
+  function renderHostGpu(data) {
+    var host = data.host_gpu || {};
+    var fresh = host.enabled === true && host.available === true && host.stale === false;
+    var gpus = Array.isArray(host.gpus) ? host.gpus : [];
+    setText('host-gpu-state', !host.enabled ? 'Disabled' : host.stale ? 'Stale · unknown' : fresh ? 'Available' : 'Unavailable');
+    byId('host-gpu-state').className = fresh ? 'tag tag-good' : 'tag tag-warning';
+    setText('host-gpu-detail', !host.enabled ? 'Install and enable the read-only host helper to display physical GPU metrics. Ollama model allocations alone cannot provide total VRAM usage.'
+      : !fresh ? 'Fresh host telemetry is unavailable. Hardware values are unknown, not zero; no safety decision should rely on this display.'
+        : gpus.length ? 'Physical GPU usage includes driver allocations and other processes, not just Ollama models.' : 'The host helper returned no GPU devices. No hardware measurements are available.');
+    setText('host-gpu-sampled', host.sampled_at ? 'Last hardware sample: ' + formatRelativeDate(host.sampled_at) + (fresh ? '' : ' · not current') : 'No hardware sample available.');
+    setHidden('host-gpu-error', !host.error);
+    setText('host-gpu-error', host.error);
+    var list = byId('host-gpu-list');
+    list.replaceChildren();
+    gpus.slice(0, 8).forEach(function (gpu) {
+      var item = create('section', 'host-gpu-item');
+      item.appendChild(create('h3', '', String(gpu.name || 'GPU ' + (gpu.id == null ? '?' : gpu.id)).slice(0, 180)));
+      var stats = create('dl', 'detail-grid');
+      [['Total VRAM', hardwareBytes(gpu.vram_total_bytes, fresh)], ['Used VRAM', hardwareBytes(gpu.vram_used_bytes, fresh)],
+        ['Free VRAM', hardwareBytes(gpu.vram_free_bytes, fresh)], ['GPU utilization', hardwareValue(gpu.utilization_percent, '%', fresh)],
+        ['Temperature', hardwareValue(gpu.temperature_c, ' °C', fresh)], ['Power', hardwareValue(gpu.power_w, ' W', fresh)]].forEach(function (entry) {
+          var pair = create('div'); pair.appendChild(create('dt', '', entry[0])); pair.appendChild(create('dd', '', entry[1])); stats.appendChild(pair);
+        });
+      item.appendChild(stats);
+      var known = fresh && gpu.processes_known === true;
+      var processes = Array.isArray(gpu.processes) ? gpu.processes : [];
+      item.appendChild(create('p', 'form-help', !known ? 'GPU processes: unknown.' : processes.length ? 'Reported GPU processes (up to 12 shown):' : 'No GPU processes reported in this sample.'));
+      if (known && processes.length) {
+        var processList = create('ul', 'gpu-process-list');
+        processes.slice(0, 12).forEach(function (process) {
+          processList.appendChild(create('li', '', 'PID ' + String(process.pid == null ? 'unknown' : process.pid).slice(0, 24) + ' · '
+            + String(process.name || (process.is_ollama ? 'Ollama' : 'Unnamed process')).slice(0, 100) + ' · '
+            + hardwareBytes(process.vram_bytes, fresh) + ' VRAM' + (process.is_ollama ? ' · Ollama' : '')));
+        });
+        item.appendChild(processList);
+        if (processes.length > 12) item.appendChild(create('p', 'form-help', formatInteger(processes.length - 12) + ' additional processes are not shown.'));
+      }
+      list.appendChild(item);
+    });
+  }
+
+  async function performRecoveryAction(action) {
+    if (!['check', 'acknowledge'].includes(action) || recoveryActionPending || maintenanceActionPending) return;
+    var maintenance = snapshot && snapshot.maintenance || {};
+    var recovery = snapshot && snapshot.recovery || {};
+    if (!getMaintenanceToken() || maintenance.control_available !== true || !recoveryIsActive(snapshot)) return;
+    if (['restarting', 'verifying'].includes(recovery.state)) return;
+    if (action === 'check' && !recovery.enabled) return;
+    if (action === 'acknowledge' && (!(maintenance.state === 'paused' || maintenance.paused === true) || !byId('recovery-confirm').checked || snapshot.active_request)) return;
+    if (action === 'check' && !window.confirm('Check recovery now? This may restart only the Ollama service, interrupting its clients, within the configured limits. It never resets the GPU, reboots the host, or resumes a manual pause.')) return;
+    recoveryActionPending = true;
+    syncMaintenanceControls();
+    setText('recovery-action-status', action === 'check' ? 'Requesting a bounded recovery check…' : 'Submitting your host recovery verification…');
+    var controller = new AbortController();
+    var timeout = window.setTimeout(function () { controller.abort(); }, 15000);
+    try {
+      var response = await fetch('/_intermediary/v1/recovery/' + action, {
+        method: 'POST', headers: maintenanceHeaders(), cache: 'no-store', credentials: 'same-origin', signal: controller.signal,
+        body: JSON.stringify(action === 'check' ? { confirm: true } : { confirm_gpu_recovered: true })
+      });
+      var payload = await response.json();
+      if (response.status === 401 || response.status === 403) { setMaintenanceToken(''); throw new Error('The maintenance token was rejected. Enter it again.'); }
+      if (!response.ok) throw new Error(typeof payload.error === 'string' ? payload.error : payload.error && payload.error.message || payload.message || 'HTTP ' + response.status);
+      byId('recovery-confirm').checked = false;
+      setText('recovery-action-status', action === 'check' ? 'Recovery check accepted. Watch the checks and cooldown above; a manual pause remains in effect.' : 'Recovery acknowledgment accepted. A manual pause remains in effect; resume separately when ready.');
+      await refreshSnapshot();
+    } catch (error) {
+      setText('recovery-action-status', controller.signal.aborted ? 'The recovery request timed out. Check the status before retrying; it may already be in progress.' : 'Recovery action not completed: ' + error.message);
+    } finally {
+      window.clearTimeout(timeout);
+      recoveryActionPending = false;
+      syncMaintenanceControls();
+    }
   }
 
   function eventSeverity(event) {
@@ -490,6 +668,8 @@
     renderActive(data);
     renderQueue(data);
     renderBackend(data);
+    renderRecovery(data);
+    renderHostGpu(data);
     renderEvents(data);
     renderCatchup(data.frigate || {});
     if (data.build) setText('schema-version', 'Version ' + data.build.version + ' · ' + data.build.revision + ' · Schema ' + data.schema_version);
@@ -715,6 +895,7 @@
   function syncCatchupControls() {
     setHidden('catchup-use-saved-token', !savedCatchupToken() || Boolean(catchupAdminToken));
     setHidden('catchup-lock', !catchupAdminToken);
+    byId('catchup-refresh').disabled = !catchupAdminToken || catchupActionPending;
     setText('catchup-control-state', catchupAdminToken
       ? 'Settings token selected for this tab. The server checks it for every action. Retrying respects live priority, pause mode, and the active handoff.'
       : 'Controls are locked. Enter the separate Settings admin token, or explicitly use its saved token. Dashboard and maintenance tokens are never used for these actions.');
@@ -727,31 +908,33 @@
   }
 
   async function performCatchupAction(action, job) {
-    if (!catchupAdminToken || catchupActionPending || !['retry', 'recheck'].includes(action)) return;
+    if (!catchupAdminToken || catchupActionPending || !['retry', 'recheck', 'refresh'].includes(action)) return;
     if (action === 'retry' && job.state !== 'retrying') return;
     if (action === 'recheck' && (job.state || job.status) !== 'skipped') return;
-    if (!window.confirm(action === 'retry' ? 'Make this job eligible to retry when idle? Existing descriptions and media will be checked first. This does not bypass live priority or pause mode.' : 'Recheck this skipped item and queue it only if eligible again? No recording or description will be deleted.')) return;
+    if (action !== 'refresh' && !window.confirm(action === 'retry' ? 'Make this job eligible to retry when idle? Existing descriptions and media will be checked first. This does not bypass live priority or pause mode.' : 'Recheck this skipped item and queue it only if eligible again? No recording or description will be deleted.')) return;
     catchupActionPending = true;
+    syncCatchupControls();
     renderCatchupPage();
     var controller = new AbortController();
     var timeout = window.setTimeout(function () { controller.abort(); }, 10000);
     try {
       var response = await fetch('/_intermediary/v1/frigate/' + action, {
         method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/json', authorization: 'Bearer ' + catchupAdminToken },
-        body: JSON.stringify({ confirm: true, kind: job.kind, id: job.id }), signal: controller.signal
+        body: JSON.stringify(action === 'refresh' ? { confirm: true } : { confirm: true, kind: job.kind, id: job.id }), signal: controller.signal
       });
       var payload = await response.json();
       if (!response.ok) {
         if (response.status === 401 || response.status === 403) unlockCatchup('');
         throw new Error(typeof payload.error === 'string' ? payload.error : payload.error && payload.error.message || payload.message || 'HTTP ' + response.status);
       }
-      setText('catchup-action-status', 'Request accepted. Media, saved descriptions, and scheduling rules still apply.');
+      setText('catchup-action-status', action === 'refresh' ? 'Connection recheck accepted. Capability status is refreshed without retrying jobs or bypassing the active handoff.' : 'Request accepted. Media, saved descriptions, and scheduling rules still apply.');
       await refreshSnapshot();
     } catch (error) {
       setText('catchup-action-status', controller.signal.aborted ? 'The action timed out. Refresh the job status before trying again; it may have been accepted.' : 'Action not completed: ' + error.message);
     } finally {
       window.clearTimeout(timeout);
       catchupActionPending = false;
+      syncCatchupControls();
       renderCatchupPage();
     }
   }
@@ -804,6 +987,10 @@
       } catch (error) {
         showError(controller.signal.aborted ? 'Status request timed out. Retrying automatically.'
           : 'Unable to read intermediary status: ' + (error.message || String(error)));
+        if (snapshot && snapshot.host_gpu && snapshot.host_gpu.enabled) {
+          renderHostGpu({ host_gpu: Object.assign({}, snapshot.host_gpu, { available: false, stale: true,
+            error: 'The dashboard cannot refresh host telemetry. Displayed hardware state is unknown until reconnection.' }) });
+        }
         setConnection('offline', 'Disconnected');
         return false;
       } finally {
@@ -815,6 +1002,7 @@
   }
 
   async function performMaintenanceAction(action) {
+    if (maintenanceActionPending || recoveryActionPending || (action === 'resume' && recoveryIsActive(snapshot))) return;
     var token = getMaintenanceToken();
     if (!token) {
       setMaintenanceActionStatus('Enter the separate maintenance control token first.', 'error');
@@ -921,6 +1109,10 @@
   });
 
   byId('pause-button').addEventListener('click', function () { performMaintenanceAction('pause'); });
+  byId('recovery-check').addEventListener('click', function () { performRecoveryAction('check'); });
+  byId('recovery-acknowledge').addEventListener('click', function () { performRecoveryAction('acknowledge'); });
+  byId('recovery-confirm').addEventListener('change', syncRecoveryControls);
+  byId('catchup-refresh').addEventListener('click', function () { performCatchupAction('refresh'); });
   byId('catchup-previous').addEventListener('click', function () { changeCatchupPage(-1); });
   byId('catchup-next').addEventListener('click', function () { changeCatchupPage(1); });
   Object.keys(CATCHUP_VIEWS).forEach(function (view) {

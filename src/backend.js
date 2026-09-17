@@ -11,6 +11,28 @@ const GPU_FAULT_PATTERNS = [
   /(?:GPU|CUDA|HIP) (?:error:\s*)?out of memory/i,
 ];
 
+export const RECOVERY_REASONS = Object.freeze({
+  upstream_disconnected: 'The connection to Ollama closed after dispatch; completion is unknown.',
+  upstream_completion_uncertain: 'Ollama did not return a complete inference response.',
+  model_unload_failed: 'Ollama did not confirm that the previous model was unloaded.',
+  gpu_memory_fault: 'Ollama reported a GPU memory or mapping failure.',
+  restored_attempt_uncertain: 'An inference was outstanding when the intermediary restarted.',
+  catchup_state_error: 'Catch-up completion could not be saved safely; inspect state storage.',
+  recovery_state_error: 'The saved recovery state could not be read or written safely.',
+  unknown: 'GPU health or upstream completion requires verification.',
+});
+
+function recoveryCode(reason, supplied) {
+  if (Object.hasOwn(RECOVERY_REASONS, supplied ?? '')) return supplied;
+  if (/after dispatch; upstream completion is unknown/.test(reason)) return 'upstream_disconnected';
+  if (/without a complete response/.test(reason)) return 'upstream_completion_uncertain';
+  if (/restored catch-up inference/.test(reason)) return 'restored_attempt_uncertain';
+  if (/completion could not be persisted/.test(reason)) return 'catchup_state_error';
+  if (/unload/i.test(reason)) return 'model_unload_failed';
+  if (GPU_FAULT_PATTERNS.some((pattern) => pattern.test(reason))) return 'gpu_memory_fault';
+  return 'unknown';
+}
+
 function gpuFaultMessage(status, body, error = null) {
   const text = `${error?.message ?? ''}\n${Buffer.isBuffer(body) ? body.toString('utf8') : body ?? ''}`;
   if (!GPU_FAULT_PATTERNS.some((pattern) => pattern.test(text))) return null;
@@ -60,6 +82,7 @@ export class BackendState {
     this.probing = false;
     this.recoveryRequired = false;
     this.recoveryReason = null;
+    this.recoveryCode = null;
     this.recoverySince = null;
     this.loadedModels = [];
     this.recoveryStorageError = null;
@@ -76,6 +99,7 @@ export class BackendState {
       if (saved.recovery_required) {
         this.recoveryRequired = true;
         this.recoveryReason = typeof saved.reason === 'string' ? saved.reason : 'Persisted GPU recovery required';
+        this.recoveryCode = recoveryCode(this.recoveryReason, saved.code);
         this.recoverySince = Number.isFinite(saved.since) ? saved.since : this.clock();
         this.lastError = this.recoveryReason;
       }
@@ -83,6 +107,7 @@ export class BackendState {
       if (error.code === 'ENOENT') return;
       this.recoveryRequired = true;
       this.recoveryReason = 'GPU recovery state could not be read; manual verification required';
+      this.recoveryCode = 'recovery_state_error';
       this.recoverySince = this.clock();
       this.recoveryStorageError = error.message;
       this.lastError = this.recoveryReason;
@@ -97,7 +122,8 @@ export class BackendState {
       fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
       const descriptor = fs.openSync(temporary, 'wx', 0o600);
       try {
-        fs.writeFileSync(descriptor, JSON.stringify({ schema_version: 1, recovery_required: required, reason, since }));
+        fs.writeFileSync(descriptor, JSON.stringify({ schema_version: 1, recovery_required: required, reason, since,
+          code: required ? this.recoveryCode : null }));
         fs.fsyncSync(descriptor);
       } finally {
         fs.closeSync(descriptor);
@@ -117,6 +143,7 @@ export class BackendState {
     this.persistRecovery(false);
     this.recoveryRequired = false;
     this.recoveryReason = null;
+    this.recoveryCode = null;
     this.recoverySince = null;
     this.lastError = null;
     this.lastInferenceError = null;
@@ -171,7 +198,7 @@ export class BackendState {
   recordGenerationResult(status, body, error = null) {
     const message = this.config.gpu_safety.recovery_on_oom ? gpuFaultMessage(status, body, error) : null;
     if (message) {
-      this.requireRecovery(message, { http_status: status });
+      this.requireRecovery(message, { http_status: status, code: 'gpu_memory_fault' });
       return { recoveryRequired: true, reason: message };
     }
     if (error) this.recordFailure(error, 'response_stream');
@@ -192,6 +219,7 @@ export class BackendState {
     if (!this.recoveryRequired) {
       this.recoveryRequired = true;
       this.recoveryReason = message;
+      this.recoveryCode = recoveryCode(message, details.code);
       this.recoverySince = this.clock();
       this.metrics.increment('proxy_gpu_recovery_required_total');
       this.logger.error('GPU recovery required; inference dispatch suspended', {
@@ -268,6 +296,7 @@ export class BackendState {
           : this.lastInferenceSuccessAt ? 'last_request_succeeded' : 'not_observed',
       recovery_required: this.recoveryRequired,
       recovery_reason: this.recoveryReason,
+      recovery_code: this.recoveryCode,
       recovery_since: this.recoverySince ? new Date(this.recoverySince).toISOString() : null,
       circuit_open: this.circuitOpen(now),
       circuit_open_remaining: Math.max(0, this.openUntil - now) / 1000,

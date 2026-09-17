@@ -130,6 +130,35 @@
         </div>
       </section>
 
+      <section class="card recovery-card" aria-labelledby="recovery-heading">
+        <div class="card-header"><div><p class="eyebrow">Bounded host recovery</p><h2 id="recovery-heading">Inference recovery</h2></div><span id="recovery-state" class="tag tag-neutral">Unknown</span></div>
+        <p id="recovery-detail" class="muted">Waiting for recovery status.</p>
+        <p id="recovery-step" class="muted" hidden></p>
+        <p id="recovery-cause" class="notice notice-warning" hidden></p>
+        <dl class="detail-grid">
+          <div><dt>Automatic recovery</dt><dd id="recovery-enabled">Unknown</dd></div>
+          <div><dt>Host helper</dt><dd id="recovery-host">Unknown</dd></div>
+          <div><dt id="recovery-window-label">Restarts in rolling window</dt><dd id="recovery-attempts">—</dd></div>
+          <div><dt>Restarts this incident</dt><dd id="recovery-episode-attempts">—</dd></div>
+          <div><dt>Cooldown remaining</dt><dd id="recovery-cooldown">—</dd></div>
+          <div><dt>Last recovery check</dt><dd id="recovery-last-check">—</dd></div>
+          <div><dt>Failure category</dt><dd id="recovery-code">—</dd></div>
+        </dl>
+        <p id="recovery-last-error" class="notice notice-error" hidden></p>
+        <div class="recovery-controls">
+          <button id="recovery-check" class="control-button control-button-secondary" type="button" disabled>Check / recover now</button>
+          <details>
+            <summary>Manual acknowledgment · verify the host first</summary>
+            <p class="muted">This clears a safety lock; it does not restart Ollama or repair the GPU. Pause inference and check the host before acknowledging. An idle dashboard alone is not proof that the previous operation stopped.</p>
+            <label class="recovery-confirm"><input id="recovery-confirm" type="checkbox"><span>I have checked the host GPU and verified the previous Ollama operation has stopped safely.</span></label>
+            <button id="recovery-acknowledge" class="control-button control-button-warning" type="button" disabled>Acknowledge verified recovery</button>
+          </details>
+        </div>
+        <p id="recovery-control-state" class="form-help">Use the maintenance control token above. Recovery never resumes a manual pause.</p>
+        <p id="recovery-action-status" class="action-status" role="status" aria-live="polite"></p>
+        <p class="muted">Automatic recovery may restart only Ollama when configured. It never resets the GPU or reboots the host. Live priority and one-at-a-time inference still apply.</p>
+      </section>
+
       <section class="card catchup-card" aria-labelledby="catchup-heading">
         <div class="card-header"><div><p class="eyebrow">Persistent background work</p><h2 id="catchup-heading">Frigate catch-up</h2></div><span id="catchup-state" class="tag tag-neutral">Disabled</span></div>
         <p id="catchup-detail" class="muted">Enable recovery and configure the Frigate connection in Settings.</p>
@@ -171,6 +200,8 @@
             <div class="token-row"><input id="catchup-token-input" type="password" autocomplete="off" spellcheck="false" aria-describedby="catchup-control-state"><button type="submit">Unlock controls</button></div>
           </form>
           <div class="catchup-pagination"><button id="catchup-use-saved-token" class="quiet-button" type="button" hidden>Use saved Settings token</button><button id="catchup-lock" class="quiet-button" type="button" hidden>Lock controls</button></div>
+          <p><button id="catchup-refresh" class="quiet-button" type="button" disabled>Recheck Frigate connection</button></p>
+          <p class="form-help">Refreshes API and bridge capabilities now. Does not retry jobs, clear the queue, restart services, or bypass an outstanding generation.</p>
           <p id="catchup-control-state" class="muted">Controls are locked. Retrying never bypasses live priority, pause mode, or the active handoff.</p>
         </details>
         <p id="catchup-action-status" class="action-status" role="status"></p>
@@ -190,8 +221,8 @@
         <div id="active-empty" class="empty-state">
           <span class="empty-pulse" aria-hidden="true"></span>
           <div>
-            <strong>No request is running</strong>
-            <p>The intermediary is ready for the next request.</p>
+            <strong id="active-empty-title">No request is running</strong>
+            <p id="active-empty-detail">Waiting for scheduler status.</p>
           </div>
         </div>
 
@@ -263,7 +294,7 @@
         <div class="card-header">
           <div>
             <p class="eyebrow">Ollama backend</p>
-            <h2 id="backend-heading">Model &amp; GPU</h2>
+            <h2 id="backend-heading">Ollama models</h2>
           </div>
           <span id="backend-state" class="tag tag-neutral">Unknown</span>
         </div>
@@ -275,7 +306,7 @@
         </div>
 
         <dl class="detail-grid backend-details">
-          <div><dt>Reported VRAM</dt><dd id="backend-vram">—</dd></div>
+          <div><dt>Ollama model VRAM</dt><dd id="backend-vram">—</dd></div>
           <div><dt>Context</dt><dd id="backend-context">—</dd></div>
           <div><dt>Model lease</dt><dd id="backend-lease">—</dd></div>
           <div><dt>Model switches</dt><dd id="backend-switches">0</dd></div>
@@ -284,8 +315,8 @@
         </dl>
 
         <div id="recovery-warning" class="notice notice-warning" role="alert" hidden>
-          <strong>GPU recovery required</strong>
-          <span id="recovery-reason">The backend reported an unsafe GPU state.</span>
+          <strong>Inference recovery required</strong>
+          <span id="recovery-reason">The previous operation could not be verified safe.</span>
         </div>
         <p id="inference-warning" class="notice notice-warning" role="status" hidden></p>
 
@@ -295,6 +326,16 @@
         </div>
         <ul id="loaded-models" class="model-list"></ul>
         <p id="models-empty" class="compact-empty">Ollama reports no loaded model.</p>
+        <p class="form-help">Ollama model allocations are not total physical GPU usage. Other processes and driver allocations appear in host telemetry below.</p>
+      </section>
+
+      <section class="card host-gpu-card" aria-labelledby="host-gpu-heading">
+        <div class="card-header"><div><p class="eyebrow">Read-only host telemetry</p><h2 id="host-gpu-heading">Physical GPU &amp; VRAM</h2></div><span id="host-gpu-state" class="tag tag-neutral">Unknown</span></div>
+        <p id="host-gpu-detail" class="muted">Host monitoring is separate from Ollama's model list.</p>
+        <p id="host-gpu-sampled" class="form-help">No hardware sample available.</p>
+        <p id="host-gpu-error" class="notice notice-warning" hidden></p>
+        <div id="host-gpu-list" class="host-gpu-list"></div>
+        <p class="form-help">Unknown values are not zero. Idle telemetry does not by itself prove that an interrupted request cannot resume.</p>
       </section>
 
       <section class="card events-card" aria-labelledby="events-heading">

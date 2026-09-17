@@ -74,7 +74,7 @@ function harness(kind) {
   });
   const marker = kind === 'dashboard' ? "  byId('token-form').addEventListener" : '  bindEvents();';
   const names = kind === 'dashboard'
-    ? 'eventSeverity, formatRelativeDate, renderCatchup, healthState, refreshSnapshot, startPolling, changeCatchupPage, changeCatchupView, refreshCatchupPage, unlockCatchup, performCatchupAction'
+    ? 'eventSeverity, formatRelativeDate, renderCatchup, healthState, refreshSnapshot, startPolling, changeCatchupPage, changeCatchupView, refreshCatchupPage, unlockCatchup, performCatchupAction, render, renderHostGpu, setMaintenanceToken, syncRecoveryControls, performRecoveryAction, performMaintenanceAction'
     : 'restartInfo, applyEnvelope, updateDirtyState, useWarmModel, collectPatch, refreshCatchup, showAuth, startCatchupRefresh, stopCatchupRefresh';
   const boundary = source.indexOf(marker);
   assert.ok(boundary > 0, 'UI bootstrap marker must remain identifiable');
@@ -116,6 +116,165 @@ test('metadata health is not mistaken for successful model inference', () => {
   const status = ui.healthState({ backend: { reachable: true, state: 'healthy', last_inference_error: 'Model runner failed' }, service: { ready: true } });
   assert.equal(status.css, 'health-warning');
   assert.match(status.title, /inference request failed/);
+});
+
+test('recovery overrides optimistic scheduler and maintenance messages without resuming a manual pause', () => {
+  const { ui, nodes } = harness('dashboard');
+  for (const state of ['waiting', 'restarting', 'verifying', 'cooldown', 'needs_attention']) {
+    ui.render({ backend: { reachable: true, recovery_required: true, recovery_code: 'upstream_completion_unknown', recovery_reason: 'Connection ended before completion was verified.' },
+      recovery: { enabled: true, state, host_available: true, attempts_in_window: 1, max_restarts: 2, cooldown_remaining_seconds: 90 },
+      maintenance: { state: 'running', control_available: true, gpu_released: true }, scheduler: { state: 'idle' } });
+    assert.match(nodes.get('overall-state').textContent, /recovery/i);
+    assert.match(nodes.get('maintenance-title').textContent, /blocked for recovery/);
+    assert.equal(nodes.get('maintenance-gpu-released').textContent, 'Not verified');
+    assert.match(nodes.get('active-empty-detail').textContent, /Recovery must finish/);
+    assert.doesNotMatch(nodes.get('active-empty-detail').textContent, /ready for the next/);
+    assert.equal(nodes.get('resume-button').disabled, true);
+    assert.match(nodes.get('recovery-code').textContent, /Upstream Completion Unknown/);
+  }
+  ui.render({ backend: { reachable: true, state: 'healthy' }, recovery: { enabled: true, state: 'recovered' }, maintenance: { state: 'paused', paused: true }, scheduler: { state: 'paused' } });
+  assert.match(nodes.get('recovery-detail').textContent, /manual pause remains/);
+  assert.match(nodes.get('active-empty-detail').textContent, /remains paused/);
+});
+
+test('physical VRAM is distinct from model allocation and null or stale hardware data is unknown', () => {
+  const { ui, nodes } = harness('dashboard');
+  const host = { enabled: true, available: true, stale: false, sampled_at: new Date().toISOString(), gpus: [{ id: 0, name: 'AMD test GPU',
+    vram_total_bytes: 32 * 1024 ** 3, vram_used_bytes: 57 * 1024 ** 2, vram_free_bytes: null, utilization_percent: 0, temperature_c: 29,
+    power_w: null, processes_known: true, processes: [] }] };
+  ui.render({ backend: { loaded_models: [{ name: 'model', size_vram: 16 * 1024 ** 3 }] }, host_gpu: host });
+  assert.equal(nodes.get('backend-vram').textContent, '16 GB');
+  assert.match(nodes.get('host-gpu-list').textContent, /32 GB/);
+  assert.match(nodes.get('host-gpu-list').textContent, /57 MB/);
+  assert.match(nodes.get('host-gpu-list').textContent, /Free VRAMUnknown/);
+  assert.match(nodes.get('host-gpu-list').textContent, /GPU utilization0%/);
+  assert.match(nodes.get('host-gpu-list').textContent, /PowerUnknown/);
+  ui.renderHostGpu({ host_gpu: { ...host, stale: true } });
+  assert.match(nodes.get('host-gpu-state').textContent, /Stale/);
+  assert.doesNotMatch(nodes.get('host-gpu-list').textContent, /32 GB|57 MB|utilization0%/);
+  assert.match(nodes.get('host-gpu-list').textContent, /GPU processes: unknown/);
+  ui.renderHostGpu({ host_gpu: { ...host, available: false } });
+  assert.equal(nodes.get('host-gpu-state').textContent, 'Unavailable');
+  assert.doesNotMatch(nodes.get('host-gpu-list').textContent, /No GPU processes reported/);
+});
+
+test('automatic recovery storage unavailability does not invent an inference lock', () => {
+  const { ui, nodes } = harness('dashboard');
+  const data = { backend: { reachable: true, state: 'healthy', recovery_required: false }, service: { ready: true }, scheduler: { state: 'idle' },
+    maintenance: { state: 'running', paused: false, control_available: true }, recovery: { enabled: true, state: 'needs_attention',
+      requires_attention: true, reason: 'automatic_recovery_state_unreadable', attempts_in_window: 2, episode_attempts: 1, max_restarts: 2, window_seconds: 3600 } };
+  ui.render(data);
+  assert.equal(nodes.get('overall-state').textContent, 'Automatic recovery needs attention');
+  assert.match(nodes.get('overall-detail').textContent, /Normal scheduling can continue/);
+  assert.equal(nodes.get('maintenance-title').textContent, 'Inference is running normally');
+  assert.doesNotMatch(nodes.get('active-empty-detail').textContent, /Recovery must finish/);
+  assert.match(nodes.get('recovery-detail').textContent, /No inference recovery lock/);
+  assert.equal(nodes.get('recovery-attempts').textContent, '2 / 2');
+  assert.equal(nodes.get('recovery-episode-attempts').textContent, '1 / 2');
+  assert.equal(nodes.get('recovery-window-label').textContent, 'Restarts in rolling 1h 0m window');
+  data.maintenance = { ...data.maintenance, state: 'paused', paused: true };
+  ui.render(data);
+  ui.setMaintenanceToken('maintenance-only');
+  assert.equal(nodes.get('resume-button').disabled, false, 'unavailable auto-recovery alone does not disable manual resume');
+  assert.equal(nodes.get('recovery-check').disabled, true, 'there is no incident to recover');
+});
+
+test('GPU processes are rendered as bounded text rather than HTML', () => {
+  const { ui, nodes } = harness('dashboard');
+  ui.renderHostGpu({ host_gpu: { enabled: true, available: true, stale: false, gpus: [{ id: 0, name: '<img src=x onerror=alert(1)>', processes_known: true,
+    processes: Array.from({ length: 20 }, (_, pid) => ({ pid, name: '<script>unsafe</script>' + 'x'.repeat(1000), vram_bytes: null })) }] } });
+  const card = nodes.get('host-gpu-list').children[0];
+  const processes = card.children.find((element) => element.className === 'gpu-process-list');
+  assert.equal(processes.children.length, 12);
+  assert.ok(processes.children.every((item) => item.textContent.length < 180));
+  assert.match(card.textContent, /8 additional processes/);
+  assert.doesNotMatch(DASHBOARD_JS, /innerHTML/);
+});
+
+test('a disconnected dashboard does not keep presenting cached hardware readings as available', async () => {
+  const { ui, nodes, context } = harness('dashboard');
+  ui.render({ host_gpu: { enabled: true, available: true, stale: false, gpus: [{ id: 0, vram_used_bytes: 1024, utilization_percent: 0 }] } });
+  assert.equal(nodes.get('host-gpu-state').textContent, 'Available');
+  context.fetch = async () => { throw new Error('connection lost'); };
+  await ui.refreshSnapshot();
+  assert.match(nodes.get('host-gpu-state').textContent, /Stale/);
+  assert.match(nodes.get('host-gpu-error').textContent, /until reconnection/);
+  assert.doesNotMatch(nodes.get('host-gpu-list').textContent, /1 KB|utilization0%/);
+});
+
+test('recovery actions require maintenance authorization and explicit paused host acknowledgment', async () => {
+  const { ui, context, nodes } = harness('dashboard');
+  const data = { backend: { recovery_required: true }, recovery: { enabled: true, state: 'needs_attention' }, maintenance: { state: 'running', control_available: true } };
+  ui.render(data);
+  const calls = [];
+  context.window.confirm = () => true;
+  context.fetch = async (url, options) => { calls.push({ url, options }); return { ok: true, status: 200, json: async () => options.method === 'GET' ? data : { acknowledged: true } }; };
+  await ui.performRecoveryAction('check');
+  assert.equal(calls.length, 0);
+  ui.setMaintenanceToken('maintenance-only');
+  nodes.get('recovery-confirm').checked = true;
+  await ui.performRecoveryAction('acknowledge');
+  assert.equal(calls.length, 0, 'running maintenance cannot be acknowledged');
+  data.maintenance = { ...data.maintenance, state: 'paused', paused: true };
+  ui.render(data);
+  nodes.get('recovery-confirm').checked = false;
+  await ui.performRecoveryAction('acknowledge');
+  assert.equal(calls.length, 0, 'explicit confirmation is required');
+  nodes.get('recovery-confirm').checked = true;
+  await ui.performRecoveryAction('acknowledge');
+  let posts = calls.filter((call) => call.options.method === 'POST');
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].options.headers.authorization, 'Bearer maintenance-only');
+  assert.match(posts[0].url, /recovery\/acknowledge$/);
+  assert.deepEqual(JSON.parse(posts[0].options.body), { confirm_gpu_recovered: true });
+  assert.match(nodes.get('recovery-action-status').textContent, /manual pause remains/);
+  await ui.performRecoveryAction('check');
+  posts = calls.filter((call) => call.options.method === 'POST');
+  assert.equal(posts.length, 2);
+  assert.match(posts[1].url, /recovery\/check$/);
+  assert.deepEqual(JSON.parse(posts[1].options.body), { confirm: true });
+  assert.ok(calls.every((call) => !call.url.includes('/resume')));
+  assert.equal(nodes.get('recovery-confirm').checked, false);
+});
+
+test('recovery checks respect disabled automation and rejected maintenance tokens', async () => {
+  const { ui, context, nodes } = harness('dashboard');
+  const data = { backend: { recovery_required: true }, recovery: { enabled: false, state: 'disabled' }, maintenance: { state: 'paused', paused: true, control_available: true } };
+  ui.render(data);
+  ui.setMaintenanceToken('wrong-maintenance');
+  const calls = [];
+  context.window.confirm = () => true;
+  context.fetch = async (url, options) => { calls.push({ url, options }); return { ok: false, status: 401, json: async () => ({}) }; };
+  await ui.performRecoveryAction('check');
+  await ui.performMaintenanceAction('resume');
+  assert.equal(calls.length, 0);
+  data.recovery.enabled = true;
+  ui.render(data);
+  await ui.performRecoveryAction('check');
+  assert.equal(calls.length, 1);
+  assert.match(nodes.get('recovery-action-status').textContent, /maintenance token was rejected/);
+  assert.equal(nodes.get('recovery-check').disabled, true);
+  await ui.performRecoveryAction('check');
+  assert.equal(calls.length, 1);
+});
+
+test('Frigate connection refresh uses Settings token without scheduling job mutations', async () => {
+  const { ui, context, nodes } = harness('dashboard');
+  ui.setMaintenanceToken('maintenance-is-not-settings');
+  ui.unlockCatchup('');
+  const calls = [];
+  context.fetch = async (url, options) => { calls.push({ url, options }); return { ok: true, status: 200, json: async () => ({}) }; };
+  await ui.performCatchupAction('refresh');
+  assert.equal(calls.length, 0);
+  assert.equal(nodes.get('catchup-refresh').disabled, true);
+  ui.unlockCatchup('settings-only');
+  await ui.performCatchupAction('refresh');
+  const posts = calls.filter((call) => call.options.method === 'POST');
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].url, '/_intermediary/v1/frigate/refresh');
+  assert.equal(posts[0].options.headers.authorization, 'Bearer settings-only');
+  assert.deepEqual(JSON.parse(posts[0].options.body), { confirm: true });
+  assert.match(nodes.get('catchup-action-status').textContent, /without retrying jobs/);
 });
 
 test('catch-up rendering separates lifetime totals from stored view counts', async () => {

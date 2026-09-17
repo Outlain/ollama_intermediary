@@ -81,6 +81,7 @@
           <a href="#frigate">Frigate</a>
           <a href="#catchup">Catch-up</a>
           <a href="#gpu-safety">GPU safety</a>
+          <a href="#recovery">Recovery &amp; telemetry</a>
           <a href="#access">Access</a>
           <a href="#infrastructure">Diagnostics</a>
         </nav>
@@ -295,6 +296,27 @@
           </div>
         </section>
 
+        <section id="recovery" class="settings-card" aria-labelledby="auto-recovery-heading">
+          <div class="card-heading"><div><p class="eyebrow">Ollama-only recovery</p><h2 id="auto-recovery-heading">Host telemetry &amp; automatic recovery</h2></div><span class="safety-lock">Host helper required</span></div>
+          <p class="section-intro">Install the host helper and mount its private socket before enabling these settings. The browser cannot install it or change the socket path. Recovery may restart only Ollama within bounded limits; it never resets the GPU or reboots ubuntu-ai. All clients should send inference through this intermediary.</p>
+          <div class="field-grid field-grid-3">
+            <label class="check-field" data-field-wrap="host_helper.enabled"><input data-path="host_helper.enabled" type="checkbox"><span><strong>Host GPU monitoring</strong><small>Read physical VRAM, utilization, temperature, power, and process telemetry from the installed helper.</small></span><span class="field-error" data-error-for="host_helper.enabled"></span></label>
+            <label class="check-field" data-field-wrap="auto_recovery.enabled"><input data-path="auto_recovery.enabled" type="checkbox"><span><strong>Automatic Ollama recovery</strong><small>Permit bounded Ollama-only restarts when completion is uncertain. Requires the host helper and a configured maintenance token. Never resumes a manual pause.</small></span><span class="field-error" data-error-for="auto_recovery.enabled"></span></label>
+            <div class="field" data-field-wrap="host_helper.poll_interval"><label>Hardware sample interval<input data-path="host_helper.poll_interval" type="text" placeholder="5s"></label><p class="field-error" data-error-for="host_helper.poll_interval"></p></div>
+            <div class="field" data-field-wrap="host_helper.request_timeout"><label>Host helper request timeout<input data-path="host_helper.request_timeout" type="text" placeholder="15s"></label><p class="field-error" data-error-for="host_helper.request_timeout"></p></div>
+            <div class="field" data-field-wrap="host_helper.stale_after"><label>Mark telemetry stale after<input data-path="host_helper.stale_after" type="text" placeholder="30s"></label><p class="field-help">Stale or missing telemetry is unknown, never zero usage.</p><p class="field-error" data-error-for="host_helper.stale_after"></p></div>
+            <div class="field" data-field-wrap="auto_recovery.check_interval"><label>Recovery check interval<input data-path="auto_recovery.check_interval" type="text" placeholder="5s"></label><p class="field-error" data-error-for="auto_recovery.check_interval"></p></div>
+            <div class="field" data-field-wrap="auto_recovery.restart_timeout"><label>Ollama restart timeout<input data-path="auto_recovery.restart_timeout" type="text" placeholder="90s"></label><p class="field-error" data-error-for="auto_recovery.restart_timeout"></p></div>
+            <div class="field" data-field-wrap="auto_recovery.verification_timeout"><label>Recovery verification timeout<input data-path="auto_recovery.verification_timeout" type="text" placeholder="60s"></label><p class="field-error" data-error-for="auto_recovery.verification_timeout"></p></div>
+            <div class="field" data-field-wrap="auto_recovery.cooldown"><label>Minimum restart cooldown<input data-path="auto_recovery.cooldown" type="text" placeholder="5m"></label><p class="field-help">At least five minutes. Manual checks do not bypass this limit.</p><p class="field-error" data-error-for="auto_recovery.cooldown"></p></div>
+            <div class="field" data-field-wrap="auto_recovery.window"><label>Restart budget window<input data-path="auto_recovery.window" type="text" placeholder="1h"></label><p class="field-error" data-error-for="auto_recovery.window"></p></div>
+            <div class="field" data-field-wrap="auto_recovery.max_restarts"><label>Maximum restarts per window<input data-path="auto_recovery.max_restarts" type="number" min="1" max="2" step="1" placeholder="2"></label><p class="field-error" data-error-for="auto_recovery.max_restarts"></p></div>
+            <div class="field" data-field-wrap="auto_recovery.stable_samples"><label>Consecutive stable samples<input data-path="auto_recovery.stable_samples" type="number" min="2" max="10" step="1" placeholder="3"></label><p class="field-help">Verification after a confirmed service restart; idle readings alone cannot clear an uncertain operation.</p><p class="field-error" data-error-for="auto_recovery.stable_samples"></p></div>
+            <div class="field" data-field-wrap="auto_recovery.max_idle_vram_mb"><label>Maximum idle VRAM (MB)<input data-path="auto_recovery.max_idle_vram_mb" type="number" min="64" max="4096" step="1" placeholder="512"></label><p class="field-help">Allow known driver/display allocations after restart. Do not raise this to conceal unexplained GPU allocations.</p><p class="field-error" data-error-for="auto_recovery.max_idle_vram_mb"></p></div>
+          </div>
+          <p class="section-intro">Automatic recovery waits during a manual pause. The dashboard's protected Check / recover now action explicitly permits a recovery check while paused, without resuming inference. If checks fail or the restart budget is exhausted, the safety lock remains visible for attention.</p>
+        </section>
+
         <section id="access" class="settings-card" aria-labelledby="access-heading">
           <div class="card-heading">
             <div><p class="eyebrow">Authentication &amp; visibility</p><h2 id="access-heading">Maintenance, observability &amp; secrets</h2></div>
@@ -302,7 +324,7 @@
           <div class="field-grid field-grid-3">
             <label class="check-field" data-field-wrap="maintenance.enabled"><input data-path="maintenance.enabled" type="checkbox"><span><strong>Maintenance controls</strong><small>Allow authenticated pause and resume actions.</small></span><span class="field-error" data-error-for="maintenance.enabled"></span></label>
             <label class="check-field" data-field-wrap="observability.enabled"><input data-path="observability.enabled" type="checkbox"><span><strong>Observability API</strong><small>Expose protected operational metadata.</small></span><span class="field-error" data-error-for="observability.enabled"></span></label>
-            <label class="check-field" data-field-wrap="observability.ui_enabled"><input data-path="observability.ui_enabled" type="checkbox"><span><strong>Operations dashboard</strong><small>Serve the read-only <code>/debug</code> dashboard. The protected settings recovery page remains available.</small></span><span class="field-error" data-error-for="observability.ui_enabled"></span></label>
+            <label class="check-field" data-field-wrap="observability.ui_enabled"><input data-path="observability.ui_enabled" type="checkbox"><span><strong>Operations dashboard</strong><small>Serve the <code>/debug</code> monitor with separately authenticated controls. The protected settings recovery page remains available.</small></span><span class="field-error" data-error-for="observability.ui_enabled"></span></label>
             <div class="field" data-field-wrap="maintenance.max_pause"><label>Maximum timed pause<input data-path="maintenance.max_pause" type="text" placeholder="168h"></label><p class="field-error" data-error-for="maintenance.max_pause"></p></div>
             <div class="field" data-field-wrap="observability.history_limit"><label>Event history limit<input data-path="observability.history_limit" type="number" min="1" max="1000" step="1"></label><p class="field-error" data-error-for="observability.history_limit"></p></div>
             <div class="field" data-field-wrap="observability.queue_items_limit"><label>Visible queue item limit<input data-path="observability.queue_items_limit" type="number" min="1" max="500" step="1"></label><p class="field-error" data-error-for="observability.queue_items_limit"></p></div>

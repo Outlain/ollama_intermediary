@@ -13,6 +13,24 @@ function backend(config) {
   return new BackendState(config, { logger: new SilentLogger(), metrics: new Metrics(), onModel() {} });
 }
 
+test('recovery codes distinguish transport uncertainty from GPU faults and migrate old latches', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'intermediary-recovery-reasons-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const target = path.join(directory, 'recovery.json');
+  const config = testConfig({ gpu_safety: { state_path: target } });
+  const reason = 'Ollama request failed after dispatch; upstream completion is unknown';
+  fs.writeFileSync(target, JSON.stringify({ schema_version: 1, recovery_required: true, reason, since: 1000 }));
+  const migrated = backend(config);
+  assert.equal(migrated.recoveryCode, 'upstream_disconnected');
+  migrated.clearRecovery();
+  migrated.recordGenerationResult(500, Buffer.from('{"error":"ROCm error: out of memory"}'));
+  assert.equal(migrated.recoveryCode, 'gpu_memory_fault');
+  assert.equal(backend(config).recoveryCode, 'gpu_memory_fault');
+  migrated.clearRecovery();
+  migrated.requireRecovery('Catch-up inference completion could not be persisted');
+  assert.equal(migrated.recoveryCode, 'catchup_state_error');
+});
+
 test('GPU recovery survives restart and only explicit durable acknowledgement clears it', (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'intermediary-recovery-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
