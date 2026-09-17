@@ -97,13 +97,18 @@ const EDITABLE_TREE = Object.freeze({
     auth_mode: descriptor('enum', { values: ['auto', 'none', 'password', 'token'] }),
     verify_tls: boolean(),
     poll_interval: duration({ greaterThanZero: true }),
+    confirmation_interval: duration({ minMs: 1000 }),
+    cleanup_interval: duration({ minMs: 10000 }),
+    cleanup_batch_size: integer({ min: 1, max: 100 }),
     live_grace: duration(),
     retry_interval: duration({ greaterThanZero: true }),
     max_retry_interval: duration({ greaterThanZero: true }),
+    attention_after: duration({ greaterThanZero: true }),
     request_timeout: duration({ greaterThanZero: true }),
     generation_timeout: duration({ greaterThanZero: true }),
     page_size: integer({ min: 1, max: 1000 }),
     max_jobs: integer({ min: 1, max: 100000 }),
+    history_limit: integer({ min: 1, max: 5000 }),
   }),
   clients: Object.freeze({ $dynamic: CLIENT_FIELDS }),
   models: Object.freeze({ $dynamic: MODEL_POLICY_FIELDS, $modelNames: true }),
@@ -229,6 +234,7 @@ function validateDescriptor(value, field, spec, diagnostics) {
       try {
         const milliseconds = parseDuration(value, field);
         if (spec.greaterThanZero && milliseconds <= 0) invalid('out_of_range', 'Must be greater than zero.');
+        else if (spec.minMs !== undefined && milliseconds < spec.minMs) invalid('out_of_range', `Must be at least ${spec.minMs / 1000}s.`);
       } catch {
         invalid('invalid_duration', 'Use a duration such as 500ms, 20s, 5m, or 2h.');
       }
@@ -390,7 +396,7 @@ export function maskSettings(raw) {
   return masked;
 }
 
-function operationalDiagnostics(raw) {
+function operationalDiagnostics(raw, effectiveConfig) {
   const diagnostics = [];
   if (raw?.frigate?.enabled && raw.frigate.verify_tls === false) {
     diagnostics.push(diagnostic('frigate.verify_tls', 'tls_verification_disabled',
@@ -399,6 +405,19 @@ function operationalDiagnostics(raw) {
   if (raw?.frigate?.enabled && raw.frigate.auth_mode !== 'none' && !raw.frigate.auth_token && (!raw.frigate.username || !raw.frigate.password)) {
     diagnostics.push(diagnostic('frigate.authentication', 'frigate_credentials_missing',
       'No Frigate credentials are configured. For an intentionally open trusted API, select No login required in Frigate authentication.', 'warning'));
+  }
+  const policy = effectiveConfig?.clients?.frigate?.model_policy;
+  // Only compare duration strings: native numeric keep_alive values have
+  // different units from the intermediary's numeric duration fields.
+  if (effectiveConfig?.frigate?.enabled && typeof policy?.keep_alive === 'string') {
+    try {
+      const keepAliveMs = parseDuration(policy.keep_alive);
+      const expectedGapMs = effectiveConfig.frigate.confirmationIntervalMs + policy.idleHoldMs;
+      if (keepAliveMs < expectedGapMs) {
+        diagnostics.push(diagnostic('clients.frigate.model_policy.keep_alive', 'frigate_keep_alive_short',
+          'Frigate keep-alive is shorter than its confirmation interval plus idle hold and may cause extra model loads between catch-up jobs. Consider 2m; exact-model overrides may differ. This is not a scheduling-priority change.', 'warning'));
+      }
+    } catch { /* Invalid durations are reported by configuration validation. */ }
   }
   if (raw?.maintenance?.enabled && !raw.maintenance.auth_token) {
     diagnostics.push(diagnostic(
@@ -470,7 +489,7 @@ export function validateSettingsDraft({
   }
 
   const displayRaw = candidateRaw ?? expandedBase ?? {};
-  diagnostics.push(...operationalDiagnostics(displayRaw));
+  diagnostics.push(...operationalDiagnostics(displayRaw, effectiveConfig));
   const valid = !diagnostics.some((item) => item.severity === 'error');
   const settings = maskSettings(effectiveConfig ?? displayRaw);
   let overrides = mergedOverrides;

@@ -136,17 +136,43 @@
         <dl class="queue-summary">
           <div><dt>Waiting</dt><dd id="catchup-pending">0</dd></div>
           <div><dt>Retrying</dt><dd id="catchup-retrying">0</dd></div>
-          <div><dt>Completed</dt><dd id="catchup-completed">0</dd></div>
+          <div><dt>Completed · lifetime</dt><dd id="catchup-completed">0</dd></div>
         </dl>
         <p id="catchup-capabilities" class="muted">Object / review API support not checked.</p>
+        <p id="catchup-blocker" class="muted">Waiting for scheduler status.</p>
         <p id="catchup-active" class="muted">No background handoff.</p>
         <p id="catchup-confirmation" class="notice notice-warning" hidden></p>
         <p id="catchup-error" class="notice notice-error" hidden></p>
         <p id="catchup-warning" class="notice notice-warning" hidden></p>
-        <div class="catchup-columns">
-          <section aria-labelledby="catchup-pending-heading"><h3 id="catchup-pending-heading">Waiting list · newest first</h3><p id="catchup-pending-empty" class="compact-empty">No descriptions are waiting.</p><ul id="catchup-pending-jobs" class="queue-list" aria-label="Pending catch-up jobs"></ul><p id="catchup-page-status" class="muted" role="status">No queued descriptions.</p><div class="catchup-pagination"><button id="catchup-previous" type="button" class="quiet-button" disabled>Previous 30</button><button id="catchup-next" type="button" class="quiet-button" disabled>Next 30</button></div><p class="muted">Browse the whole saved queue. Positions can change as new events arrive or jobs finish.</p></section>
-          <section aria-labelledby="catchup-recent-heading"><h3 id="catchup-recent-heading">Recent results</h3><p id="catchup-recent-empty" class="compact-empty">No completed or skipped jobs yet.</p><ul id="catchup-jobs" class="queue-list" aria-label="Recent catch-up jobs"></ul></section>
+        <div class="catchup-views" role="group" aria-label="Catch-up job views">
+          <button id="catchup-view-waiting" class="quiet-button" type="button" aria-pressed="true">Waiting <span id="catchup-count-waiting">0</span></button>
+          <button id="catchup-view-awaiting" class="quiet-button" type="button" aria-pressed="false">Awaiting result <span id="catchup-count-awaiting">0</span></button>
+          <button id="catchup-view-retrying" class="quiet-button" type="button" aria-pressed="false">Retrying <span id="catchup-count-retrying">0</span></button>
+          <button id="catchup-view-attention" class="quiet-button" type="button" aria-pressed="false">Needs attention <span id="catchup-count-attention">0</span></button>
+          <button id="catchup-view-completed" class="quiet-button" type="button" aria-pressed="false">Completed <span id="catchup-count-completed">0</span></button>
+          <button id="catchup-view-skipped" class="quiet-button" type="button" aria-pressed="false">Skipped / media missing <span id="catchup-count-skipped">0</span></button>
         </div>
+        <section aria-labelledby="catchup-pending-heading">
+          <h3 id="catchup-pending-heading">Waiting · newest event first</h3>
+          <p id="catchup-view-help" class="muted">Jobs that have not yet been handed off. Live work always has priority.</p>
+          <p id="catchup-pending-empty" class="compact-empty">No jobs in this view.</p>
+          <ul id="catchup-pending-jobs" class="queue-list" aria-label="Selected catch-up jobs"></ul>
+          <p id="catchup-page-status" class="muted" role="status">Loading saved jobs…</p>
+          <div class="catchup-pagination"><button id="catchup-previous" type="button" class="quiet-button" disabled>Previous 30</button><button id="catchup-next" type="button" class="quiet-button" disabled>Next 30</button></div>
+          <p id="catchup-history-limit" class="muted">Completed and skipped history is bounded. Lifetime totals do not expire.</p>
+          <p id="catchup-cleanup" class="muted">Media cleanup runs independently of GPU inference.</p>
+          <p class="muted">Each view covers its entire saved list. Positions can change as events arrive or jobs finish. Needs attention is a subset of unfinished jobs, not a permanent failure.</p>
+        </section>
+        <details class="catchup-controls">
+          <summary>Retry and availability controls · Settings admin token required</summary>
+          <form id="catchup-token-form" class="token-form">
+            <label for="catchup-token-input">Settings admin token (separate from dashboard and maintenance tokens)</label>
+            <div class="token-row"><input id="catchup-token-input" type="password" autocomplete="off" spellcheck="false" aria-describedby="catchup-control-state"><button type="submit">Unlock controls</button></div>
+          </form>
+          <div class="catchup-pagination"><button id="catchup-use-saved-token" class="quiet-button" type="button" hidden>Use saved Settings token</button><button id="catchup-lock" class="quiet-button" type="button" hidden>Lock controls</button></div>
+          <p id="catchup-control-state" class="muted">Controls are locked. Retrying never bypasses live priority, pause mode, or the active handoff.</p>
+        </details>
+        <p id="catchup-action-status" class="action-status" role="status"></p>
         <p><a class="quiet-button" href="/settings#catchup">Open catch-up settings</a> <span class="muted">Use “Fill missing descriptions” there to start a historical scan.</span></p>
         <small class="muted">Newest event first. Frigate stores the images; this queue stores identifiers only. Work already handed to Frigate is not preempted.</small>
       </section>

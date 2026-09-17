@@ -69,15 +69,19 @@ function setup(t, overlay = {}, existing = {}) {
   const gate = existing.gate ?? { ready: true };
   const settings = {
     enabled: true, url: 'http://frigate.test:5000', state_path: path.join(directory, 'state.json'),
-    pollIntervalMs: 100, liveGraceMs: 1_000, requestTimeoutMs: 100, generationTimeoutMs: 5_000,
+    pollIntervalMs: 100, confirmationIntervalMs: 100, liveGraceMs: 1_000, requestTimeoutMs: 100, generationTimeoutMs: 5_000,
     retryIntervalMs: 1_000, maxRetryIntervalMs: 60_000, page_size: 100, max_jobs: 100, ...overlay,
   };
   const worker = new FrigateCatchup(settings, { client, clock: () => clock.now, canRun: () => gate.ready });
   worker.start();
-  clearTimeout(worker.timer);
-  worker.timer = null;
+  const clearTimers = () => {
+    for (const name of ['timer', 'confirmationTimer', 'cleanupTimer']) {
+      clearTimeout(worker[name]); worker[name] = null;
+    }
+  };
+  clearTimers();
   t.after(() => worker.stop());
-  const manual = () => { worker.scanMissing(); clearTimeout(worker.timer); worker.timer = null; };
+  const manual = () => { worker.scanMissing(); clearTimers(); };
   return { worker, client, gate, clock, settings, directory, manual };
 }
 
@@ -454,4 +458,430 @@ test('live completion during media preflight is rechecked immediately before PUT
   await context.worker.tick();
   assert.equal(context.client.calls.length, 0);
   assert.equal(context.worker.status().recent_jobs[0].reason, 'completed_by_frigate');
+});
+
+function readyJob(context, id, start = 100, extra = {}) {
+  context.worker.capabilities = { object: true, review: true, checked: true };
+  context.worker.runtimeConfig = context.client.config;
+  const job = { kind: 'object', id, camera: 'yard', event_time: start, state: 'pending',
+    attempts: 0, failures: 0, created_at: context.clock.now, next_attempt_at: context.clock.now,
+    first_failed_at: null, last_attempt_at: null, reason: null, ...extra };
+  context.worker.state.jobs.push(job);
+  context.client.rows.object.push(object(id, start));
+  return job;
+}
+
+test('fast confirmation immediately hands off the next eligible job without discovery polling', async (t) => {
+  const context = setup(t, { pollIntervalMs: 30_000, confirmationIntervalMs: 2_000 });
+  readyJob(context, 'first', 200);
+  readyJob(context, 'second', 100);
+  await context.worker.processJobs();
+  assert.deepEqual(context.client.calls.map((call) => call.id), ['first']);
+  context.client.rows.object[0].data.description = 'saved';
+  context.clock.now += 2_000;
+  await context.worker.processJobs();
+  assert.deepEqual(context.client.calls.map((call) => call.id), ['first', 'second']);
+  assert.equal(context.worker.status().totals.completed, 1);
+  assert.equal(context.client.listCalls.length, 0);
+});
+
+test('foreground arriving during confirmation blocks the next handoff, not completion verification', async (t) => {
+  const context = setup(t);
+  readyJob(context, 'first', 200);
+  readyJob(context, 'second', 100);
+  await context.worker.processJobs();
+  context.client.rows.object[0].data.description = 'saved';
+  context.gate.ready = false;
+  await context.worker.processJobs();
+  assert.equal(context.worker.status().totals.completed, 1);
+  assert.equal(context.client.calls.length, 1);
+  context.gate.ready = true;
+  await context.worker.processJobs();
+  assert.equal(context.client.calls.length, 2);
+});
+
+test('unchanged fast confirmation does not fsync the whole backlog', async (t) => {
+  const context = setup(t);
+  readyJob(context, 'first');
+  await context.worker.processJobs();
+  let writes = 0;
+  const persist = context.worker.persist.bind(context.worker);
+  context.worker.persist = () => { writes += 1; return persist(); };
+  for (let i = 0; i < 10; i += 1) await context.worker.processJobs();
+  assert.equal(writes, 0);
+  assert.equal(context.client.calls.length, 1);
+});
+
+test('unavailable confirmation backs off without releasing or duplicating native work', async (t) => {
+  const context = setup(t, { confirmationIntervalMs: 2_000 });
+  readyJob(context, 'first');
+  await context.worker.processJobs();
+  context.client.getError = new FrigateError('request_timeout');
+  for (let i = 0; i < 5; i += 1) {
+    await context.worker.processJobs();
+    if (i < 4) context.clock.now = context.worker.confirmationBackoffUntil;
+  }
+  context.worker.scheduleConfirmation();
+  assert.equal(context.worker.nextConfirmationAt - context.clock.now, 60_000);
+  clearTimeout(context.worker.confirmationTimer);
+  assert.equal(context.worker.status().counts.waiting_result, 1);
+  assert.equal(context.client.calls.length, 1);
+});
+
+test('blocked discovery does not block active-description confirmation', async (t) => {
+  const context = setup(t);
+  readyJob(context, 'first');
+  await context.worker.processJobs();
+  let release;
+  const list = context.client.list.bind(context.client);
+  const entered = new Promise((resolve) => {
+    context.client.list = async (...args) => { resolve(); await new Promise((done) => { release = done; }); return list(...args); };
+  });
+  const background = context.worker.tick();
+  await entered;
+  context.client.rows.object[0].data.description = 'saved';
+  await context.worker.processJobs();
+  assert.equal(context.worker.status().totals.completed, 1);
+  context.client.list = list;
+  release();
+  await background;
+});
+
+test('slow cleanup does not block confirmation and guards action races on its job', async (t) => {
+  const context = setup(t);
+  readyJob(context, 'active', 300);
+  const cleaning = readyJob(context, 'cleaning', 200, { state: 'retrying', next_attempt_at: context.clock.now + 10_000 });
+  await context.worker.processJobs();
+  let release;
+  const entered = new Promise((resolve) => {
+    context.client.hasMedia = async () => { resolve(); return new Promise((done) => { release = done; }); };
+  });
+  const cleanup = context.worker.cleanupJobs();
+  await entered;
+  assert.throws(() => context.worker.retryJob('object', cleaning.id), (error) => error.code === 'operation_in_progress');
+  context.client.rows.object[0].data.description = 'saved';
+  await context.worker.processJobs();
+  assert.equal(context.worker.status().totals.completed, 1);
+  release(false);
+  await cleanup;
+  assert.equal(context.worker.status().totals.skipped, 1);
+  assert.equal(context.client.calls.length, 1);
+});
+
+test('cleanup checks bounded batches while GPU is busy, skips missing media, and remembers progress', async (t) => {
+  const context = setup(t, { cleanup_batch_size: 2 });
+  context.gate.ready = false;
+  for (const id of ['a', 'b', 'c', 'd', 'e']) readyJob(context, id);
+  context.client.media = false;
+  await context.worker.cleanupJobs();
+  assert.equal(context.worker.status().totals.skipped, 2);
+  await context.worker.cleanupJobs();
+  assert.equal(context.worker.status().totals.skipped, 4);
+  await context.worker.cleanupJobs();
+  assert.equal(context.worker.status().totals.skipped, 5);
+  assert.equal(context.client.calls.length, 0);
+});
+
+test('cleanup ignores unfinished live media and never mistakes transient failures for missing files', async (t) => {
+  const context = setup(t);
+  const job = readyJob(context, 'a');
+  context.gate.ready = false;
+  context.client.rows.object[0].end_time = null;
+  context.client.media = false;
+  await context.worker.cleanupJobs();
+  assert.equal(context.worker.status().total_queued, 1);
+  context.client.rows.object[0].end_time = 101;
+  for (const error of [new FrigateError('authentication_failed', 401), new FrigateError('http_503', 503),
+    new FrigateError('connection_failed'), new FrigateError('invalid_media_response')]) {
+    context.client.getError = error;
+    await context.worker.cleanupJobs();
+    assert.equal(context.worker.status().total_queued, 1);
+    assert.equal(job.first_failed_at, null);
+    assert.equal(job.failures, 0);
+    assert.equal(context.worker.status().cleanup.last_error, error.code);
+  }
+  assert.equal(context.worker.status().totals.skipped, 0);
+});
+
+test('retry delays cap at five hours and attention starts at first failure, never initial queue time', async (t) => {
+  const context = setup(t, { maxRetryIntervalMs: undefined, retryIntervalMs: 60_000, attentionAfterMs: 86_400_000 });
+  const job = readyJob(context, 'old');
+  context.clock.now += 2 * 86_400_000;
+  assert.equal(context.worker.jobs({ view: 'attention' }).total, 0);
+  const failedAt = context.clock.now;
+  for (let attempt = 0; attempt < 20; attempt += 1) context.worker.retry(job, 'description_not_confirmed');
+  assert.equal(job.next_attempt_at - context.clock.now, 18_000_000);
+  assert.equal(job.first_failed_at, failedAt);
+  context.clock.now += 86_400_000 - 1;
+  assert.equal(context.worker.jobs({ view: 'attention' }).total, 0);
+  context.clock.now += 1;
+  assert.equal(context.worker.jobs({ view: 'attention' }).items[0].needs_attention, true);
+  assert.equal(context.worker.status().attention_count, 1);
+  await context.worker.processJobs();
+  assert.equal(context.client.calls.length, 1, 'attention does not suspend automatic retries');
+});
+
+test('legacy failed jobs retain their queue but get no invented historical first-failure time', async (t) => {
+  const context = setup(t);
+  const job = readyJob(context, 'legacy', 100, { state: 'retrying', failures: 20 });
+  delete job.first_failed_at;
+  delete job.last_attempt_at;
+  context.worker.persist();
+  await context.worker.stop();
+  context.clock.now += 3 * 86_400_000;
+  const resumed = setup(t, {}, context);
+  assert.equal(resumed.worker.status().attention_count, 0);
+  assert.equal(resumed.worker.state.jobs[0].first_failed_at, null);
+  resumed.worker.retry(resumed.worker.state.jobs[0], 'request_timeout');
+  assert.equal(resumed.worker.state.jobs[0].first_failed_at, context.clock.now);
+});
+
+test('separate filtered views paginate all matches and history uses completion time, not event age', (t) => {
+  const context = setup(t);
+  for (let i = 0; i < 101; i += 1) readyJob(context, `event-${i}`, i, {
+    state: i % 2 ? 'retrying' : 'pending', first_failed_at: i % 2 ? context.clock.now - 86_400_000 : null,
+  });
+  const page = context.worker.jobs({ view: 'retrying', offset: 30, limit: 30 });
+  assert.equal(page.total, 50);
+  assert.equal(page.items.length, 20);
+  assert.ok(page.items.every((job) => job.state === 'retrying'));
+  assert.equal(context.worker.jobs({ view: 'attention' }).total, 50);
+  assert.equal(context.worker.jobs({ view: 'waiting' }).total, 51);
+  context.worker.finish(context.worker.state.jobs[100], 'completed', 'description_confirmed');
+  context.clock.now += 1_000;
+  context.worker.finish(context.worker.state.jobs[0], 'completed', 'description_confirmed');
+  assert.equal(context.worker.jobs({ view: 'completed' }).items[0].id, 'event-0');
+  assert.throws(() => context.worker.jobs({ view: 'unknown' }), RangeError);
+});
+
+test('default history retains latest 1000 rows but lifetime totals survive rollover', (t) => {
+  const context = setup(t);
+  context.worker.persist = () => true;
+  for (let i = 0; i < 1_005; i += 1) {
+    const job = readyJob(context, `event-${i}`, i);
+    context.clock.now += 1;
+    context.worker.finish(job, i % 2 ? 'completed' : 'skipped', i % 2 ? 'description_confirmed' : 'media_expired_or_missing');
+  }
+  assert.equal(context.worker.state.recent.length, 1_000);
+  assert.equal(context.worker.state.recent[0].id, 'event-5');
+  assert.equal(context.worker.status().history_limit, 1_000);
+  assert.equal(context.worker.status().totals.completed + context.worker.status().totals.skipped, 1_005);
+  assert.equal(context.worker.status().views.completed + context.worker.status().views.skipped, 1_000);
+});
+
+test('missing-media suppression outlives history, persists privately, and expires for later revalidation', async (t) => {
+  const context = setup(t, { history_limit: 1 });
+  const expired = readyJob(context, 'expired');
+  context.worker.finish(expired, 'skipped', 'media_expired_or_missing');
+  const other = readyJob(context, 'other');
+  context.worker.finish(other, 'completed', 'description_confirmed');
+  assert.equal(context.worker.state.recent.length, 1);
+  context.manual();
+  context.gate.ready = false;
+  await context.worker.tick();
+  assert.equal(context.worker.status().total_queued, 0);
+  await context.worker.stop();
+  const resumed = setup(t, { history_limit: 1 }, context);
+  assert.equal(resumed.worker.state.suppressed[0].id, 'expired');
+  resumed.clock.now += 30 * 86_400_000 + 1;
+  resumed.manual();
+  await resumed.worker.tick();
+  assert.ok(resumed.worker.state.jobs.some((job) => job.id === 'expired'));
+  assert.equal(resumed.worker.status().suppression_count, 0);
+});
+
+test('retry/recheck controls schedule safe work, preserve ambiguity grace, and bound capacity', async (t) => {
+  const context = setup(t, { max_jobs: 2 });
+  const job = readyJob(context, 'retry', 200, { state: 'retrying', reason: 'description_not_confirmed',
+    next_attempt_at: context.clock.now + 60_000 });
+  context.worker.retryJob(job.kind, job.id);
+  assert.equal(job.next_attempt_at, context.clock.now + 60_000);
+  job.reason = 'http_400';
+  context.worker.retryJob(job.kind, job.id);
+  assert.equal(job.next_attempt_at, context.clock.now);
+  assert.equal(context.client.calls.length, 0, 'action itself never hands off');
+  const missing = readyJob(context, 'missing');
+  context.worker.finish(missing, 'skipped', 'media_expired_or_missing');
+  context.worker.recheckJob(missing.kind, missing.id);
+  assert.equal(context.worker.status().total_queued, 2);
+  assert.equal(context.worker.state.suppressed.length, 0);
+  assert.throws(() => context.worker.recheckJob(missing.kind, missing.id), (error) => error.code === 'job_not_recheckable');
+  const extra = { ...missing, id: 'extra', state: 'skipped', completed_at: context.clock.now };
+  context.worker.state.recent.push(extra);
+  assert.throws(() => context.worker.recheckJob('object', 'extra'), (error) => error.code === 'backlog_capacity_reached');
+  context.gate.ready = false;
+  await context.worker.processJobs();
+  assert.equal(context.client.calls.length, 0);
+});
+
+test('single-flight dispatch is durable before handoff and prevents concurrent actions or cleanup duplicates', async (t) => {
+  const context = setup(t);
+  readyJob(context, 'first', 200);
+  readyJob(context, 'second', 100);
+  let release;
+  const entered = new Promise((resolve) => {
+    context.client.regenerate = async (kind, id) => {
+      context.client.calls.push({ kind, id });
+      const saved = JSON.parse(fs.readFileSync(context.settings.state_path));
+      assert.equal(saved.jobs.find((job) => job.id === id).state, 'waiting_result');
+      resolve();
+      await new Promise((done) => { release = done; });
+    };
+  });
+  const processing = context.worker.processJobs();
+  await entered;
+  assert.equal(context.worker.processJobs(), processing);
+  assert.throws(() => context.worker.retryJob('object', 'first'), (error) => error.code === 'handoff_outstanding');
+  assert.throws(() => context.worker.recheckJob('object', 'first'), (error) => error.code === 'handoff_outstanding');
+  await context.worker.cleanupJobs();
+  assert.equal(context.client.calls.length, 1);
+  release();
+  await processing;
+  assert.equal(context.worker.status().counts.waiting_result, 1);
+});
+
+test('public job IDs remain exact for authenticated actions, including IDs longer than 120 characters', (t) => {
+  const context = setup(t);
+  const id = 'event-'.padEnd(256, 'x');
+  readyJob(context, id, 100, { state: 'retrying', reason: 'http_400' });
+  assert.equal(context.worker.jobs({ view: 'retrying' }).items[0].id, id);
+  assert.doesNotThrow(() => context.worker.retryJob('object', context.worker.jobs().items[0].id));
+});
+
+test('global outage cooldown bounds preflight failures and cannot be bypassed by discovery', async (t) => {
+  const context = setup(t, { confirmationIntervalMs: 2_000 });
+  for (let i = 0; i < 20; i += 1) readyJob(context, `job-${i}`, i + 100);
+  let reads = 0;
+  context.client.get = async () => { reads += 1; throw new FrigateError('http_503', 503); };
+  await context.worker.processJobs();
+  assert.equal(reads, 1, 'a server error stops the current batch');
+  assert.equal(context.worker.status().counts.retrying, 1);
+  context.clock.now += 2_000;
+  context.worker.nextCleanupAt = context.clock.now + 60_000;
+  await context.worker.tick();
+  await context.worker.processJobs();
+  assert.equal(reads, 1, 'discovery must honor the same fast-lane cooldown');
+  context.clock.now = context.worker.confirmationBackoffUntil;
+  await context.worker.processJobs();
+  assert.equal(reads, 2);
+  assert.equal(context.worker.confirmationBackoffUntil - context.clock.now, 8_000);
+});
+
+test('404 from config, recording availability, or regeneration is not mislabeled as event deletion', async (t) => {
+  const context = setup(t);
+  const job = readyJob(context, 'exists');
+  context.client.getConfig = async () => { throw new FrigateError('http_404', 404); };
+  await context.worker.processJobs();
+  assert.equal(job.state, 'retrying');
+  assert.equal(context.worker.status().totals.skipped, 0);
+  context.client.media = false;
+  await context.worker.cleanupJobs();
+  assert.equal(context.worker.status().cleanup.last_error, 'http_404');
+  assert.equal(context.worker.status().totals.skipped, 0);
+  context.client.getConfig = async () => context.client.config;
+  context.client.hasMedia = async () => { throw new FrigateError('http_404', 404); };
+  await context.worker.cleanupJobs();
+  assert.equal(context.worker.status().totals.skipped, 0);
+  context.client.hasMedia = async () => true;
+  context.client.regenerateError = new FrigateError('http_404', 404);
+  context.clock.now = Math.max(job.next_attempt_at, context.worker.confirmationBackoffUntil);
+  await context.worker.processJobs();
+  assert.equal(job.state, 'retrying');
+  assert.equal(context.worker.status().totals.skipped, 0);
+});
+
+test('cleanup rotates with consistent ordering and schedules the next interval after batch completion', async (t) => {
+  const context = setup(t, { cleanup_batch_size: 1, cleanupIntervalMs: 60_000 });
+  for (const id of ['a', 'A', 'b']) readyJob(context, id);
+  const seen = [];
+  const original = context.client.get.bind(context.client);
+  context.client.get = async (kind, id) => { seen.push(id); context.clock.now += 90_000; return original(kind, id); };
+  for (let i = 0; i < 3; i += 1) {
+    await context.worker.cleanupJobs();
+    assert.equal(context.worker.nextCleanupAt - context.clock.now, 60_000);
+  }
+  assert.deepEqual(seen, ['a', 'A', 'b'].sort((a, b) => `object:${a}`.localeCompare(`object:${b}`)));
+});
+
+test('a configured slow confirmation interval is never silently shortened by the outage ceiling', async (t) => {
+  const context = setup(t, { confirmationIntervalMs: 90_000 });
+  readyJob(context, 'a');
+  context.client.getError = new FrigateError('connection_failed');
+  await context.worker.processJobs();
+  context.worker.scheduleConfirmation();
+  assert.equal(context.worker.nextConfirmationAt - context.clock.now, 90_000);
+});
+
+test('fast dispatch reads current camera eligibility instead of terminal-skipping a stale disabled/filter setting', async (t) => {
+  const context = setup(t);
+  readyJob(context, 'newly-enabled');
+  const stale = structuredClone(context.client.config);
+  stale.cameras.yard.objects.genai.enabled = false;
+  stale.cameras.yard.objects.genai.objects = ['dog'];
+  context.worker.runtimeConfig = stale;
+  await context.worker.processJobs();
+  assert.equal(context.client.calls[0].id, 'newly-enabled');
+  assert.equal(context.worker.status().totals.skipped, 0);
+});
+
+test('fast dispatch uses the current image source instead of skipping on missing media for a stale source', async (t) => {
+  const context = setup(t);
+  readyJob(context, 'changed-source');
+  context.worker.runtimeConfig = structuredClone(context.client.config);
+  context.client.config.cameras.yard.objects.genai.use_snapshot = false;
+  const sources = [];
+  context.client.hasMedia = async (kind, item, source) => { sources.push(source); return source === 'thumbnails'; };
+  await context.worker.processJobs();
+  assert.deepEqual(sources, ['thumbnails']);
+  assert.equal(context.client.calls[0].source, 'thumbnails');
+  assert.equal(context.worker.status().totals.skipped, 0);
+});
+
+test('a source change while probing missing media requeues for verification instead of terminal-skipping', async (t) => {
+  const context = setup(t);
+  const job = readyJob(context, 'changed-during-probe');
+  context.client.hasMedia = async (kind, item, source) => {
+    context.client.config.cameras.yard.objects.genai.use_snapshot = false;
+    return source === 'thumbnails';
+  };
+  await context.worker.processJobs();
+  assert.equal(job.state, 'pending');
+  assert.equal(context.worker.status().totals.skipped, 0);
+  assert.equal(context.client.calls.length, 0);
+  context.clock.now = job.next_attempt_at;
+  await context.worker.processJobs();
+  assert.equal(context.client.calls[0].source, 'thumbnails');
+});
+
+test('malformed fresh camera configuration retries or retains work instead of terminal-skipping it', async (t) => {
+  const context = setup(t);
+  const job = readyJob(context, 'retained');
+  for (const malformed of [{}, { cameras: [] }, { cameras: null }, { cameras: 'invalid' }]) {
+    context.client.getConfig = async () => malformed;
+    context.clock.now = Math.max(job.next_attempt_at, context.worker.confirmationBackoffUntil);
+    await context.worker.processJobs();
+    assert.equal(job.state, 'retrying');
+    assert.equal(job.reason, 'invalid_camera_configuration');
+    assert.equal(context.worker.status().total_queued, 1);
+    assert.equal(context.worker.status().totals.skipped, 0);
+    const failures = job.failures;
+    context.client.media = false;
+    await context.worker.cleanupJobs();
+    assert.equal(context.worker.status().cleanup.last_error, 'invalid_camera_configuration');
+    assert.equal(context.worker.status().totals.skipped, 0);
+    assert.equal(job.failures, failures, 'passive cleanup does not add generation failures');
+  }
+  assert.equal(context.client.calls.length, 0);
+});
+
+test('malformed last-moment camera configuration cannot discard or dispatch a ready job', async (t) => {
+  const context = setup(t);
+  const job = readyJob(context, 'retained');
+  let reads = 0;
+  context.client.getConfig = async () => ++reads === 1 ? context.client.config : { cameras: [] };
+  await context.worker.processJobs();
+  assert.equal(job.state, 'retrying');
+  assert.equal(job.reason, 'invalid_camera_configuration');
+  assert.equal(context.worker.status().totals.skipped, 0);
+  assert.equal(context.client.calls.length, 0);
 });

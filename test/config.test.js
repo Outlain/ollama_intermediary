@@ -12,8 +12,41 @@ test('catch-up is opt-in and strict scheduling defaults preserve arbitrary model
   const config = normalizeConfig({ server: { listen: '127.0.0.1:0' } });
   assert.equal(config.frigate.enabled, false);
   assert.equal(config.frigate.pollIntervalMs, 30000);
+  assert.equal(config.frigate.confirmationIntervalMs, 2000);
+  assert.equal(config.frigate.cleanupIntervalMs, 60000);
+  assert.equal(config.frigate.cleanup_batch_size, 25);
+  assert.equal(config.frigate.history_limit, 1000);
+  assert.equal(config.frigate.maxRetryIntervalMs, 5 * 60 * 60 * 1000);
+  assert.equal(config.frigate.attentionAfterMs, 24 * 60 * 60 * 1000);
   assert.equal(config.scheduler.mode, 'strict_priority');
   assert.equal(config.scheduler.unknown_model_policy, 'schedule');
+});
+
+test('catch-up cadence, cleanup, and retained history bounds prevent unbounded work', () => {
+  const normalized = (frigate) => normalizeConfig({ server: { listen: '127.0.0.1:0' }, frigate });
+  for (const [field, values] of Object.entries({
+    confirmation_interval: ['0s', '999ms'],
+    cleanup_interval: ['0s', '9999ms'],
+    cleanup_batch_size: [0, 101, 1.5],
+    history_limit: [0, 5001, 1.5],
+    attention_after: ['0s'],
+  })) {
+    for (const value of values) assert.throws(() => normalized({ [field]: value }), new RegExp(`frigate\\.${field}`));
+  }
+  assert.doesNotThrow(() => normalized({ confirmation_interval: '1s', cleanup_interval: '10s', cleanup_batch_size: 100, history_limit: 5000 }));
+});
+
+test('new catch-up defaults do not replace existing retry or model policies', () => {
+  const config = normalizeConfig({
+    server: { listen: '127.0.0.1:0' },
+    frigate: { max_retry_interval: '1h', generation_timeout: '20m' },
+    clients: { frigate: { model_policy: { keep_alive: '15s', idle_hold: '3s' } } },
+  });
+  assert.equal(config.frigate.maxRetryIntervalMs, 3600000);
+  assert.equal(config.frigate.generationTimeoutMs, 1200000);
+  assert.equal(config.frigate.confirmationIntervalMs, 2000);
+  assert.equal(config.frigate.history_limit, 1000);
+  assert.equal(config.clients.frigate.model_policy.keep_alive, '15s');
 });
 
 test('Frigate connection and operational bounds fail safely', () => {

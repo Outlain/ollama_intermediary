@@ -73,7 +73,7 @@ clients:
       idle_hold: 3s
       max_batch_requests: 10
       max_batch_time: 60s
-      keep_alive: 15s
+      keep_alive: 2m
     # Optional newest-wins coalescing. Leave disabled until the actual Frigate payload/header is known.
     deduplication:
       enabled: false
@@ -161,11 +161,20 @@ frigate:
   auth_token: "${FRIGATE_AUTH_TOKEN:-}"
   verify_tls: true
   state_path: /app/state/frigate-backlog.json
+  # Discover new candidates slowly; confirm the single outstanding result faster.
   poll_interval: 30s
+  confirmation_interval: 2s
+  # Metadata/media availability cleanup does not use the GPU.
+  cleanup_interval: 1m
+  cleanup_batch_size: 25
   live_grace: 2m
   retry_interval: 1m
-  max_retry_interval: 1h
+  max_retry_interval: 5h
+  # An attention flag does not stop automatic retries.
+  attention_after: 24h
   request_timeout: 15s
   generation_timeout: 10m
   page_size: 100
   max_jobs: 10000
+  # Completed/skipped metadata history; pending jobs have a separate limit above.
+  history_limit: 1000

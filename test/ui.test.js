@@ -19,6 +19,7 @@ class Element {
     this.type = 'text';
     this.className = '';
     this.validity = {};
+    this.attributes = {};
     this.classList = {
       add: (...names) => { this.className = [...new Set([...this.className.split(' ').filter(Boolean), ...names])].join(' '); },
       remove: (...names) => { this.className = this.className.split(' ').filter((name) => !names.includes(name)).join(' '); },
@@ -29,7 +30,7 @@ class Element {
   appendChild(child) { this.children.push(child); return child; }
   replaceChildren(...children) { this.text = ''; this.children = children; }
   addEventListener() {}
-  setAttribute() {}
+  setAttribute(name, value) { this.attributes[name] = value; }
   focus() {}
   scrollIntoView() { this.scrolled = true; }
   remove() {}
@@ -73,8 +74,8 @@ function harness(kind) {
   });
   const marker = kind === 'dashboard' ? "  byId('token-form').addEventListener" : '  bindEvents();';
   const names = kind === 'dashboard'
-    ? 'eventSeverity, formatRelativeDate, renderCatchup, healthState, refreshSnapshot, startPolling, changeCatchupPage'
-    : 'restartInfo, applyEnvelope, updateDirtyState';
+    ? 'eventSeverity, formatRelativeDate, renderCatchup, healthState, refreshSnapshot, startPolling, changeCatchupPage, changeCatchupView, refreshCatchupPage, unlockCatchup, performCatchupAction'
+    : 'restartInfo, applyEnvelope, updateDirtyState, useWarmModel, collectPatch, refreshCatchup, showAuth, startCatchupRefresh, stopCatchupRefresh';
   const boundary = source.indexOf(marker);
   assert.ok(boundary > 0, 'UI bootstrap marker must remain identifiable');
   vm.runInContext(`${source.slice(0, boundary)}\n globalThis.ui = { ${names} };\n})();`, context);
@@ -88,7 +89,11 @@ test('UI wrappers load their independent assets and all literal element referenc
     assert.doesNotThrow(() => new vm.Script(js));
     const ids = [...html.matchAll(/\bid="([^"]+)"/g)].map((match) => match[1]);
     assert.equal(new Set(ids).size, ids.length, `${kind}: duplicate element IDs`);
-    for (const match of js.matchAll(/(?:byId|setText|setHidden)\('([^']+)'/g)) assert.ok(ids.includes(match[1]), `${kind}: missing ${match[1]}`);
+    for (const match of js.matchAll(/(?:byId|setText|setHidden)\('([^']+)'\s*[,)]/g)) assert.ok(ids.includes(match[1]), `${kind}: missing ${match[1]}`);
+    if (kind === 'dashboard') for (const view of ['waiting', 'awaiting', 'retrying', 'attention', 'completed', 'skipped']) {
+      assert.ok(ids.includes('catchup-view-' + view));
+      assert.ok(ids.includes('catchup-count-' + view));
+    }
   }
 });
 
@@ -113,37 +118,151 @@ test('metadata health is not mistaken for successful model inference', () => {
   assert.match(status.title, /inference request failed/);
 });
 
-test('catch-up rendering uses durable totals, pending jobs, timestamps, and expiry reasons', () => {
-  const { ui, nodes } = harness('dashboard');
-  ui.renderCatchup({ enabled: true, state: 'running', counts: { pending: 2, waiting_live: 3, retrying: 1 }, totals: { completed: 47 }, scan: { blocked_reason: 'capacity_reached' }, capabilities: { object: true, review: true }, pending_jobs: [{ kind: 'review', id: 'review-1', camera: 'Driveway', state: 'pending', event_time: 1_789_000_000 }], recent_jobs: [{ kind: 'object', id: 'object-2', camera: 'Driveway', state: 'skipped', reason: 'media_expired' }] });
+test('catch-up rendering separates lifetime totals from stored view counts', async () => {
+  const { ui, nodes, context } = harness('dashboard');
+  ui.renderCatchup({ enabled: true, state: 'running', counts: { pending: 2, waiting_live: 3, retrying: 1 }, totals: { completed: 47 }, views: { waiting: 5, retrying: 1, attention: 1, completed: 10, skipped: 4 }, history_limit: 1000, scan: { blocked_reason: 'capacity_reached' }, capabilities: { object: true, review: true } });
   assert.equal(nodes.get('catchup-pending').textContent, '5');
   assert.equal(nodes.get('catchup-completed').textContent, '47');
+  assert.equal(nodes.get('catchup-count-completed').textContent, '10');
+  assert.equal(nodes.get('catchup-count-attention').textContent, '1');
+  assert.match(nodes.get('catchup-history-limit').textContent, /1,000/);
   assert.match(nodes.get('catchup-detail').textContent, /Capacity Reached/);
+  context.fetch = async () => ({ ok: true, json: async () => ({ offset: 0, total: 1, items: [{ kind: 'review', id: 'review-1', camera: 'Driveway', state: 'pending', event_time: 1_789_000_000 }] }) });
+  await ui.refreshCatchupPage();
   assert.match(nodes.get('catchup-pending-jobs').textContent, /Recorded/);
-  assert.match(nodes.get('catchup-jobs').textContent, /Media Expired/);
   assert.equal(nodes.get('catchup-pending-empty').hidden, true);
+  context.fetch = async () => ({ ok: true, json: async () => ({ offset: 0, total: 1, items: [{ kind: 'object', id: 'object-2', camera: 'Driveway', state: 'skipped', reason: 'media_expired' }] }) });
+  await ui.changeCatchupView('skipped');
+  assert.match(nodes.get('catchup-pending-jobs').textContent, /Media Expired/);
+  assert.match(nodes.get('catchup-pending-jobs').textContent, /Recheck availability/);
 });
 
 test('backlog UI shows 30 jobs and pages through the remaining saved jobs', async () => {
   const { context, ui, nodes } = harness('dashboard');
   const rows = Array.from({ length: 65 }, (_, i) => ({ id: `event-${i}`, kind: 'object', camera: 'Yard', state: 'pending' }));
   ui.renderCatchup({ enabled: true, total_queued: 65, counts: { pending: 65 }, pending_jobs: rows.slice(0, 30) });
-  assert.equal(nodes.get('catchup-pending-jobs').children.length, 30);
-  assert.equal(nodes.get('catchup-page-status').textContent, 'Showing 1–30 of 65 saved jobs');
   const requests = [];
   context.fetch = async (url) => {
     requests.push(url);
     const offset = Number(new URL(url, 'http://example.test').searchParams.get('offset'));
     return { ok: true, json: async () => ({ offset, limit: 30, total: 65, items: rows.slice(offset, offset + 30) }) };
   };
+  await ui.refreshCatchupPage();
+  assert.equal(nodes.get('catchup-pending-jobs').children.length, 30);
+  assert.equal(nodes.get('catchup-page-status').textContent, 'Showing 1–30 of 65 saved jobs in this view');
   await ui.changeCatchupPage(1);
-  assert.equal(nodes.get('catchup-page-status').textContent, 'Showing 31–60 of 65 saved jobs');
+  assert.equal(nodes.get('catchup-page-status').textContent, 'Showing 31–60 of 65 saved jobs in this view');
   await ui.changeCatchupPage(1);
   assert.equal(nodes.get('catchup-pending-jobs').children.length, 5);
   assert.equal(nodes.get('catchup-next').disabled, true);
   await ui.changeCatchupPage(-1);
-  assert.equal(nodes.get('catchup-page-status').textContent, 'Showing 31–60 of 65 saved jobs');
-  assert.ok(requests.every((url) => url.includes('limit=30')));
+  assert.equal(nodes.get('catchup-page-status').textContent, 'Showing 31–60 of 65 saved jobs in this view');
+  assert.ok(requests.every((url) => url.includes('limit=30') && url.includes('view=waiting')));
+});
+
+test('views fetch their whole filtered dataset and preserve scroll during refresh', async () => {
+  const { context, ui, nodes } = harness('dashboard');
+  const requests = [];
+  context.fetch = async (url) => {
+    requests.push(url);
+    const query = new URL(url, 'http://example.test').searchParams;
+    const offset = Number(query.get('offset'));
+    return { ok: true, json: async () => ({ offset, total: 1000, items: Array.from({ length: 30 }, (_, i) => ({ kind: 'object', id: `history-${offset + i}`, state: query.get('view') })) }) };
+  };
+  await ui.changeCatchupView('completed');
+  await ui.changeCatchupPage(1);
+  nodes.get('catchup-pending-jobs').scrollTop = 123;
+  const originalRow = nodes.get('catchup-pending-jobs').children[0];
+  await ui.refreshCatchupPage();
+  assert.equal(nodes.get('catchup-pending-jobs').scrollTop, 123);
+  assert.equal(nodes.get('catchup-pending-jobs').children[0], originalRow, 'unchanged rows retain focusable DOM nodes');
+  assert.match(nodes.get('catchup-page-status').textContent, /31–60 of 1,000/);
+  assert.ok(requests.every((url) => url.includes('view=completed')));
+  assert.equal(nodes.get('catchup-view-completed').attributes['aria-pressed'], 'true');
+  await ui.changeCatchupView('retrying');
+  assert.match(requests.at(-1), /view=retrying&offset=0/);
+  assert.equal(nodes.get('catchup-pending-jobs').scrollTop, 0);
+});
+
+test('a stale page response cannot overwrite a newly selected catch-up view', async () => {
+  const { context, ui, nodes } = harness('dashboard');
+  let finishOld;
+  context.fetch = async (url) => {
+    if (url.includes('view=waiting')) return new Promise((resolve) => { finishOld = resolve; });
+    return { ok: true, json: async () => ({ offset: 0, total: 1, items: [{ kind: 'object', id: 'correct-retry', state: 'retrying' }] }) };
+  };
+  const old = ui.refreshCatchupPage();
+  const selected = ui.changeCatchupView('retrying');
+  finishOld({ ok: true, json: async () => ({ offset: 0, total: 1, items: [{ kind: 'object', id: 'wrong-pending', state: 'pending' }] }) });
+  await old;
+  await selected;
+  assert.match(nodes.get('catchup-pending-jobs').textContent, /correct-retry/);
+  assert.doesNotMatch(nodes.get('catchup-pending-jobs').textContent, /wrong-pending/);
+  assert.equal(nodes.get('catchup-view-retrying').attributes['aria-pressed'], 'true');
+});
+
+test('retry rows show attention, attempts and eligibility without promising a start time', async () => {
+  const { context, ui, nodes } = harness('dashboard');
+  context.fetch = async () => ({ ok: true, json: async () => ({ offset: 0, total: 1, items: [{ kind: 'review', id: 'retry', state: 'retrying', needs_attention: true, attempts: 8, failures: 8, first_failed_at: 10000, last_attempt_at: 20000, next_attempt_at: 30000, reason: 'description_not_confirmed' }] }) });
+  await ui.changeCatchupView('attention');
+  assert.match(nodes.get('catchup-pending-jobs').textContent, /Needs attention \(automatic retries continue\)/);
+  assert.match(nodes.get('catchup-pending-jobs').textContent, /Attempts: 8/);
+  assert.match(nodes.get('catchup-pending-jobs').textContent, /First unsuccessful attempt/);
+  assert.match(nodes.get('catchup-pending-jobs').textContent, /not a promised start/);
+  assert.match(nodes.get('catchup-pending-jobs').children[0].className, /catchup-attention/);
+});
+
+test('manual retry requires explicit Settings-token unlock and never uses dashboard tokens', async () => {
+  const { context, ui, nodes } = harness('dashboard');
+  context.sessionStorage.getItem = () => 'unrelated-saved-token';
+  context.window.confirm = () => true;
+  const calls = [];
+  context.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, json: async () => url.includes('/jobs?') ? { offset: 0, total: 0, items: [] } : {} };
+  };
+  const job = { kind: 'review', id: 'one', state: 'retrying' };
+  await ui.performCatchupAction('retry', job);
+  assert.equal(calls.length, 0);
+  ui.unlockCatchup('settings-only-token');
+  await ui.performCatchupAction('retry', { ...job, state: 'waiting_result' });
+  assert.equal(calls.length, 0);
+  await ui.performCatchupAction('retry', job);
+  const action = calls.find((call) => call.options.method === 'POST');
+  assert.equal(action.options.headers.authorization, 'Bearer settings-only-token');
+  assert.deepEqual(JSON.parse(action.options.body), { confirm: true, kind: 'review', id: 'one' });
+  assert.match(nodes.get('catchup-action-status').textContent, /Request accepted/);
+});
+
+test('a rejected Settings token locks catch-up actions without altering saved jobs', async () => {
+  const { context, ui, nodes } = harness('dashboard');
+  context.window.confirm = () => true;
+  let posts = 0;
+  context.fetch = async () => { posts++; return { ok: false, status: 401, json: async () => ({ error: 'Settings token required.' }) }; };
+  ui.unlockCatchup('bad-settings-token');
+  const job = { kind: 'object', id: 'media-missing', state: 'skipped' };
+  await ui.performCatchupAction('recheck', job);
+  assert.equal(posts, 1);
+  assert.match(nodes.get('catchup-control-state').textContent, /Controls are locked/);
+  assert.match(nodes.get('catchup-action-status').textContent, /Settings token required/);
+  await ui.performCatchupAction('recheck', job);
+  assert.equal(posts, 1);
+});
+
+test('catch-up distinguishes the live priority blocker from saved-result confirmation', async () => {
+  const { context, ui, nodes } = harness('dashboard');
+  let data = { backend: { reachable: true, state: 'healthy' }, service: { ready: true },
+    scheduler: { background: { allowed: false, reason: 'active_request' } }, active_request: { client: 'odysseus' },
+    frigate: { enabled: true, total_queued: 8 } };
+  context.fetch = async (url) => ({ ok: true, status: 200, json: async () => url.includes('/jobs?') ? { offset: 0, total: 0, items: [] } : data });
+  await ui.refreshSnapshot();
+  assert.match(nodes.get('catchup-blocker').textContent, /Waiting for Odysseus/);
+  data = { ...data, frigate: { ...data.frigate, active_job: { state: 'waiting_result' } } };
+  await ui.refreshSnapshot();
+  assert.match(nodes.get('catchup-blocker').textContent, /Waiting for Frigate to save/);
+  data = { ...data, scheduler: { background: { allowed: false, reason: 'maintenance_paused' } } };
+  await ui.refreshSnapshot();
+  assert.match(nodes.get('catchup-blocker').textContent, /paused for GPU maintenance/);
 });
 
 test('waiting result explains the confirmation window instead of implying active GPU generation', () => {
@@ -170,6 +289,46 @@ test('settings restores the requested section after the authenticated workspace 
   ui.applyEnvelope({ settings: maskSettings(testConfig()), valid: true, revision: 'test', infrastructure: { ui_can_apply: true } });
   for (const timer of timeouts.values()) if (timer.milliseconds === 0) timer.fn();
   assert.equal(nodes.get('catchup').scrolled, true);
+});
+
+test('warm-model advice only changes keep-alive after explicit draft action', () => {
+  const { ui, nodes, inputs } = harness('settings');
+  ui.applyEnvelope({ settings: maskSettings(testConfig({ frigate: { enabled: true, url: 'http://frigate.example' }, clients: { frigate: { model_policy: { keep_alive: '15s' } } } })), valid: true, infrastructure: { ui_can_apply: true } });
+  const field = inputs.find((input) => input.dataset.path === 'clients.frigate.model_policy.keep_alive');
+  assert.equal(field.value, '15s');
+  assert.equal(nodes.get('catchup-warm-warning').hidden, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(ui.collectPatch())), {});
+  ui.useWarmModel();
+  assert.equal(field.value, '2m');
+  assert.deepEqual(JSON.parse(JSON.stringify(ui.collectPatch())), { clients: { frigate: { model_policy: { keep_alive: '2m' } } } });
+  assert.equal(nodes.get('catchup-warm-warning').hidden, true);
+  assert.equal(nodes.get('document-state').textContent, 'Unapplied changes');
+});
+
+test('settings catch-up refresh is single-flight, bounded, and stops when logged out or hidden', async () => {
+  const { context, ui, timeouts, intervals } = harness('settings');
+  let requests = 0;
+  context.fetch = async (_url, { signal }) => {
+    requests++;
+    return new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true }));
+  };
+  ui.applyEnvelope({ settings: maskSettings(testConfig()), valid: true, infrastructure: { ui_can_apply: true } });
+  const outstanding = ui.refreshCatchup();
+  ui.refreshCatchup();
+  assert.equal(requests, 1);
+  assert.ok([...timeouts.values()].some((timer) => timer.milliseconds === 10000));
+  assert.ok([...intervals.values()].some((timer) => timer.milliseconds === 5000));
+  ui.showAuth('Logged out');
+  await outstanding;
+  assert.equal(intervals.size, 0);
+  assert.equal(timeouts.size, 1, 'only the token-input focus timeout remains');
+  await ui.refreshCatchup();
+  assert.equal(requests, 1);
+  context.document.hidden = true;
+  ui.applyEnvelope({ settings: maskSettings(testConfig()), valid: true, infrastructure: { ui_can_apply: true } });
+  await ui.refreshCatchup();
+  assert.equal(requests, 1);
+  assert.equal(intervals.size, 0);
 });
 
 test('dashboard restores the connected badge after a temporary polling failure', async () => {

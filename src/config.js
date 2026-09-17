@@ -87,13 +87,18 @@ const DEFAULTS = {
     verify_tls: true,
     state_path: '/app/state/frigate-backlog.json',
     poll_interval: '30s',
+    confirmation_interval: '2s',
+    cleanup_interval: '1m',
+    cleanup_batch_size: 25,
     live_grace: '2m',
     retry_interval: '1m',
-    max_retry_interval: '1h',
+    max_retry_interval: '5h',
+    attention_after: '24h',
     request_timeout: '15s',
     generation_timeout: '10m',
     page_size: 100,
     max_jobs: 10000,
+    history_limit: 1000,
   },
   clients: {
     default: {
@@ -142,7 +147,9 @@ function durationFields(config) {
   config.maintenance.maxPauseMs = parseDuration(config.maintenance.max_pause, 'maintenance.max_pause');
   for (const [field, derived] of Object.entries({
     poll_interval: 'pollIntervalMs', live_grace: 'liveGraceMs',
+    confirmation_interval: 'confirmationIntervalMs', cleanup_interval: 'cleanupIntervalMs',
     retry_interval: 'retryIntervalMs', max_retry_interval: 'maxRetryIntervalMs',
+    attention_after: 'attentionAfterMs',
     request_timeout: 'requestTimeoutMs', generation_timeout: 'generationTimeoutMs',
   })) config.frigate[derived] = parseDuration(config.frigate[field], `frigate.${field}`);
 
@@ -180,7 +187,7 @@ function validate(config) {
     scheduler: { aging_interval: 'agingIntervalMs' },
     circuit_breaker: { failure_window: 'failureWindowMs', open_duration: 'openDurationMs' },
     gpu_safety: { unload_timeout: 'unloadTimeoutMs' },
-    frigate: { poll_interval: 'pollIntervalMs', retry_interval: 'retryIntervalMs', max_retry_interval: 'maxRetryIntervalMs', request_timeout: 'requestTimeoutMs', generation_timeout: 'generationTimeoutMs' },
+    frigate: { poll_interval: 'pollIntervalMs', retry_interval: 'retryIntervalMs', max_retry_interval: 'maxRetryIntervalMs', attention_after: 'attentionAfterMs', request_timeout: 'requestTimeoutMs', generation_timeout: 'generationTimeoutMs' },
   })) {
     for (const [field, derived] of Object.entries(fields)) {
       if (config[section][derived] <= 0) throw new Error(`${section}.${field} must be greater than zero`);
@@ -232,6 +239,18 @@ function validate(config) {
   }
   if (!Number.isInteger(config.frigate.max_jobs) || config.frigate.max_jobs < 1 || config.frigate.max_jobs > 100000) {
     throw new Error('frigate.max_jobs must be between 1 and 100000');
+  }
+  if (config.frigate.confirmationIntervalMs < 1000) {
+    throw new Error('frigate.confirmation_interval must be at least 1s');
+  }
+  if (config.frigate.cleanupIntervalMs < 10000) {
+    throw new Error('frigate.cleanup_interval must be at least 10s');
+  }
+  if (!Number.isInteger(config.frigate.cleanup_batch_size) || config.frigate.cleanup_batch_size < 1 || config.frigate.cleanup_batch_size > 100) {
+    throw new Error('frigate.cleanup_batch_size must be between 1 and 100');
+  }
+  if (!Number.isInteger(config.frigate.history_limit) || config.frigate.history_limit < 1 || config.frigate.history_limit > 5000) {
+    throw new Error('frigate.history_limit must be between 1 and 5000');
   }
   if (config.frigate.maxRetryIntervalMs < config.frigate.retryIntervalMs) {
     throw new Error('frigate.max_retry_interval must be at least frigate.retry_interval');

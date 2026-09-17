@@ -180,6 +180,16 @@ rest:
           {{ (((value_json.get('frigate') or {}).get('totals') or {})
               .get('completed')) | int(0) }}
 
+      # Optional: already included in pending, not an additional queue count.
+      # Attention does not stop automatic retries.
+      - name: "Ollama Frigate Descriptions Needing Attention"
+        unique_id: ollama_frigate_descriptions_needing_attention
+        icon: mdi:alert-circle-outline
+        unit_of_measurement: "descriptions"
+        state_class: measurement
+        value_template: >-
+          {{ ((value_json.get('frigate') or {}).get('attention_count')) | int(0) }}
+
       - name: "Ollama Frigate Lifetime Skipped Descriptions"
         unique_id: ollama_frigate_skipped_descriptions
         icon: mdi:skip-next-circle-outline
@@ -419,6 +429,7 @@ cards:
     entities:
       - sensor.ollama_frigate_recovery_state
       - sensor.ollama_frigate_pending_descriptions
+      - sensor.ollama_frigate_descriptions_needing_attention
       - sensor.ollama_frigate_lifetime_completed_descriptions
       - sensor.ollama_frigate_lifetime_skipped_descriptions
 
@@ -433,5 +444,7 @@ cards:
 ```
 
 Home Assistant may append `_2` to an entity ID if that ID already exists. Check the actual IDs under **Settings → Tools → States** and adjust the card if necessary.
+
+The faster catch-up worker preserves the existing sensors and scan action; updating their YAML is not required. The optional **Descriptions Needing Attention** sensor above uses the same shared REST snapshot, with no extra polling request. It counts jobs with prolonged unsuccessful attempts (24h by default); those jobs continue retrying and are already included in pending descriptions. Do not add the attention count to the pending total. The dashboard's completed/skipped history is bounded (1,000 rows by default), while the lifetime sensors continue to use persistent totals rather than the currently visible history size.
 
 References: [RESTful integration](https://www.home-assistant.io/integrations/rest/), [RESTful Command](https://www.home-assistant.io/integrations/rest_command/), [secrets](https://www.home-assistant.io/docs/configuration/secrets/), [dashboard actions](https://www.home-assistant.io/dashboards/actions/), [dashboard cards](https://www.home-assistant.io/dashboards/cards/), and [conditional cards](https://www.home-assistant.io/dashboards/conditional/).

@@ -6,6 +6,7 @@
   var MAINTENANCE_RESUME_URL = '/_intermediary/v1/maintenance/resume';
   var TOKEN_KEY = 'ollama-intermediary-observability-token';
   var MAINTENANCE_TOKEN_KEY = 'ollama-intermediary-maintenance-token';
+  var SETTINGS_TOKEN_KEY = 'ollama-intermediary-settings-admin-token';
   var POLL_INTERVAL_MS = 2000;
 
   var snapshot = null;
@@ -20,7 +21,20 @@
   var catchupOffset = 0;
   var catchupPage = null;
   var catchupPagePromise = null;
+  var catchupRenderedPage = null;
+  var catchupView = 'waiting';
+  var catchupData = {};
+  var catchupAdminToken = '';
+  var catchupActionPending = false;
   var CATCHUP_PAGE_SIZE = 30;
+  var CATCHUP_VIEWS = {
+    waiting: ['Waiting · newest event first', 'Jobs not yet handed off. Odysseus and live Frigate work always have priority.'],
+    awaiting: ['Awaiting saved result', 'One handoff at a time. Completion is confirmed only when Frigate saves a description.'],
+    retrying: ['Retrying · newest event first', 'Retry times are earliest eligible times, not promised start times. Delays increase after unsuccessful attempts.'],
+    attention: ['Needs attention · still retrying', 'These jobs have remained unsuccessful past the configured attention threshold. Automatic retries continue; waiting behind live work alone is not a failure.'],
+    completed: ['Completed · retained history', 'Descriptions are saved in Frigate. Removing old history rows here never removes descriptions or recordings.'],
+    skipped: ['Skipped / media missing · retained history', 'Jobs no longer eligible for generation, including confirmed missing media. Connection errors alone never prove that footage was deleted.']
+  };
 
   function byId(id) { return document.getElementById(id); }
   function setText(id, value) {
@@ -482,6 +496,7 @@
   }
 
   function renderCatchup(data) {
+    catchupData = data;
     setText('catchup-state', titleCase(data.state || 'disabled'));
     var counts = data.counts || {};
     setText('catchup-pending', formatInteger((counts.pending || 0) + (counts.waiting_live || 0)));
@@ -490,54 +505,126 @@
     var support = data.capabilities || {};
     setText('catchup-capabilities', 'Objects: ' + (support.object ? 'supported' : 'not verified') + ' · Reviews: ' + (support.review ? 'supported' : 'not verified'));
     setText('catchup-detail', data.enabled
-      ? (data.scan && data.scan.blocked_reason ? titleCase(data.scan.blocked_reason) : 'Background recovery runs only when live work and its idle hold are finished.')
+      ? (data.blocked_reason ? titleCase(data.blocked_reason) : data.scan && data.scan.blocked_reason ? titleCase(data.scan.blocked_reason) : 'Background recovery runs only when live work and its idle hold are finished.')
       : 'Enable recovery and configure the Frigate connection in Settings.');
-    var active = data.active_job;
-    setText('catchup-active', active ? titleCase(active.kind) + ' · ' + (active.camera || '') + ' · ' + titleCase(active.state || active.status) : 'No background handoff.');
-    setHidden('catchup-confirmation', !active);
-    if (active) {
-      var remaining = Math.max(0, (Number(active.next_attempt_at) - Date.now()) / 1000);
-      setText('catchup-confirmation', (remaining > 0
-        ? 'Waiting for Frigate to save the description. Confirmation window: ' + formatDuration(remaining) + ' remaining. '
-        : 'Confirmation window elapsed. Waiting for an idle opportunity to schedule a retry. ')
-        + 'This is not proof that the model is still generating. A failed generation may remain here until verification times out; no second catch-up handoff starts meanwhile.');
-    }
+    setText('catchup-blocker', catchupBlocker(data));
+    renderCatchupConfirmation();
+    var views = data.views || {};
+    Object.keys(CATCHUP_VIEWS).forEach(function (view) {
+      setText('catchup-count-' + view, formatInteger(views[view] || 0));
+    });
+    byId('catchup-view-attention').classList.remove('has-attention');
+    byId('catchup-view-retrying').classList.remove('has-retries');
+    if (views.attention) byId('catchup-view-attention').classList.add('has-attention');
+    if (views.retrying) byId('catchup-view-retrying').classList.add('has-retries');
+    setText('catchup-history-limit', 'Retains the latest ' + formatInteger(data.history_limit || 1000)
+      + ' completed / skipped records combined. Completed lifetime: ' + formatInteger((data.totals || {}).completed || 0)
+      + ' · Skipped lifetime: ' + formatInteger((data.totals || {}).skipped || 0) + '. Tab counts describe stored rows, not lifetime totals.');
+    var cleanup = data.cleanup || {};
+    setText('catchup-cleanup', 'Media checks run independently of the GPU. Last cleanup: '
+      + (cleanup.last_checked_at ? new Date(cleanup.last_checked_at).toLocaleString() : 'not yet checked')
+      + ' · Known missing-media IDs remembered: ' + formatInteger(data.suppression_count || 0)
+      + (cleanup.last_error ? ' · Cleanup delayed: ' + titleCase(cleanup.last_error) + '. This does not prove media was deleted.' : ''));
     setHidden('catchup-error', !data.last_error);
     setText('catchup-error', typeof data.last_error === 'string' ? data.last_error : data.last_error && (data.last_error.message || data.last_error.code));
     var warnings = Array.isArray(data.warnings) ? data.warnings : [];
     setHidden('catchup-warning', !warnings.length);
     setText('catchup-warning', warnings.length ? 'Some cameras use early-only object triggers that cannot be reconstructed later: '
       + warnings.map(function (warning) { return warning.camera + ' (' + titleCase(warning.code) + ')'; }).join(', ') : '');
-    renderCatchupJobs('catchup-jobs', 'catchup-recent-empty', Array.isArray(data.recent_jobs) ? data.recent_jobs : []);
-    if (catchupOffset === 0) {
-      catchupPage = { items: Array.isArray(data.pending_jobs) ? data.pending_jobs : [], offset: 0,
-        limit: CATCHUP_PAGE_SIZE, total: data.total_queued == null
-          ? Object.keys(counts).reduce(function (sum, key) { return sum + (counts[key] || 0); }, 0) : data.total_queued };
-    }
     renderCatchupPage();
+    syncCatchupControls();
+  }
+
+  function catchupBlocker(data) {
+    if (!data.enabled) return 'Catch-up is disabled.';
+    var background = snapshot && snapshot.scheduler && snapshot.scheduler.background || {};
+    var reason = background.reason;
+    var reasons = {
+      maintenance_paused: 'Generation is paused for GPU maintenance; saved-result and media checks can still run.',
+      recovery_required: 'Waiting for GPU recovery. No new catch-up generation can start.',
+      backend_unavailable: 'Waiting for the Ollama backend to become available.',
+      live_requests_pending: 'Waiting for incoming live requests to be admitted.',
+      backend_operation: 'Waiting for the current backend operation to finish.',
+      service_stopping: 'The intermediary is stopping or preparing a safe restart.',
+      shutting_down: 'The intermediary is shutting down.'
+    };
+    if (reasons[reason]) return reasons[reason];
+    if (data.active_job) return 'Waiting for Frigate to save the outstanding description. No second catch-up handoff is sent.';
+    if (reason === 'active_request') {
+      var active = snapshot && snapshot.active_request;
+      return 'Waiting for ' + titleCase(active && active.client || 'the active request') + ' to finish. Running inference is not preempted.';
+    }
+    if (reason === 'live_requests_queued') {
+      var queues = snapshot && snapshot.queue && snapshot.queue.by_client || {};
+      return 'Waiting behind ' + (queues.odysseus ? 'Odysseus' : queues.frigate ? 'live Frigate requests' : 'live requests') + '.';
+    }
+    if (reason === 'model_lease') return 'Waiting for the short model idle hold' + (background.wait_seconds == null ? '' : ' (' + formatDuration(background.wait_seconds) + ')') + '. This is separate from model keep-alive.';
+    if (data.scan && data.scan.blocked_reason) return 'Catch-up: ' + titleCase(data.scan.blocked_reason) + '.';
+    if (!data.total_queued) return 'No unfinished descriptions are queued.';
+    return 'The next eligible job may start when its live grace / retry delay and all safety checks permit.';
+  }
+
+  function renderCatchupConfirmation() {
+    var active = catchupData.active_job;
+    setText('catchup-active', active ? titleCase(active.kind) + ' · ' + (active.camera || '') + ' · ' + titleCase(active.state || active.status) : 'No background handoff.');
+    setHidden('catchup-confirmation', !active);
+    if (active) {
+      var remaining = Math.max(0, (Number(active.next_attempt_at) - Date.now()) / 1000);
+      setText('catchup-confirmation', (remaining > 0
+        ? 'Waiting for Frigate to save the description. Confirmation window: ' + formatDuration(remaining) + ' remaining. '
+        : 'Confirmation window elapsed. Checking the saved result before arranging an idle-only retry. ')
+        + 'This is not proof that the model is still generating. Confirmation is checked separately from discovery; no second catch-up handoff starts meanwhile.');
+    }
   }
 
   function renderCatchupJobs(id, emptyId, jobs) {
       var list = byId(id);
+      var scroll = list.scrollTop;
       list.replaceChildren();
       setHidden(emptyId, jobs.length > 0);
       jobs.forEach(function (job) {
-        var item = create('li', 'queue-item');
+        var item = create('li', 'queue-item' + (job.needs_attention ? ' catchup-attention' : job.state === 'retrying' ? ' catchup-retrying' : ''));
         item.appendChild(create('strong', '', titleCase(job.kind) + ' · ' + (job.camera || '') + ' · ' + titleCase(job.state || job.status)));
         var eventTime = Number(job.event_time);
         var details = compactId(job.id || job.event_id) + (Number.isFinite(eventTime) && eventTime > 0 ? ' · Recorded ' + new Date(eventTime * 1000).toLocaleString() : '');
         if (job.reason) details += ' · ' + titleCase(job.reason);
-        if (job.state === 'retrying' && job.next_attempt_at) details += ' · Retry after ' + formatDate(job.next_attempt_at);
+        if (job.needs_attention) details += ' · Needs attention (automatic retries continue)';
         item.appendChild(create('p', 'muted', details));
+        var attempts = [];
+        if (job.attempts != null) attempts.push('Attempts: ' + formatInteger(job.attempts));
+        if (job.failures) attempts.push('Unsuccessful / unconfirmed: ' + formatInteger(job.failures));
+        if (job.last_attempt_at) attempts.push('Last attempt: ' + new Date(job.last_attempt_at).toLocaleString());
+        if (job.first_failed_at) attempts.push('First unsuccessful attempt: ' + new Date(job.first_failed_at).toLocaleString());
+        if (job.state === 'retrying' && job.next_attempt_at) attempts.push('Earliest retry: ' + new Date(job.next_attempt_at).toLocaleString() + ' (when idle, not a promised start)');
+        if (attempts.length) item.appendChild(create('p', 'muted', attempts.join(' · ')));
+        var action = job.state === 'retrying' ? 'retry' : (job.state || job.status) === 'skipped' ? 'recheck' : null;
+        if (action) {
+          var button = create('button', 'quiet-button catchup-job-action', action === 'retry' ? 'Retry when idle' : 'Recheck availability');
+          button.type = 'button';
+          button.disabled = !catchupAdminToken || catchupActionPending;
+          button.title = catchupAdminToken ? 'Never bypasses scheduling or media checks' : 'Unlock with the Settings admin token below';
+          button.addEventListener('click', function () { performCatchupAction(action, job); });
+          item.appendChild(button);
+        }
         list.appendChild(item);
       });
+      list.scrollTop = scroll;
   }
 
   function renderCatchupPage() {
     var page = catchupPage || { items: [], offset: 0, total: 0 };
-    renderCatchupJobs('catchup-pending-jobs', 'catchup-pending-empty', page.items);
+    Object.keys(CATCHUP_VIEWS).forEach(function (view) {
+      byId('catchup-view-' + view).setAttribute('aria-pressed', String(view === catchupView));
+    });
+    setText('catchup-pending-heading', CATCHUP_VIEWS[catchupView][0]);
+    setText('catchup-view-help', CATCHUP_VIEWS[catchupView][1]);
+    var renderKey = JSON.stringify([catchupView, page.items, Boolean(catchupAdminToken), catchupActionPending]);
+    if (renderKey !== catchupRenderedPage) {
+      renderCatchupJobs('catchup-pending-jobs', 'catchup-pending-empty', page.items);
+      catchupRenderedPage = renderKey;
+    }
     setText('catchup-page-status', page.total ? 'Showing ' + (page.offset + 1) + '–'
-      + (page.offset + page.items.length) + ' of ' + formatInteger(page.total) + ' saved jobs' : 'No queued descriptions.');
+      + (page.offset + page.items.length) + ' of ' + formatInteger(page.total) + ' saved jobs in this view' : 'No jobs in this view.');
     byId('catchup-previous').disabled = Boolean(catchupPagePromise) || catchupOffset === 0;
     byId('catchup-next').disabled = Boolean(catchupPagePromise) || catchupOffset + CATCHUP_PAGE_SIZE >= page.total;
   }
@@ -545,21 +632,22 @@
   async function refreshCatchupPage() {
     if (catchupPagePromise) return catchupPagePromise;
     var offset = catchupOffset;
+    var view = catchupView;
     var controller = new AbortController();
     var timeout = window.setTimeout(function () { controller.abort(); }, 10000);
     catchupPagePromise = (async function () {
       try {
-        var response = await fetch('/_intermediary/v1/frigate/jobs?offset=' + offset + '&limit=' + CATCHUP_PAGE_SIZE,
+        var response = await fetch('/_intermediary/v1/frigate/jobs?view=' + view + '&offset=' + offset + '&limit=' + CATCHUP_PAGE_SIZE,
           { headers: requestHeaders(), cache: 'no-store', signal: controller.signal });
         if (!response.ok) throw new Error('HTTP ' + response.status);
         var page = await response.json();
         if (!Array.isArray(page.items) || !Number.isSafeInteger(page.offset) || !Number.isSafeInteger(page.total)) throw new Error('Invalid page');
-        if (offset !== catchupOffset) return;
+        if (offset !== catchupOffset || view !== catchupView) return;
         catchupOffset = page.offset;
         catchupPage = page;
         renderCatchupPage();
       } catch (error) {
-        setText('catchup-page-status', 'Could not refresh this queue page. Retrying automatically; saved jobs are unchanged.');
+        if (view === catchupView) setText('catchup-page-status', 'Could not refresh this view. Retrying automatically; saved jobs are unchanged.');
       } finally {
         window.clearTimeout(timeout);
         catchupPagePromise = null;
@@ -581,7 +669,67 @@
     byId('catchup-pending-jobs').scrollTop = 0;
   }
 
+  async function changeCatchupView(view) {
+    if (!CATCHUP_VIEWS[view] || view === catchupView) return;
+    catchupView = view;
+    catchupOffset = 0;
+    catchupPage = null;
+    renderCatchupPage();
+    byId('catchup-pending-jobs').scrollTop = 0;
+    if (catchupPagePromise) await catchupPagePromise;
+    await refreshCatchupPage();
+  }
+
+  function savedCatchupToken() {
+    try { return sessionStorage.getItem(SETTINGS_TOKEN_KEY) || ''; } catch (_) { return ''; }
+  }
+
+  function syncCatchupControls() {
+    setHidden('catchup-use-saved-token', !savedCatchupToken() || Boolean(catchupAdminToken));
+    setHidden('catchup-lock', !catchupAdminToken);
+    setText('catchup-control-state', catchupAdminToken
+      ? 'Settings token selected for this tab. The server checks it for every action. Retrying respects live priority, pause mode, and the active handoff.'
+      : 'Controls are locked. Enter the separate Settings admin token, or explicitly use its saved token. Dashboard and maintenance tokens are never used for these actions.');
+  }
+
+  function unlockCatchup(token) {
+    catchupAdminToken = String(token || '').trim();
+    syncCatchupControls();
+    renderCatchupPage();
+  }
+
+  async function performCatchupAction(action, job) {
+    if (!catchupAdminToken || catchupActionPending || !['retry', 'recheck'].includes(action)) return;
+    if (action === 'retry' && job.state !== 'retrying') return;
+    if (action === 'recheck' && (job.state || job.status) !== 'skipped') return;
+    if (!window.confirm(action === 'retry' ? 'Make this job eligible to retry when idle? Existing descriptions and media will be checked first. This does not bypass live priority or pause mode.' : 'Recheck this skipped item and queue it only if eligible again? No recording or description will be deleted.')) return;
+    catchupActionPending = true;
+    renderCatchupPage();
+    var controller = new AbortController();
+    var timeout = window.setTimeout(function () { controller.abort(); }, 10000);
+    try {
+      var response = await fetch('/_intermediary/v1/frigate/' + action, {
+        method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/json', authorization: 'Bearer ' + catchupAdminToken },
+        body: JSON.stringify({ confirm: true, kind: job.kind, id: job.id }), signal: controller.signal
+      });
+      var payload = await response.json();
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) unlockCatchup('');
+        throw new Error(typeof payload.error === 'string' ? payload.error : payload.error && payload.error.message || payload.message || 'HTTP ' + response.status);
+      }
+      setText('catchup-action-status', 'Request accepted. Media, saved descriptions, and scheduling rules still apply.');
+      await refreshSnapshot();
+    } catch (error) {
+      setText('catchup-action-status', controller.signal.aborted ? 'The action timed out. Refresh the job status before trying again; it may have been accepted.' : 'Action not completed: ' + error.message);
+    } finally {
+      window.clearTimeout(timeout);
+      catchupActionPending = false;
+      renderCatchupPage();
+    }
+  }
+
   function updateLiveClocks() {
+    renderCatchupConfirmation();
     if (activeClock) {
       var elapsed = activeClock.seconds + ((performance.now() - activeClock.at) / 1000);
       setText('active-running', formatDuration(elapsed));
@@ -622,7 +770,7 @@
         hideAuth();
         showError('');
         render(data);
-        if (catchupOffset > 0) await refreshCatchupPage();
+        await refreshCatchupPage();
         setConnection('live', 'Polling every 2s');
         return true;
       } catch (error) {
@@ -747,6 +895,16 @@
   byId('pause-button').addEventListener('click', function () { performMaintenanceAction('pause'); });
   byId('catchup-previous').addEventListener('click', function () { changeCatchupPage(-1); });
   byId('catchup-next').addEventListener('click', function () { changeCatchupPage(1); });
+  Object.keys(CATCHUP_VIEWS).forEach(function (view) {
+    byId('catchup-view-' + view).addEventListener('click', function () { changeCatchupView(view); });
+  });
+  byId('catchup-token-form').addEventListener('submit', function (event) {
+    event.preventDefault();
+    unlockCatchup(byId('catchup-token-input').value);
+    byId('catchup-token-input').value = '';
+  });
+  byId('catchup-use-saved-token').addEventListener('click', function () { unlockCatchup(savedCatchupToken()); });
+  byId('catchup-lock').addEventListener('click', function () { unlockCatchup(''); });
   byId('resume-button').addEventListener('click', function () { performMaintenanceAction('resume'); });
 
   window.addEventListener('pagehide', stopConnections);

@@ -45,7 +45,7 @@ test('catch-up status accepts read/admin tokens but historical scans require adm
   assert.equal(scans, 1);
   const snapshot = await (await fetch(`${base}/_intermediary/v1/status`, { headers: { authorization: 'Bearer read-test' } })).json();
   assert.equal(snapshot.frigate.enabled, true);
-  assert.equal(snapshot.build.version, '1.1.0');
+  assert.equal(snapshot.build.version, '1.2.0');
 });
 
 test('GPU recovery acknowledgment requires admin, pause, empty models, and explicit host confirmation', async (t) => {
@@ -77,10 +77,55 @@ test('backlog pages use read authorization and enforce bounded page parameters',
     assert.equal(response.status, 200);
     assert.equal((await response.json()).total, 50);
   }
-  for (const query of ['offset=-1', 'offset=NaN', 'limit=101', 'limit=0', 'limit=1.5']) {
+  for (const query of ['offset=-1', 'offset=NaN', 'limit=101', 'limit=0', 'limit=1.5', 'view=unknown']) {
     assert.equal((await fetch(`${endpoint}?${query}`, { headers: { authorization: 'Bearer read-test' } })).status, 400);
   }
-  assert.deepEqual(calls, [{ offset: 30, limit: 30 }, { offset: 30, limit: 30 }]);
+  assert.deepEqual(calls, [{ offset: 30, limit: 30, view: 'all' }, { offset: 30, limit: 30, view: 'all' }]);
+  for (const view of ['waiting', 'awaiting', 'retrying', 'attention', 'completed', 'skipped']) {
+    const response = await fetch(`${endpoint}?view=${view}`, { headers: { authorization: 'Bearer read-test' } });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).view, view);
+    assert.equal(calls.at(-1).view, view);
+  }
+});
+
+test('retry/recheck require settings authority, explicit confirmation and valid saved-job identifiers', async (t) => {
+  const calls = [];
+  const catchup = { start() {}, async stop() {}, status: () => ({ enabled: true }),
+    retryJob: async (kind, id) => { calls.push(['retry', kind, id]); return { enabled: true }; },
+    recheckJob: async (kind, id) => { calls.push(['recheck', kind, id]); return { enabled: true }; },
+  };
+  const { base } = await fixture(t, { observability: { auth_token: 'read-test' } }, { catchup });
+  for (const action of ['retry', 'recheck']) {
+    const endpoint = `${base}/_intermediary/v1/frigate/${action}`;
+    const body = { confirm: true, kind: 'review', id: 'saved-job' };
+    for (const token of ['', 'read-test', 'maintenance-test']) assert.equal((await post(endpoint, token, body)).status, 401);
+    assert.equal((await fetch(endpoint)).status, 405);
+    assert.equal((await post(endpoint, 'settings-test', { ...body, confirm: false })).status, 400);
+    for (const invalid of [{ ...body, kind: 'all' }, { ...body, id: '' }, { ...body, id: 'x'.repeat(257) }, { ...body, id: 'bad\n' }]) {
+      assert.equal((await post(endpoint, 'settings-test', invalid)).status, 400);
+    }
+    assert.equal((await fetch(endpoint, { method: 'POST', headers: { authorization: 'Bearer settings-test' }, body: '{}' })).status, 415);
+    assert.equal((await fetch(endpoint, { method: 'POST', headers: { authorization: 'Bearer settings-test', 'content-type': 'application/json' }, body: '{bad' })).status, 400);
+    assert.equal((await post(endpoint, 'settings-test', body)).status, 202);
+  }
+  assert.deepEqual(calls, [['retry', 'review', 'saved-job'], ['recheck', 'review', 'saved-job']]);
+});
+
+test('catch-up controls expose only safe errors and cannot run without an administrative token', async (t) => {
+  let failure = Object.assign(new Error('PRIVATE RESPONSE'), { code: 'handoff_outstanding', statusCode: 409 });
+  const catchup = { start() {}, async stop() {}, status: () => ({}), async retryJob() { throw failure; } };
+  const { base } = await fixture(t, {}, { catchup });
+  const endpoint = `${base}/_intermediary/v1/frigate/retry`;
+  const body = { confirm: true, kind: 'object', id: 'pending' };
+  let response = await post(endpoint, 'settings-test', body);
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).code, 'handoff_outstanding');
+  failure = Object.assign(new Error('PRIVATE RESPONSE'), { code: 'PRIVATE RESPONSE', statusCode: 500 });
+  response = await post(endpoint, 'settings-test', body);
+  assert.doesNotMatch(await response.text(), /PRIVATE/);
+  const disabled = await fixture(t, {}, { catchup, settingsToken: '' });
+  assert.equal((await post(`${disabled.base}/_intermediary/v1/frigate/retry`, 'settings-test', body)).status, 503);
 });
 
 test('request memory admission includes bodies held by an active HTTP request', async (t) => {
@@ -170,4 +215,48 @@ test('real catch-up worker waits through Odysseus request and idle hold before n
   await waitFor(() => catchup.status().totals.completed === 1);
   assert.equal(generated, 1);
   assert.equal(nativeError, undefined);
+});
+
+test('real timer confirms successive saved descriptions without another discovery poll and keeps GPU inference serial', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'intermediary-fast-catchup-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  let service;
+  let base;
+  const calls = [];
+  const failures = [];
+  const items = ['newer', 'older'].map((id, i) => ({ id, camera: 'driveway', label: 'person',
+    start_time: Date.now() / 1000 - 500 - i * 10, end_time: Date.now() / 1000 - 400 - i * 10, data: {} }));
+  const client = {
+    close() {}, capabilities: async () => ({ object: true, review: false }),
+    getConfig: async () => ({ genai: { local: { roles: ['descriptions'] } }, cameras: {
+      driveway: { enabled: true, objects: { genai: { enabled: true, use_snapshot: true } } },
+    } }),
+    list: async (kind, scan) => items.filter((item) => item.start_time > scan.after && item.start_time < scan.before),
+    get: async (kind, id) => items.find((item) => item.id === id), hasMedia: async () => true,
+    regenerate: async (kind, id) => {
+      calls.push(id);
+      // Like Frigate, acknowledge now and save only after native inference ends.
+      post(`${base}/api/generate`, '', { model: 'f-model', id, delay_ms: 50, stream: false })
+        .then(async (response) => {
+          await response.text();
+          if (response.ok) items.find((item) => item.id === id).data.description = 'Saved';
+          else failures.push(response.status);
+        }).catch((error) => failures.push(error));
+      return { accepted: true };
+    },
+  };
+  const config = testConfig({ frigate: { enabled: true, url: 'http://frigate.invalid',
+    state_path: path.join(directory, 'jobs.json'), poll_interval: '1h', confirmation_interval: '1s', live_grace: '0s' } });
+  const catchup = new FrigateCatchup(config, { logger: new SilentLogger(), client,
+    canRun: () => service ? service.backgroundReadiness() : false });
+  const fixtureResult = await fixture(t, {}, { catchup });
+  ({ service, base } = fixtureResult);
+  assert.equal((await post(`${base}/_intermediary/v1/frigate/scan`, 'settings-test', { confirm: true })).status, 202);
+  await waitFor(() => catchup.status().totals.completed === 2, 5_000);
+  assert.deepEqual(calls, ['newer', 'older']);
+  assert.deepEqual(failures, []);
+  assert.equal(fixtureResult.backend.maxActive, 1);
+  const history = await (await fetch(`${base}/_intermediary/v1/frigate/jobs?view=completed`)).json();
+  assert.equal(history.total, 2);
+  assert.equal(history.items.every((job) => job.state === 'completed'), true);
 });

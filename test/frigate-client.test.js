@@ -133,6 +133,31 @@ test('retained media preflight checks thumbnail and snapshot without storing ima
   assert.deepEqual(requests.map((request) => request.url), ['/api/events/x/thumbnail.jpg', '/api/events/x/snapshot.jpg']);
 });
 
+test('empty or non-image media responses are uncertain rather than evidence of deleted footage', async (t) => {
+  let contentType = 'image/jpeg';
+  const { client } = await server(t, (_request, response) => {
+    response.setHeader('content-type', contentType); response.end();
+  });
+  await assert.rejects(client.hasMedia('object', { id: 'x' }, 'thumbnails'), { code: 'invalid_media_response' });
+  contentType = 'text/html';
+  await assert.rejects(client.hasMedia('object', { id: 'x' }, 'thumbnails'), { code: 'invalid_media_response' });
+});
+
+test('malformed recording indexes and unfinished reviews cannot be treated as expired media', async (t) => {
+  let rows = [{ start_time: 'invalid', end_time: 200 }];
+  const { client, requests } = await server(t, (_request, response) => json(response, rows));
+  const item = { camera: 'yard', start_time: 100, end_time: 150 };
+  for (const malformed of [rows, [null], [{ start_time: 150, end_time: 100 }], [{ start_time: null, end_time: 200 }]]) {
+    rows = malformed;
+    await assert.rejects(client.hasMedia('review', item, 'recordings'), { code: 'invalid_recording_list' });
+  }
+  const checked = requests.length;
+  await assert.rejects(client.hasMedia('review', { ...item, end_time: null }, 'recordings'), { code: 'invalid_event_response' });
+  assert.equal(requests.length, checked);
+  rows = [];
+  assert.equal(await client.hasMedia('review', item, 'recordings'), false);
+});
+
 test('missing media returns false; authentication failure is not mistaken for expired footage', async (t) => {
   let code = 404;
   const { client } = await server(t, (request, response) => json(response, {}, code));
@@ -149,6 +174,11 @@ test('review media preflight requires overlapping main-stream recordings', async
   assert.equal(requests[0].url, '/api/yard/recordings?after=105&before=115');
   recordings = [];
   assert.equal(await client.hasMedia('review', item, 'recordings'), false);
+});
+
+test('missing recordings-list route is uncertain rather than evidence of expired review media', async (t) => {
+  const { client } = await server(t, (request, response) => json(response, { error: 'Not found' }, 404));
+  await assert.rejects(client.hasMedia('review', { id: 'r', camera: 'yard', start_time: 105, end_time: 115 }, 'recordings'), { code: 'http_404' });
 });
 
 test('metadata request timeout is bounded and client can cancel outstanding work', async (t) => {

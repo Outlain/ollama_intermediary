@@ -16,6 +16,10 @@
   var lastValidatedSignature = '';
   var lastApplyFeedback = null;
   var touchedPaths = new Set();
+  var catchupRefreshPromise = null;
+  var catchupRefreshController = null;
+  var catchupRefreshTimer = null;
+  var workspaceVisible = false;
 
   function byId(id) { return document.getElementById(id); }
   function all(selector) { return Array.prototype.slice.call(document.querySelectorAll(selector)); }
@@ -73,12 +77,15 @@
     setHidden('page-error', !message);
   }
   function showAuth(message) {
+    workspaceVisible = false;
+    stopCatchupRefresh();
     setHidden('settings-workspace', true);
     setHidden('auth-panel', false);
     setText('auth-message', message || 'A valid settings admin token is required.');
     window.setTimeout(function () { byId('admin-token').focus(); }, 0);
   }
   function showWorkspace() {
+    workspaceVisible = true;
     setHidden('auth-panel', true);
     setHidden('settings-workspace', false);
   }
@@ -474,6 +481,39 @@
     }
     setText('fallback-client-readout', getPath(collectSettings(), 'scheduler.default_client') || 'Odysseus');
     renderFrigateAuthentication();
+    renderWarmModelHint();
+  }
+
+  function durationSeconds(value) {
+    if (typeof value === 'number') return value;
+    var match = /^(-?\d+(?:\.\d+)?)\s*(ms|s|m|h|d)?$/.exec(String(value == null ? '' : value).trim());
+    if (!match) return null;
+    return Number(match[1]) * ({ ms: 0.001, s: 1, m: 60, h: 3600, d: 86400 }[match[2] || 's']);
+  }
+
+  function renderWarmModelHint() {
+    var settings = collectSettings();
+    var keepAlive = durationSeconds(getPath(settings, 'clients.frigate.model_policy.keep_alive'));
+    var confirmation = durationSeconds(getPath(settings, 'frigate.confirmation_interval')) || 2;
+    // Frigate's native preparation can also take time; this is a recommendation,
+    // not a measured guarantee about how long a particular model takes to load.
+    var usefulGap = Math.max(30, confirmation * 2);
+    var show = getPath(settings, 'frigate.enabled') && keepAlive != null && keepAlive >= 0 && keepAlive < usefulGap;
+    setHidden('catchup-warm-warning', !show);
+    setText('catchup-warm-detail', 'Frigate keep-alive is shorter than a useful gap between catch-up jobs and may cause repeated model loads. Consider 2m to keep the model warm; this occupies VRAM while idle but does not reserve the GPU against higher-priority work.');
+    byId('catchup-use-warm-model').disabled = busy || Boolean(loadedEnvelope && loadedEnvelope.restart_pending);
+  }
+
+  function useWarmModel() {
+    if (busy || !loadedSettings || loadedEnvelope && loadedEnvelope.restart_pending) return;
+    var path = 'clients.frigate.model_policy.keep_alive';
+    var input = all('[data-path]').find(function (field) { return field.dataset.path === path; });
+    if (!input) return;
+    input.value = '2m';
+    touchedPaths.add(path);
+    lastValidatedSignature = '';
+    lastApplyFeedback = null;
+    updateDirtyState();
   }
 
   function renderFrigateAuthentication() {
@@ -508,21 +548,49 @@
       if (target) target.scrollIntoView({ block: 'start' });
     }, 0);
     refreshCatchup();
+    startCatchupRefresh();
   }
 
   async function refreshCatchup() {
-    try {
-      var response = await fetch('/_intermediary/v1/frigate/status', { headers: headers(false), cache: 'no-store' });
-      if (!response.ok) return;
-      var data = await response.json();
-      setText('catchup-state', data.state || 'Unknown');
-      var counts = data.counts || {};
-      setText('catchup-status', 'Objects: ' + (data.capabilities && data.capabilities.object ? 'supported' : 'not verified')
-        + ' · Reviews: ' + (data.capabilities && data.capabilities.review ? 'supported' : 'not verified')
-        + ' · Waiting: ' + ((counts.pending || 0) + (counts.waiting_live || 0))
-        + ' · Awaiting saved result: ' + (counts.waiting_result || 0) + ' · Retrying: ' + (counts.retrying || 0)
-        + (data.last_error ? ' · ' + (data.last_error.message || data.last_error.code || data.last_error) : ''));
-    } catch (_) { /* Settings may be restarting; keep current status. */ }
+    if (!workspaceVisible || document.hidden) return;
+    if (catchupRefreshPromise) return catchupRefreshPromise;
+    var controller = new AbortController();
+    catchupRefreshController = controller;
+    var timeout = window.setTimeout(function () { controller.abort(); }, 10000);
+    catchupRefreshPromise = (async function () {
+      try {
+        var response = await fetch('/_intermediary/v1/frigate/status', { headers: headers(false), cache: 'no-store', signal: controller.signal });
+        if (response.status === 401 || response.status === 403) { showAuth('The settings admin token was rejected.'); return; }
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        var data = await response.json();
+        if (!workspaceVisible || controller.signal.aborted) return;
+        setText('catchup-state', data.state || 'Unknown');
+        var counts = data.counts || {};
+        setText('catchup-status', 'Objects: ' + (data.capabilities && data.capabilities.object ? 'supported' : 'not verified')
+          + ' · Reviews: ' + (data.capabilities && data.capabilities.review ? 'supported' : 'not verified')
+          + ' · Waiting: ' + ((counts.pending || 0) + (counts.waiting_live || 0))
+          + ' · Awaiting saved result: ' + (counts.waiting_result || 0) + ' · Retrying: ' + (counts.retrying || 0)
+          + ' · Needs attention: ' + (data.attention_count || 0)
+          + (data.last_error ? ' · ' + (data.last_error.message || data.last_error.code || data.last_error) : ''));
+      } catch (_) {
+        if (workspaceVisible && !document.hidden) setText('catchup-status', 'Catch-up status could not refresh. Retrying automatically; your draft is unchanged.');
+      } finally {
+        window.clearTimeout(timeout);
+        catchupRefreshPromise = null;
+        catchupRefreshController = null;
+      }
+    })();
+    return catchupRefreshPromise;
+  }
+
+  function startCatchupRefresh() {
+    if (!catchupRefreshTimer && workspaceVisible && !document.hidden) catchupRefreshTimer = window.setInterval(refreshCatchup, 5000);
+  }
+
+  function stopCatchupRefresh() {
+    if (catchupRefreshTimer) window.clearInterval(catchupRefreshTimer);
+    catchupRefreshTimer = null;
+    if (catchupRefreshController) catchupRefreshController.abort();
   }
 
   byId('catchup-scan').addEventListener('click', async function () {
@@ -746,6 +814,13 @@
     byId('discard-button').addEventListener('click', discardDraft);
     byId('rollback-button').addEventListener('click', function () { mutateSavedOverrides('rollback'); });
     byId('reset-button').addEventListener('click', function () { mutateSavedOverrides('reset'); });
+    byId('catchup-use-warm-model').addEventListener('click', useWarmModel);
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden) stopCatchupRefresh();
+      else { refreshCatchup(); startCatchupRefresh(); }
+    });
+    window.addEventListener('pagehide', stopCatchupRefresh);
+    window.addEventListener('pageshow', function () { refreshCatchup(); startCatchupRefresh(); });
     window.addEventListener('beforeunload', function (event) {
       if (!dirty) return;
       event.preventDefault();

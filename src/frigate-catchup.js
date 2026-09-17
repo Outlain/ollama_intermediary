@@ -6,7 +6,11 @@ import { FrigateClient, FrigateError } from './frigate-client.js';
 const SCHEMA = 1;
 const KINDS = ['object', 'review'];
 const STATES = new Set(['pending', 'waiting_live', 'waiting_result', 'retrying']);
-const HISTORY_LIMIT = 200;
+const HISTORY_LIMIT = 1_000;
+const SUPPRESSION_LIMIT = 10_000;
+const SUPPRESSION_TTL = 30 * 24 * 60 * 60 * 1_000;
+const VIEWS = new Set(['all', 'waiting', 'awaiting', 'retrying', 'attention', 'completed', 'skipped']);
+const MEDIA_REASONS = new Set(['media_expired_or_missing', 'event_deleted']);
 const MAX_STATE_BYTES = 64 * 1024 * 1024;
 const ELIGIBILITY_REASONS = new Set([
   'camera_disabled', 'description_provider_unavailable', 'false_positive', 'object_descriptions_disabled',
@@ -17,7 +21,7 @@ const JOB_REASONS = new Set([
   'event_deleted', 'description_not_confirmed', 'generation_requested', 'handoff_uncertain',
   'connection_failed', 'request_timeout', 'stopped', 'response_interrupted', 'response_too_large',
   'authentication_failed', 'invalid_json_response', 'invalid_event_response', 'invalid_recording_list',
-  'invalid_media_response', 'generation_not_accepted', 'frigate_operation_failed',
+  'invalid_media_response', 'invalid_camera_configuration', 'generation_not_accepted', 'frigate_operation_failed',
 ]);
 const text = (value, limit = 120) => String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, limit);
 const seconds = (value) => Number.isFinite(Number(value)) && value !== null ? Number(value) : null;
@@ -33,11 +37,17 @@ const restoredJob = (job) => ({
   kind: job.kind, id: job.id, camera: job.camera, event_time: job.event_time, state: job.state,
   reason: safeReason(job.reason), attempts: counter(job.attempts), failures: counter(job.failures),
   created_at: Number.isFinite(job.created_at) ? job.created_at : 0,
+  first_failed_at: Number.isFinite(job.first_failed_at) ? job.first_failed_at : null,
+  last_attempt_at: Number.isFinite(job.last_attempt_at) ? job.last_attempt_at : null,
   next_attempt_at: job.next_attempt_at, ...(Number.isFinite(job.completed_at) ? { completed_at: job.completed_at } : {}),
 });
-const publicJob = (job) => ({
-  kind: job.kind, id: text(job.id), camera: text(job.camera), event_time: job.event_time,
+const publicJob = (job, now, attentionAfterMs) => ({
+  kind: job.kind, id: text(job.id, 256), camera: text(job.camera), event_time: job.event_time,
   state: job.state, reason: safeReason(job.reason), attempts: job.attempts,
+  failures: counter(job.failures), first_failed_at: job.first_failed_at ?? null,
+  last_attempt_at: job.last_attempt_at ?? null,
+  needs_attention: STATES.has(job.state) && Number.isFinite(job.first_failed_at)
+    && now - job.first_failed_at >= attentionAfterMs,
   next_attempt_at: job.next_attempt_at ?? null, completed_at: job.completed_at ?? null,
 });
 const newestFirst = (a, b) => b.event_time - a.event_time || key(a.kind, a.id).localeCompare(key(b.kind, b.id));
@@ -89,7 +99,7 @@ function emptyState(now, origin) {
   return {
     schema_version: SCHEMA, origin, enabled_at: now,
     watermarks: { object: now / 1000, review: now / 1000 },
-    scans: { automatic: {}, manual: {} }, jobs: [], recent: [],
+    scans: { automatic: {}, manual: {} }, jobs: [], recent: [], suppressed: [],
     totals: { completed: 0, skipped: 0, retry_attempts: 0 },
     eligibility_skipped: {},
   };
@@ -110,6 +120,18 @@ export class FrigateCatchup {
     this.running = false;
     this.timer = null;
     this.busy = null;
+    this.processBusy = null;
+    this.cleanupBusy = null;
+    this.cleanupTimer = null;
+    this.confirmationTimer = null;
+    this.nextConfirmationAt = null;
+    this.confirmationFailures = 0;
+    this.confirmationBackoffUntil = 0;
+    this.lockedJobs = new Set();
+    this.nextCleanupAt = 0;
+    this.cleanupCursor = null;
+    this.cleanupLastError = null;
+    this.lastCleanupAt = null;
     this.storeError = null;
     this.lastError = null;
     this.blockedReason = null;
@@ -164,13 +186,20 @@ export class FrigateCatchup {
         }
       }
       if (raw.jobs.filter((job) => job.state === 'waiting_result').length > 1) throw new Error('multiple_handoffs');
+      if (raw.suppressed !== undefined && (!Array.isArray(raw.suppressed) || raw.suppressed.length > SUPPRESSION_LIMIT
+        || raw.suppressed.some((entry) => !KINDS.includes(entry.kind) || typeof entry.id !== 'string'
+          || !entry.id || entry.id.length > 256 || !MEDIA_REASONS.has(entry.reason)
+          || !Number.isFinite(entry.recheck_after)))) throw new Error('invalid_suppression');
       this.state = {
         ...emptyState(raw.enabled_at, this.origin),
         watermarks: { object: raw.watermarks.object, review: raw.watermarks.review },
         scans: { automatic: {}, manual: {} }, jobs: raw.jobs.map(restoredJob),
-        recent: raw.recent.slice(-HISTORY_LIMIT).filter((job) => KINDS.includes(job.kind)
+        recent: raw.recent.slice(-(this.settings.history_limit ?? HISTORY_LIMIT)).filter((job) => KINDS.includes(job.kind)
           && ['completed', 'skipped'].includes(job.state) && typeof job.id === 'string'
           && typeof job.camera === 'string' && Number.isFinite(job.event_time)).map(restoredJob),
+        suppressed: (raw.suppressed ?? []).filter((entry) => entry.recheck_after > this.clock()).map((entry) => ({
+          kind: entry.kind, id: entry.id, reason: entry.reason, recheck_after: entry.recheck_after,
+        })),
         totals: Object.fromEntries(['completed', 'skipped', 'retry_attempts'].map((name) => [name, counter(raw.totals?.[name])])),
         eligibility_skipped: Object.fromEntries([...ELIGIBILITY_REASONS].map((reason) => [reason, counter(raw.eligibility_skipped?.[reason])])),
       };
@@ -179,6 +208,14 @@ export class FrigateCatchup {
         if (scan) this.state.scans[mode][kind] = {
           after: scan.after, before: scan.before, until: scan.until, limit: scan.limit, seen: scan.seen ?? [],
         };
+      }
+      // Version-one states did not have separate suppression metadata. Seed
+      // only known missing-media skips; this never invents a failure timestamp.
+      if (raw.suppressed === undefined) {
+        this.state.suppressed = this.state.recent.filter((job) => MEDIA_REASONS.has(job.reason)).map((job) => ({
+          kind: job.kind, id: job.id, reason: job.reason,
+          recheck_after: (job.completed_at ?? this.clock()) + SUPPRESSION_TTL,
+        })).filter((entry) => entry.recheck_after > this.clock());
       }
     } catch {
       this.storeError = 'backlog_state_invalid';
@@ -216,6 +253,8 @@ export class FrigateCatchup {
     if (this.storeError) return this.status();
     this.running = true;
     this.schedule(0);
+    this.scheduleConfirmation();
+    this.scheduleCleanup();
     return this.status();
   }
 
@@ -230,13 +269,57 @@ export class FrigateCatchup {
     this.timer.unref?.();
   }
 
+  // Discovery/cleanup may involve many slow HTTP requests. They have their own
+  // timer; this single-flight lane only reconciles/dispatches individual jobs.
+  scheduleConfirmation(delay) {
+    if (!this.running || this.storeError) return;
+    delay ??= Math.max(this.settings.confirmationIntervalMs ?? 2_000, this.confirmationBackoffUntil - this.clock());
+    clearTimeout(this.confirmationTimer);
+    this.nextConfirmationAt = this.clock() + delay;
+    this.confirmationTimer = setTimeout(() => {
+      this.confirmationTimer = null;
+      this.processJobs().finally(() => this.scheduleConfirmation());
+    }, delay);
+    this.confirmationTimer.unref?.();
+  }
+
+  operationFailed(error) {
+    this.lastError = safeFailure(error);
+    this.confirmationFailures += 1;
+    const base = this.settings.confirmationIntervalMs ?? 2_000;
+    this.confirmationBackoffUntil = this.clock()
+      + Math.min(Math.max(base, 60_000), base * 2 ** Math.min(5, this.confirmationFailures));
+  }
+
+  scheduleCleanup() {
+    if (!this.running || this.storeError) return;
+    clearTimeout(this.cleanupTimer);
+    const delay = Math.max(0, this.nextCleanupAt - this.clock());
+    this.cleanupTimer = setTimeout(() => {
+      this.cleanupTimer = null;
+      this.nextCleanupAt = this.clock() + (this.settings.cleanupIntervalMs ?? 60_000);
+      this.cleanupJobs().finally(() => {
+        this.nextCleanupAt = this.clock() + (this.settings.cleanupIntervalMs ?? 60_000);
+        this.scheduleCleanup();
+      });
+    }, delay);
+    this.cleanupTimer.unref?.();
+  }
+
   async stop() {
     this.running = false;
     this.nextPollAt = null;
+    this.nextConfirmationAt = null;
     clearTimeout(this.timer);
     this.timer = null;
+    clearTimeout(this.confirmationTimer);
+    this.confirmationTimer = null;
+    clearTimeout(this.cleanupTimer);
+    this.cleanupTimer = null;
     this.client?.close?.();
     await this.busy;
+    await this.processBusy;
+    await this.cleanupBusy;
     if (this.state && !this.storeError) this.persist();
   }
 
@@ -244,17 +327,25 @@ export class FrigateCatchup {
     const counts = { pending: 0, waiting_live: 0, waiting_result: 0, retrying: 0 };
     for (const job of this.state?.jobs ?? []) counts[job.state] += 1;
     const queueItems = this.jobs().items;
+    const views = {
+      all: Object.values(counts).reduce((sum, value) => sum + value, 0),
+      waiting: counts.pending + counts.waiting_live, awaiting: counts.waiting_result, retrying: counts.retrying,
+      attention: (this.state?.jobs ?? []).filter((job) => this.publicJob(job).needs_attention).length,
+      completed: (this.state?.recent ?? []).filter((job) => job.state === 'completed').length,
+      skipped: (this.state?.recent ?? []).filter((job) => job.state === 'skipped').length,
+    };
     return {
       enabled: Boolean(this.settings.enabled),
       state: !this.settings.enabled ? 'disabled' : this.storeError ? 'error' : !this.running ? 'stopped'
         : this.lastError ? 'degraded' : 'running',
       enabled_at: this.state?.enabled_at ?? null,
       capabilities: { ...this.capabilities }, counts,
+      views, attention_count: views.attention, history_limit: this.settings.history_limit ?? HISTORY_LIMIT,
       total_queued: Object.values(counts).reduce((sum, value) => sum + value, 0),
       totals: { ...(this.state?.totals ?? {}) },
       active_job: this.state?.jobs.find((job) => job.state === 'waiting_result')
-        ? publicJob(this.state.jobs.find((job) => job.state === 'waiting_result')) : null,
-      recent_jobs: (this.state?.recent ?? []).slice(-30).reverse().map(publicJob),
+        ? this.publicJob(this.state.jobs.find((job) => job.state === 'waiting_result')) : null,
+      recent_jobs: (this.state?.recent ?? []).slice(-30).reverse().map((job) => this.publicJob(job)),
       pending_jobs: queueItems, queue_items: queueItems,
       eligibility_skipped: { ...(this.state?.eligibility_skipped ?? {}) },
       warnings: Object.entries(this.runtimeConfig?.cameras ?? {})
@@ -267,18 +358,83 @@ export class FrigateCatchup {
         blocked_reason: this.blockedReason,
       },
       last_error: this.storeError ?? this.lastError, next_poll_at: this.nextPollAt,
+      next_confirmation_at: this.nextConfirmationAt, next_cleanup_at: this.nextCleanupAt || null,
+      suppression_count: this.state?.suppressed.length ?? 0,
+      cleanup: { last_checked_at: this.lastCleanupAt, next_check_at: this.nextCleanupAt || null,
+        last_error: this.cleanupLastError, batch_size: this.settings.cleanup_batch_size ?? 25 },
     };
   }
 
-  jobs({ offset = 0, limit = 30 } = {}) {
-    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100) {
+  publicJob(job) {
+    return publicJob(job, this.clock(), this.settings.attentionAfterMs ?? 86_400_000);
+  }
+
+  jobs({ view = 'all', offset = 0, limit = 30 } = {}) {
+    if (!VIEWS.has(view) || !Number.isSafeInteger(offset) || offset < 0 || !Number.isInteger(limit) || limit < 1 || limit > 100) {
       throw new RangeError('Invalid backlog page');
     }
-    const jobs = [...(this.state?.jobs ?? [])].sort(newestFirst);
+    const historical = view === 'completed' || view === 'skipped';
+    const jobs = [...(historical ? this.state?.recent ?? [] : this.state?.jobs ?? [])].filter((job) => {
+      if (view === 'all') return true;
+      if (view === 'waiting') return job.state === 'pending' || job.state === 'waiting_live';
+      if (view === 'awaiting') return job.state === 'waiting_result';
+      if (view === 'attention') return this.publicJob(job).needs_attention;
+      return job.state === view;
+    }).sort(historical ? (a, b) => b.completed_at - a.completed_at || newestFirst(a, b) : newestFirst);
     // A live queue can shrink between pages; return the last valid page, not a blank screen.
     const start = Math.min(offset, Math.max(0, Math.floor((jobs.length - 1) / limit) * limit));
-    return { items: jobs.slice(start, start + limit).map(publicJob), offset: start, limit,
+    return { items: jobs.slice(start, start + limit).map((job) => this.publicJob(job)), offset: start, limit, view,
       total: jobs.length, has_more: start + limit < jobs.length };
+  }
+
+  actionError(code, statusCode = 409) {
+    const error = new Error(code);
+    error.code = code;
+    error.statusCode = statusCode;
+    return error;
+  }
+
+  requireAvailable() {
+    if (!this.settings.enabled || !this.running || !this.state || this.storeError) {
+      throw this.actionError('catchup_unavailable', this.storeError ? 503 : 409);
+    }
+  }
+
+  retryJob(kind, id) {
+    this.requireAvailable();
+    const job = this.state.jobs.find((entry) => entry.kind === kind && entry.id === id);
+    if (!job) throw this.actionError('job_not_found', 404);
+    if (job.state === 'waiting_result') throw this.actionError('handoff_outstanding');
+    if (this.lockedJobs.has(key(kind, id))) throw this.actionError('operation_in_progress');
+    if (job.state !== 'retrying') throw this.actionError('job_not_retryable');
+    // A previous native handoff may still exist in Frigate. Manual retry cannot
+    // shorten its reconciliation grace; pre-dispatch/read-only failures can be
+    // made eligible now. Normal readiness and a fresh description check remain.
+    if (['description_not_confirmed', 'handoff_uncertain'].includes(job.reason)) {
+      job.next_attempt_at = Math.max(job.next_attempt_at, this.clock());
+    } else job.next_attempt_at = this.clock();
+    if (!this.persist()) throw this.actionError('catchup_unavailable', 503);
+    this.scheduleConfirmation(0);
+    return this.status();
+  }
+
+  recheckJob(kind, id) {
+    this.requireAvailable();
+    const existing = this.state.jobs.find((entry) => entry.kind === kind && entry.id === id);
+    if (existing) throw this.actionError(existing.state === 'waiting_result' ? 'handoff_outstanding' : 'job_not_recheckable');
+    const history = this.state.recent.findLast((entry) => entry.kind === kind && entry.id === id && entry.state === 'skipped');
+    if (!history) throw this.actionError('job_not_found', 404);
+    if (this.state.jobs.length >= (this.settings.max_jobs ?? 10_000)) throw this.actionError('backlog_capacity_reached');
+    this.state.suppressed = this.state.suppressed.filter((entry) => entry.kind !== kind || entry.id !== id);
+    this.state.jobs.push({
+      kind, id, camera: history.camera, event_time: history.event_time, state: 'pending', reason: null,
+      attempts: 0, failures: 0, created_at: this.clock(), next_attempt_at: this.clock(),
+      first_failed_at: null, last_attempt_at: null,
+    });
+    if (!this.persist()) throw this.actionError('catchup_unavailable', 503);
+    this.nextCleanupAt = 0;
+    this.schedule(0);
+    return this.status();
   }
 
   scanMissing() {
@@ -323,12 +479,11 @@ export class FrigateCatchup {
       this.capabilities = { ...await this.client.capabilities(), checked: true };
       this.lastCapabilityCheck = this.clock();
     }
-    this.runtimeConfig = await this.client.getConfig();
-    if (!this.runtimeConfig?.cameras || typeof this.runtimeConfig.cameras !== 'object') {
-      throw new FrigateError('invalid_camera_configuration');
-    }
+    this.runtimeConfig = await this.readConfig();
     if (!this.running) return;
     this.lastError = null;
+    // Establish every scan frontier before making a network call. The fast
+    // dispatch lane must not jump ahead while another kind's page is in flight.
     for (const kind of KINDS) {
       if (!this.capabilities[kind]) continue;
       // Frigate writes event metadata asynchronously. Revisit a small discovery
@@ -337,6 +492,9 @@ export class FrigateCatchup {
       this.state.scans.automatic[kind] ??= this.newScan(
         beforeTimestamp(Math.max(this.state.enabled_at / 1000, this.state.watermarks[kind] - lookback)), this.clock() / 1000,
       );
+    }
+    for (const kind of KINDS) {
+      if (!this.capabilities[kind]) continue;
       for (const mode of ['automatic', 'manual']) {
         if (!this.running || this.storeError) return;
         const scan = this.state.scans[mode][kind];
@@ -345,7 +503,19 @@ export class FrigateCatchup {
     }
     if (!this.running || this.storeError) return;
     await this.processJobs();
+    if (this.clock() >= this.nextCleanupAt) {
+      this.nextCleanupAt = this.clock() + (this.settings.cleanupIntervalMs ?? 60_000);
+      await this.cleanupJobs();
+    }
     this.persist();
+  }
+
+  async readConfig() {
+    const config = await this.client.getConfig();
+    if (!config?.cameras || typeof config.cameras !== 'object' || Array.isArray(config.cameras)) {
+      throw new FrigateError('invalid_camera_configuration');
+    }
+    return config;
   }
 
   async scanPage(mode, kind, scan) {
@@ -356,11 +526,17 @@ export class FrigateCatchup {
       throw new FrigateError('invalid_event_list');
     }
     const known = new Set([...this.state.jobs.map((job) => key(job.kind, job.id)), ...(scan.seen ?? [])]);
-    const completedRecently = new Set(this.state.recent.map((job) => key(job.kind, job.id)));
+    this.state.suppressed = this.state.suppressed.filter((entry) => entry.recheck_after > this.clock());
+    const suppressed = new Set(this.state.suppressed.map((entry) => key(entry.kind, entry.id)));
+    const completedRecently = new Set(this.state.recent
+      // Missing-media skips have their own expiry; the browsable history must
+      // not prevent an eventual recheck after that expiry.
+      .filter((job) => !MEDIA_REASONS.has(job.reason)).map((job) => key(job.kind, job.id)));
     for (const item of rows) {
       const start = seconds(item.start_time);
       if (start < scan.after || start > scan.until || (mode === 'automatic' && start * 1000 < this.state.enabled_at)) continue;
-      if (known.has(key(kind, item.id)) || completedRecently.has(key(kind, item.id)) || hasFrigateDescription(kind, item)) continue;
+      if (known.has(key(kind, item.id)) || completedRecently.has(key(kind, item.id))
+        || suppressed.has(key(kind, item.id)) || hasFrigateDescription(kind, item)) continue;
       const eligibility = frigateEligibility(kind, item, this.runtimeConfig);
       const end = seconds(item.end_time);
       const camera = this.runtimeConfig.cameras[item.camera];
@@ -386,6 +562,7 @@ export class FrigateCatchup {
         reason: null, attempts: 0, failures: 0, created_at: this.clock(), next_attempt_at: end === null
           ? this.clock() + (this.settings.pollIntervalMs ?? 30_000)
           : Math.max(this.clock(), end * 1000 + (this.settings.liveGraceMs ?? 120_000)),
+        first_failed_at: null, last_attempt_at: null,
       });
       known.add(key(kind, item.id));
       (scan.seen ??= []).push(key(kind, item.id));
@@ -424,9 +601,16 @@ export class FrigateCatchup {
   }
 
   finish(job, state, reason) {
+    if (!this.state.jobs.includes(job)) return;
     this.state.jobs = this.state.jobs.filter((other) => other !== job);
     this.state.recent.push({ ...job, state, reason, completed_at: this.clock(), next_attempt_at: null });
-    this.state.recent = this.state.recent.slice(-HISTORY_LIMIT);
+    this.state.recent = this.state.recent.slice(-(this.settings.history_limit ?? HISTORY_LIMIT));
+    if (state === 'skipped' && MEDIA_REASONS.has(reason)) {
+      this.state.suppressed = this.state.suppressed.filter((entry) => key(entry.kind, entry.id) !== key(job.kind, job.id)
+        && entry.recheck_after > this.clock());
+      this.state.suppressed.push({ kind: job.kind, id: job.id, reason, recheck_after: this.clock() + SUPPRESSION_TTL });
+      this.state.suppressed = this.state.suppressed.slice(-SUPPRESSION_LIMIT);
+    }
     this.state.totals[state] = (this.state.totals[state] ?? 0) + 1;
     this.persist();
   }
@@ -434,20 +618,38 @@ export class FrigateCatchup {
   retry(job, reason) {
     const base = this.settings.retryIntervalMs ?? 60_000;
     job.failures = (job.failures ?? 0) + 1;
-    const delay = Math.min(this.settings.maxRetryIntervalMs ?? 3_600_000, base * (2 ** Math.min(16, job.failures - 1)));
+    job.first_failed_at ??= this.clock();
+    const delay = Math.min(this.settings.maxRetryIntervalMs ?? 18_000_000, base * (2 ** Math.min(30, job.failures - 1)));
     job.state = 'retrying';
     job.reason = reason;
-    job.next_attempt_at = this.clock() + Math.max(delay, this.settings.liveGraceMs ?? 120_000);
+    job.next_attempt_at = this.clock() + delay;
+    if (reason === 'description_not_confirmed' || reason === 'handoff_uncertain') {
+      job.next_attempt_at = Math.max(job.next_attempt_at, this.clock() + (this.settings.liveGraceMs ?? 120_000));
+    }
     this.state.totals.retry_attempts += 1;
     this.persist();
   }
 
-  async processJobs() {
+  processJobs() {
+    if (this.processBusy) return this.processBusy;
+    if (!this.running || this.storeError || this.clock() < this.confirmationBackoffUntil) return Promise.resolve();
+    this.processBusy = this.runProcessJobs().catch((error) => {
+      if (this.running) {
+        this.operationFailed(error);
+      }
+    }).finally(() => { this.processBusy = null; this.onChange(this.status()); });
+    return this.processBusy;
+  }
+
+  async runProcessJobs() {
     const active = this.state.jobs.find((job) => job.state === 'waiting_result');
     if (active) {
       await this.checkJob(active, true);
-      return; // Never dispatch a second background job in the same tick.
+      // A confirmed saved description releases the handoff immediately. Merely
+      // reaching its timeout never confirms failure, and still keeps retry grace.
+      if (this.state.jobs.some((job) => job.state === 'waiting_result')) return;
     }
+    if (!this.runtimeConfig || !this.capabilities.checked) return;
     if (!this.readiness()) return;
     const jobs = this.state.jobs.filter((job) => job.next_attempt_at <= this.clock())
       .sort((a, b) => b.event_time - a.event_time || a.id.localeCompare(b.id));
@@ -455,6 +657,7 @@ export class FrigateCatchup {
     for (const job of jobs.slice(0, 10)) {
       if (!this.readiness()) return;
       if (!this.capabilities[job.kind]) continue;
+      if (this.lockedJobs.has(key(job.kind, job.id))) return;
       const frontier = Math.max(0, ...['automatic', 'manual'].flatMap((mode) => KINDS
         .filter((kind) => this.capabilities[kind] && this.state.scans[mode][kind])
         .map((kind) => this.state.scans[mode][kind].before)));
@@ -472,10 +675,78 @@ export class FrigateCatchup {
     }
   }
 
+  cleanupJobs() {
+    if (this.cleanupBusy) return this.cleanupBusy;
+    if (!this.running || this.storeError || !this.runtimeConfig) return Promise.resolve();
+    this.cleanupBusy = this.runCleanupJobs().catch((error) => {
+      if (this.running) this.lastError = safeFailure(error);
+    }).finally(() => {
+      this.cleanupBusy = null;
+      this.nextCleanupAt = this.clock() + (this.settings.cleanupIntervalMs ?? 60_000);
+      this.onChange(this.status());
+    });
+    return this.cleanupBusy;
+  }
+
+  async runCleanupJobs() {
+    this.cleanupLastError = null;
+    this.lastCleanupAt = this.clock();
+    const available = this.state.jobs.filter((job) => job.state !== 'waiting_result')
+      .sort((a, b) => key(a.kind, a.id).localeCompare(key(b.kind, b.id)));
+    const pivot = available.findIndex((job) => !this.cleanupCursor || key(job.kind, job.id).localeCompare(this.cleanupCursor) > 0);
+    const ordered = pivot < 0 ? available : [...available.slice(pivot), ...available.slice(0, pivot)];
+    for (const job of ordered.slice(0, this.settings.cleanup_batch_size ?? 25)) {
+      if (!this.running || this.storeError) return;
+      this.cleanupCursor = key(job.kind, job.id);
+      if (!this.capabilities[job.kind] || job.state === 'waiting_result' || this.lockedJobs.has(this.cleanupCursor)) continue;
+      this.lockedJobs.add(this.cleanupCursor);
+      let fetchingEvent = true;
+      try {
+        const item = await this.client.get(job.kind, job.id);
+        fetchingEvent = false;
+        if (!this.running || !this.state.jobs.includes(job)) return;
+        if (hasFrigateDescription(job.kind, item)) {
+          this.finish(job, 'completed', job.attempts ? 'description_confirmed' : 'completed_by_frigate');
+          continue;
+        }
+        const end = seconds(item.end_time);
+        if (end === null || end * 1000 + (this.settings.liveGraceMs ?? 120_000) > this.clock()) continue;
+        const eligibility = frigateEligibility(job.kind, item, this.runtimeConfig);
+        // Cached camera configuration can have changed since discovery. Passive
+        // cleanup does not make terminal eligibility decisions; dispatch does a
+        // fresh effective-config check before acting on those filters.
+        if (!eligibility.eligible) continue;
+        if (!await this.client.hasMedia(job.kind, item, eligibility.source)) {
+          const current = frigateEligibility(job.kind, item, await this.readConfig());
+          if (this.running && current.eligible && current.source === eligibility.source) {
+            this.finish(job, 'skipped', 'media_expired_or_missing');
+          }
+        }
+      } catch (error) {
+        if (!this.running) return;
+        if (fetchingEvent && error.statusCode === 404) this.finish(job, 'skipped', 'event_deleted');
+        else {
+          // A failed cleanup read is not a failed generation, and must not erase
+          // work or advance that job's retry counters/backoff. Stop the batch so
+          // unavailable servers are not hit once for every remaining entry.
+          this.cleanupLastError = safeFailure(error);
+          return;
+        }
+      } finally { this.lockedJobs.delete(key(job.kind, job.id)); }
+    }
+  }
+
   async checkJob(job, verifyOnly) {
+    const id = key(job.kind, job.id);
+    if (this.lockedJobs.has(id) || !this.state.jobs.includes(job)) return true;
+    this.lockedJobs.add(id);
+    if (!verifyOnly) job.last_attempt_at = this.clock();
+    let fetchingEvent = true;
     try {
       const item = await this.client.get(job.kind, job.id);
+      fetchingEvent = false;
       if (!this.running) return false;
+      if (verifyOnly) { this.confirmationFailures = 0; this.confirmationBackoffUntil = 0; }
       if (hasFrigateDescription(job.kind, item)) {
         this.finish(job, 'completed', job.attempts ? 'description_confirmed' : 'completed_by_frigate');
         return false;
@@ -494,18 +765,34 @@ export class FrigateCatchup {
           : end * 1000 + (this.settings.liveGraceMs ?? 120_000);
         return false;
       }
-      const eligibility = frigateEligibility(job.kind, item, this.runtimeConfig);
+      // Fast dispatch runs independently of discovery, so its cached camera
+      // configuration may be older than a user's latest toggle/source change.
+      // Never make a terminal eligibility/media decision from that cache.
+      const config = await this.readConfig();
+      if (!this.running) return false;
+      const eligibility = frigateEligibility(job.kind, item, config);
       if (!eligibility.eligible) { this.finish(job, 'skipped', eligibility.reason); return false; }
       if (!await this.client.hasMedia(job.kind, item, eligibility.source)) {
-        if (this.running) this.finish(job, 'skipped', 'media_expired_or_missing');
+        const current = frigateEligibility(job.kind, item, await this.readConfig());
+        if (!this.running) return false;
+        if (!current.eligible) this.finish(job, 'skipped', current.reason);
+        else if (current.source === eligibility.source) this.finish(job, 'skipped', 'media_expired_or_missing');
+        else {
+          // Missing snapshots do not make an event unusable if the camera just
+          // switched to retained thumbnails (or vice versa). Recheck next turn.
+          job.state = 'pending';
+          job.next_attempt_at = this.clock() + (this.settings.confirmationIntervalMs ?? 2_000);
+        }
         return false;
       }
       if (!this.readiness()) return false;
       // Metadata/media checks may take seconds. Re-read uncached configuration
       // and description immediately before PUT to avoid replacing a live result
       // or acting on a camera toggle changed while this poll was in progress.
-      const latestConfig = await this.client.getConfig();
+      const latestConfig = await this.readConfig();
+      fetchingEvent = true;
       const latestItem = await this.client.get(job.kind, job.id);
+      fetchingEvent = false;
       if (!this.running) return false;
       if (hasFrigateDescription(job.kind, latestItem)) {
         this.finish(job, 'completed', 'completed_by_frigate');
@@ -524,6 +811,7 @@ export class FrigateCatchup {
       job.state = 'waiting_result';
       job.reason = 'generation_requested';
       job.attempts += 1;
+      job.last_attempt_at = this.clock();
       job.next_attempt_at = this.clock() + (this.settings.generationTimeoutMs ?? 600_000);
       if (!this.persist() || !this.readiness()) {
         if (!this.storeError) { job.state = 'pending'; this.persist(); }
@@ -531,26 +819,32 @@ export class FrigateCatchup {
       }
       try {
         await this.client.regenerate(job.kind, job.id, eligibility.source);
+        this.confirmationFailures = 0;
+        this.confirmationBackoffUntil = 0;
       } catch (error) {
         if ([400, 401, 403, 404, 405, 422, 429].includes(error.statusCode)) {
-          if (error.statusCode === 404) this.finish(job, 'skipped', 'event_deleted');
-          else this.retry(job, safeFailure(error));
+          // A missing regeneration route is not proof the event was deleted.
+          // The next preflight GET will confirm deletion if that is the cause.
+          this.retry(job, safeFailure(error));
+          if ([401, 403, 429].includes(error.statusCode)) this.operationFailed(error);
         } else {
           // Transport/5xx errors can occur after native dispatch; wait and verify.
           job.reason = 'handoff_uncertain';
+          this.operationFailed(error);
           this.persist();
         }
       }
       return true;
     } catch (error) {
       if (!this.running) return false;
-      if (error.statusCode === 404) { this.finish(job, 'skipped', 'event_deleted'); return false; }
+      if (fetchingEvent && error.statusCode === 404) { this.finish(job, 'skipped', 'event_deleted'); return false; }
       if (verifyOnly) {
-        this.lastError = safeFailure(error);
+        this.operationFailed(error);
         return true; // Cannot confirm status; keep the single native handoff.
       }
       this.retry(job, safeFailure(error));
-      return false;
-    }
+      this.operationFailed(error);
+      return true; // Stop this dispatch batch and back off after an API failure.
+    } finally { this.lockedJobs.delete(id); }
   }
 }

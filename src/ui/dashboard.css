@@ -165,9 +165,8 @@ main { padding-block: 28px 16px; }
 .maintenance-card { grid-column: 1 / -1; grid-row: 1; }
 .catchup-card { grid-column: 1 / -1; grid-row: 4; }
 .catchup-card > p { overflow-wrap: anywhere; }
-.catchup-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; margin-block: 18px; }
-.catchup-columns h3 { margin-bottom: 12px; }
-.catchup-columns .queue-item p { margin-block: 8px 0; overflow-wrap: anywhere; }
+.catchup-card h3 { margin-bottom: 12px; }
+.catchup-card .queue-item p { margin-block: 8px 0; overflow-wrap: anywhere; }
 .current-card { grid-column: 1; grid-row: 2; }
 .queue-card { grid-column: 2; grid-row: 2; }
 .backend-card { grid-column: 1; grid-row: 3; }
@@ -329,7 +328,6 @@ main { padding-block: 28px 16px; }
   .backend-card { order: 4; }
   .events-card { order: 5; }
   .catchup-card { order: 6; }
-  .catchup-columns { grid-template-columns: 1fr; }
   .maintenance-layout { grid-template-columns: 1fr; }
   .metadata-strip { grid-template-columns: repeat(4, minmax(70px, 1fr)); }
 }
@@ -384,3 +382,18 @@ main { padding-block: 28px 16px; }
 .catchup-pagination { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
 .catchup-pagination button:disabled { opacity: .45; cursor: not-allowed; }
 #catchup-page-status { margin-top: 12px; }
+.catchup-views { display: flex; flex-wrap: wrap; gap: 8px; margin: 20px 0; }
+.catchup-views button { white-space: normal; text-align: left; }
+.catchup-views button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.catchup-views span { margin-left: 5px; font-variant-numeric: tabular-nums; }
+.catchup-views .has-attention { border-color: var(--danger); }
+.catchup-views .has-attention span { color: var(--danger); }
+.catchup-views .has-retries span { color: var(--warning); }
+.catchup-controls { margin-top: 18px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; }
+.catchup-controls summary { cursor: pointer; color: var(--muted); font-size: .78rem; }
+.catchup-controls form { margin-block: 15px; }
+.catchup-controls .catchup-pagination { margin-top: 12px; }
+.queue-item.catchup-attention { border-left: 3px solid var(--danger); }
+.queue-item.catchup-retrying { border-left: 3px solid var(--warning); }
+.catchup-job-action { margin-top: 8px; }
+.catchup-job-action:disabled { opacity: .45; cursor: not-allowed; }

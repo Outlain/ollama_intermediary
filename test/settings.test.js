@@ -87,6 +87,61 @@ test('explicit open Frigate API mode is editable without a missing-credentials w
   assert.equal(result.diagnostics.some((item) => item.code === 'frigate_credentials_missing'), false);
 });
 
+test('catch-up cadence, cleanup, history, and attention options are editable and preserve saved policies', (t) => {
+  const options = fixture(t);
+  options.baseRaw.frigate = { max_retry_interval: '1h', state_path: '/app/state/original-backlog.json' };
+  const currentOverrides = { clients: { frigate: { model_policy: { keep_alive: '15s' } } } };
+  const draft = { frigate: {
+    confirmation_interval: '3s', cleanup_interval: '2m', cleanup_batch_size: 20,
+    history_limit: 1500, attention_after: '24h',
+  } };
+  const result = validateSettingsDraft({ ...options, currentOverrides, draft });
+  assert.equal(result.valid, true);
+  assert.equal(result.effectiveConfig.frigate.confirmationIntervalMs, 3000);
+  assert.equal(result.effectiveConfig.frigate.cleanupIntervalMs, 120000);
+  assert.equal(result.settings.frigate.cleanup_batch_size, 20);
+  assert.equal(result.settings.frigate.history_limit, 1500);
+  assert.equal(result.effectiveConfig.frigate.attentionAfterMs, 24 * 3600000);
+  assert.equal(result.effectiveConfig.frigate.maxRetryIntervalMs, 3600000);
+  assert.equal(result.effectiveConfig.frigate.state_path, '/app/state/original-backlog.json');
+  assert.equal(result.settings.clients.frigate.model_policy.keep_alive, '15s');
+  assert.equal(result.settings.frigate.confirmationIntervalMs, undefined);
+  assert.equal(JSON.stringify(result).includes(options.environment.MAINTENANCE_TOKEN), false);
+  assert.deepEqual(currentOverrides, { clients: { frigate: { model_policy: { keep_alive: '15s' } } } });
+  const updated = validateSettingsDraft({ ...options, currentOverrides, draft: { frigate: { max_retry_interval: '5h' } } });
+  assert.equal(updated.valid, true);
+  assert.equal(updated.effectiveConfig.frigate.maxRetryIntervalMs, 5 * 3600000);
+});
+
+test('catch-up settings report all independent unsafe cadence and storage fields', (t) => {
+  const result = validateSettingsDraft({ ...fixture(t), draft: { frigate: {
+    confirmation_interval: '500ms', cleanup_interval: '9s', cleanup_batch_size: 101,
+    history_limit: 5001, attention_after: '0s',
+  } } });
+  assert.equal(result.valid, false);
+  const invalid = result.diagnostics.filter((item) => item.severity === 'error');
+  assert.deepEqual(invalid.map((item) => item.path).sort(), [
+    'frigate.attention_after', 'frigate.cleanup_batch_size', 'frigate.cleanup_interval',
+    'frigate.confirmation_interval', 'frigate.history_limit',
+  ]);
+  assert.ok(invalid.every((item) => item.code === 'out_of_range'));
+});
+
+test('short Frigate keep-alive is a non-blocking warning, not a silent policy change', (t) => {
+  const options = fixture(t);
+  const draft = { frigate: { enabled: true, url: 'http://frigate.test:5000', auth_mode: 'none' },
+    clients: { frigate: { model_policy: { keep_alive: '1s' } } } };
+  const result = validateSettingsDraft({ ...options, draft });
+  assert.equal(result.valid, true);
+  assert.equal(result.settings.clients.frigate.model_policy.keep_alive, '1s');
+  const warning = result.diagnostics.find((item) => item.code === 'frigate_keep_alive_short');
+  assert.equal(warning.severity, 'warning');
+  assert.equal(warning.path, 'clients.frigate.model_policy.keep_alive');
+  draft.clients.frigate.model_policy.keep_alive = '2m';
+  const adequate = validateSettingsDraft({ ...options, draft });
+  assert.equal(adequate.diagnostics.some((item) => item.code === 'frigate_keep_alive_short'), false);
+});
+
 test('model overrides support normal tags and namespaces without exposing Frigate credentials', () => {
   const baseRaw = {
     server: { listen: '127.0.0.1:0' },

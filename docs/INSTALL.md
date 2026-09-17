@@ -234,6 +234,22 @@ The backlog is tied to the configured Frigate server address. Changing its host,
 
 See the [README catch-up section](../README.md#frigate-description-catch-up) for timing limits and the [Home Assistant optional sensors/action](HOME_ASSISTANT.md) for quick-view controls. Production API permissions, media availability, and GPU stability still need verification on your actual deployment.
 
+### Upgrade an existing catch-up deployment
+
+Preserve `config.yml`, `secrets.env`, browser-saved overrides, and the named state volume. Do **not** replace your configuration with `config.example.yml` or use `docker compose down -v`. At an idle/paused boundary, update the repository and rebuild/recreate `ollama-scheduler` using the normal update procedure. Refresh the dashboard and Settings page after restart. The existing backlog is reused; descriptions and images remain in Frigate.
+
+New fields default to fast **2s confirmation**, **1m cleanup / 25 jobs per pass**, **24h attention flagging**, and **1,000 combined completed/skipped history records**. Discovery remains on its own interval, normally 30s; a saved result can release the next eligible job without an extra discovery-cycle delay. Temporary Frigate failures back off API checks. This still permits one unconfirmed native regeneration and one GPU inference at a time.
+
+Explicit existing values continue to win over new defaults. In `/settings`:
+
+1. Under **Catch-up**, set **Maximum retry delay** to `5h` if your older configuration still explicitly uses `1h`. Retries continue with increasing delays; the 24h attention flag is informational, not a stop condition.
+2. Under **Frigate**, consider **Ollama keep-alive** of `2m` if it is still `15s`. This can reduce reloads; it does not extend Frigate's scheduler priority or change its idle hold. Exact-model overrides can still supersede the client policy.
+3. Validate/apply at an idle/paused boundary. Verify an object and a review description are saved, then verify Odysseus still takes priority. Resume inference explicitly if maintenance pause is active.
+
+Use the dashboard's separate **Retrying / Needs attention** views to investigate failures. **Retry when idle** still respects priority, pause, and outstanding generations. The cleanup pass checks for deleted events/missing media independently of GPU availability; it does not blindly expire everything older than two weeks. **Recheck availability** can revisit media that later becomes available. Recent completed/skipped rows roll off at the chosen limit, not pending jobs, lifetime totals, or Frigate's descriptions. Increasing history cannot restore rows that already rolled off before upgrading.
+
+Existing Home Assistant sensors/actions remain compatible; no replacement YAML is required for the faster worker or queue views.
+
 ### Context-size failures and apparent catch-up stalls
 
 An Ollama HTTP 400 such as `request (14407 tokens) exceeds the available context size (8192 tokens)` means the images/text do not fit the configured context window. It is not a scheduling-priority decision. In the targeted Frigate build `0.19.0-bb6c2e9`, the Ollama provider reads `provider_options.options.num_ctx`. In Frigate's **Settings → Enrichments → Generative AI**, edit the provider's **Provider options** field, preserving its other settings. For that specific 14,407-token failure, 16,384 is a reasonable first trial:

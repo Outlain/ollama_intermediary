@@ -99,10 +99,16 @@ export class FrigateClient {
         });
         response.on('error', (error) => finish(error));
         response.on('aborted', () => finish(new FrigateError('response_interrupted')));
-        response.on('end', () => finish(null, {
-          statusCode, headers: response.headers,
-          text: discard ? '' : Buffer.concat(chunks).toString('utf8'),
-        }));
+        response.on('end', () => {
+          // A nominal image response with no bytes is not proof of retained media.
+          // Treat it as uncertain, not deleted: a temporary server issue must not
+          // permanently discard a description job.
+          if (media && size === 0) return finish(new FrigateError('invalid_media_response'));
+          finish(null, {
+            statusCode, headers: response.headers,
+            text: discard ? '' : Buffer.concat(chunks).toString('utf8'),
+          });
+        });
       });
       const timer = setTimeout(() => request.destroy(new FrigateError('request_timeout')), this.settings.requestTimeoutMs ?? 15_000);
       timer.unref?.();
@@ -166,11 +172,19 @@ export class FrigateClient {
   async hasMedia(kind, item, source) {
     try {
       if (kind === 'review') {
+        const start = Number(item.start_time);
+        const end = Number(item.end_time);
+        if (item.start_time == null || item.end_time == null || !Number.isFinite(start)
+          || !Number.isFinite(end) || end <= start) throw new FrigateError('invalid_event_response');
         const recordings = await this.request(`${encodeURIComponent(item.camera)}/recordings`, {
           query: { after: item.start_time, before: item.end_time },
         });
-        if (!Array.isArray(recordings)) throw new FrigateError('invalid_recording_list');
-        return recordings.some((row) => Number(row.end_time) > Number(item.start_time) && Number(row.start_time) < Number(item.end_time));
+        if (!Array.isArray(recordings) || recordings.some((row) => !row || row.start_time == null || row.end_time == null
+          || !Number.isFinite(Number(row.start_time)) || !Number.isFinite(Number(row.end_time))
+          || Number(row.end_time) <= Number(row.start_time))) throw new FrigateError('invalid_recording_list');
+        // This verifies Frigate's retained-recording index, not readability of
+        // every video file. Do not decode/export whole recordings just to probe.
+        return recordings.some((row) => Number(row.end_time) > start && Number(row.start_time) < end);
       }
       // Frigate's object regeneration needs a retained thumbnail even in snapshot mode.
       await this.request(`events/${encodeURIComponent(item.id)}/thumbnail.jpg`, { discard: true, media: true });
@@ -180,7 +194,9 @@ export class FrigateClient {
       }
       return true;
     } catch (error) {
-      if (error.statusCode === 404) return false;
+      // A missing object image is evidence of unavailable media. A missing
+      // recordings-list route is not: supported APIs return [] for no footage.
+      if (kind === 'object' && error.statusCode === 404) return false;
       throw error;
     }
   }
