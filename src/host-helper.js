@@ -133,11 +133,24 @@ export class HostHelperClient {
     const available = this.settings.enabled && !stale && !this.lastError && raw?.available === true
       && validRows && raw.gpus.length > 0 && raw.gpus.length <= 16
       && new Set(gpus.map((gpu) => gpu.id)).size === gpus.length;
+    const m = value?.memory;
+    const memory = Object.fromEntries(['total_bytes', 'available_bytes', 'swap_total_bytes', 'swap_used_bytes',
+      'oom_kill_count', 'pressure_some_avg10', 'pressure_full_avg10'].map((key) => [key, number(m?.[key],
+      key.startsWith('pressure_') ? 100 : Number.MAX_SAFE_INTEGER)]));
+    memory.available = this.settings.enabled && !stale && !this.lastError && m?.available === true
+      && memory.total_bytes > 0 && memory.available_bytes !== null && memory.available_bytes <= memory.total_bytes
+      && memory.swap_total_bytes !== null && memory.swap_used_bytes !== null && memory.swap_used_bytes <= memory.swap_total_bytes;
+    memory.error = memory.available ? null : 'host_memory_unavailable';
     return {
       enabled: this.settings.enabled, available, stale, sampled_at: value?.sampled_at ?? null,
       error: !this.settings.enabled ? null : this.lastError ?? (stale ? 'host_telemetry_stale'
         : !available ? safeCode(raw?.error, 'host_telemetry_unavailable') : null),
-      gpus,
+      gpus, memory,
+      capabilities: { restart_reconciliation: value?.capabilities?.restart_reconciliation === true,
+        external_replacement: value?.capabilities?.external_replacement === true },
+      last_service_failure: value?.last_service_failure?.code === 'ollama_host_oom'
+        && Number.isFinite(Date.parse(value.last_service_failure.observed_at))
+        ? { code: 'ollama_host_oom', observed_at: value.last_service_failure.observed_at } : null,
       // Internal consumers require service incarnation proof; callers should
       // omit it from public GPU summaries unless expressly needed.
       service: value?.service ?? null, bound: value?.bound === true,
@@ -148,6 +161,14 @@ export class HostHelperClient {
   restart(operationId, expectedInvocationId, { timeoutMs, signal } = {}) {
     return this.request('/v1/ollama/restart', { method: 'POST',
       body: { operation_id: operationId, expected_invocation_id: expectedInvocationId }, timeoutMs, signal });
+  }
+
+  reconcile(operationId, options) {
+    return this.request(`/v1/ollama/operations/${encodeURIComponent(operationId)}`, options);
+  }
+
+  replacement(since, options) {
+    return this.request(`/v1/ollama/replacement?since=${encodeURIComponent(since / 1000)}`, options);
   }
 
   start() {

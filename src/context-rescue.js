@@ -6,7 +6,7 @@ const HASH = /^[a-f0-9]{64}$/;
 export const RESCUE_REASONS = new Set(['context_overflow', 'rescue_above_cap', 'rescue_model_limit',
   'rescue_model_unknown', 'rescue_telemetry_unavailable', 'rescue_gpu_busy', 'rescue_vram_headroom',
   'rescue_used', 'rescue_request_succeeded', 'rescue_request_failed', 'rescue_outcome_uncertain',
-  'rescue_body_limit']);
+  'rescue_body_limit', 'rescue_host_memory_unavailable', 'rescue_host_memory_low', 'rescue_host_memory_pressure']);
 
 // Only complete, bounded HTTP 400 error documents qualify. Never infer an
 // overflow from free text, generated content, generic 400s, or stream failures.

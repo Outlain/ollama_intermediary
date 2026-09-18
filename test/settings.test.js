@@ -90,12 +90,15 @@ test('explicit open Frigate API mode is editable without a missing-credentials w
 test('host monitoring and recovery controls are editable while socket and state paths stay host-managed', (t) => {
   const options = fixture(t);
   const result = validateSettingsDraft({ ...options, draft: {
-    host_helper: { enabled: true, poll_interval: '10s', request_timeout: '20s', stale_after: '40s' },
+    host_helper: { enabled: true, poll_interval: '10s', request_timeout: '20s', stale_after: '40s',
+      memory_guard: { enabled: true, min_available_mb: 3072, rescue_min_available_mb: 6144, max_pressure_full_percent: 5 } },
     auto_recovery: { enabled: true, check_interval: '10s', restart_timeout: '2m', verification_timeout: '1m', cooldown: '10m', window: '2h', max_restarts: 1, stable_samples: 4, max_idle_vram_mb: 256 },
   } });
   assert.equal(result.valid, true);
   assert.equal(result.effectiveConfig.auto_recovery.cooldownMs, 600000);
   assert.equal(result.effectiveConfig.host_helper.pollIntervalMs, 10000);
+  assert.equal(result.effectiveConfig.host_helper.memory_guard.min_available_mb, 3072);
+  assert.equal(result.settings.host_helper.memory_guard.rescue_min_available_mb, 6144);
   assert.equal(result.settings.auto_recovery.enabled, true);
   assert.equal(result.settings.auto_recovery.state_path, undefined);
   assert.equal(result.settings.host_helper.socket_path, undefined);

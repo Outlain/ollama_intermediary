@@ -135,6 +135,14 @@ host_helper:
   poll_interval: 5s
   request_timeout: 15s
   stale_after: 30s
+  # Used only with enabled host monitoring. Requires the 1.6+ host helper.
+  # Admission floors, not predictions of peak memory use. Live work is unchanged.
+  memory_guard:
+    enabled: true
+    min_available_mb: 2048
+    # Context rescue always requires RAM evidence, even if the guard above is off.
+    rescue_min_available_mb: 4096
+    max_pressure_full_percent: 10
 
 auto_recovery:
   # Explicit opt-in after the host helper is installed and reports fresh data.

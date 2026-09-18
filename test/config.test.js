@@ -54,6 +54,16 @@ test('host environment bootstrap accepts exact booleans without overriding absen
   }
 });
 
+test('host RAM floors default conservatively and reject invalid or inverted limits', () => {
+  const make = (memory_guard) => normalizeConfig({ server: { listen: '127.0.0.1:0' }, host_helper: { memory_guard } });
+  assert.deepEqual(make({}).host_helper.memory_guard, { enabled: true, min_available_mb: 2048,
+    rescue_min_available_mb: 4096, max_pressure_full_percent: 10 });
+  for (const guard of [{ enabled: 'true' }, { min_available_mb: 255 }, { min_available_mb: 1.5 },
+    { rescue_min_available_mb: 1024 }, { max_pressure_full_percent: 0 }, { max_pressure_full_percent: 101 }]) {
+    assert.throws(() => make(guard), /memory_guard/);
+  }
+});
+
 test('duration parsing rejects values that would overflow or make Node timers fire immediately', () => {
   assert.equal(parseDuration('30m'), 1_800_000);
   assert.throws(() => parseDuration(`${'9'.repeat(400)}h`), /must not exceed/);

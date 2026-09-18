@@ -326,6 +326,14 @@
             <div class="field" data-field-wrap="auto_recovery.max_idle_vram_mb"><label>Maximum idle VRAM (MB)<input data-path="auto_recovery.max_idle_vram_mb" type="number" min="64" max="4096" step="1" placeholder="512"></label><p class="field-help">Allow known driver/display allocations after restart. Do not raise this to conceal unexplained GPU allocations.</p><p class="field-error" data-error-for="auto_recovery.max_idle_vram_mb"></p></div>
           </div>
           <p class="section-intro">Automatic recovery waits during a manual pause. The dashboard's protected Check / recover now action explicitly permits a recovery check while paused, without resuming inference. If checks fail or the restart budget is exhausted, the safety lock remains visible for attention.</p>
+          <h3>Host RAM safeguards</h3>
+          <p class="field-help">Requires the updated host helper. This defers background catch-up, not live Odysseus/Frigate requests, when RAM is low, stale, or under sustained pressure. Pending jobs are kept. Larger-context rescue always requires RAM checks. These are minimum headroom thresholds, not predictions of peak allocation. Fix VM memory allocation and Ollama cache budgets as well.</p>
+          <div class="field-grid field-grid-3">
+            <label class="check-field" data-field-wrap="host_helper.memory_guard.enabled"><input data-path="host_helper.memory_guard.enabled" type="checkbox"><span><strong>Defer catch-up under RAM pressure</strong><small>Enabled by default when host monitoring is used.</small></span><span class="field-error" data-error-for="host_helper.memory_guard.enabled"></span></label>
+            <div class="field" data-field-wrap="host_helper.memory_guard.min_available_mb"><label>Catch-up RAM headroom (MiB)<input data-path="host_helper.memory_guard.min_available_mb" type="number" min="256" max="1048576" step="1"></label><p class="field-error" data-error-for="host_helper.memory_guard.min_available_mb"></p></div>
+            <div class="field" data-field-wrap="host_helper.memory_guard.rescue_min_available_mb"><label>Context rescue RAM headroom (MiB)<input data-path="host_helper.memory_guard.rescue_min_available_mb" type="number" min="256" max="1048576" step="1"></label><p class="field-error" data-error-for="host_helper.memory_guard.rescue_min_available_mb"></p></div>
+            <div class="field" data-field-wrap="host_helper.memory_guard.max_pressure_full_percent"><label>Full memory-stall threshold (10-second %, PSI)<input data-path="host_helper.memory_guard.max_pressure_full_percent" type="number" min="1" max="100" step="1"></label><p class="field-help">Default 10%. Swap being occupied is not by itself a reason to stop.</p><p class="field-error" data-error-for="host_helper.memory_guard.max_pressure_full_percent"></p></div>
+          </div>
         </section>
 
         <section id="access" class="settings-card" aria-labelledby="access-heading">

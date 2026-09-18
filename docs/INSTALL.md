@@ -181,6 +181,13 @@ One-at-a-time scheduling prevents overlapping admitted inference, but it cannot 
 
 ## Install from source instead
 
+For the 1.6 recovery/RAM upgrade on an existing helper-enabled installation,
+follow [Upgrading to 1.6](../integrations/host/README.md#upgrading-to-16).
+Both the container and the installed host helper need updating; preserve their
+state. A container-only upgrade with an old helper lacks RAM evidence, so guarded
+catch-up/context rescue will wait until the helper is updated. No new token,
+GPU reset permission, host reboot permission, or Frigate image rebuild is needed.
+
 ```sh
 git clone https://github.com/Outlain/ollama_intermediary.git
 cd ollama_intermediary

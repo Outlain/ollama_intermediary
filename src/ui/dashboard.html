@@ -336,6 +336,12 @@
         <p id="host-gpu-sampled" class="form-help">No hardware sample available.</p>
         <p id="host-gpu-error" class="notice notice-warning" hidden></p>
         <div id="host-gpu-list" class="host-gpu-list"></div>
+        <section aria-labelledby="host-memory-heading">
+          <h3 id="host-memory-heading">Host system RAM &amp; swap</h3>
+          <p class="form-help">This is the Ollama VM's RAM, not GPU VRAM or the intermediary container's memory. Available RAM includes reclaimable caches. Swap occupancy alone does not mean current pressure.</p>
+          <p id="host-memory-state" class="notice notice-warning">System memory is unknown. Update the host helper to enable this view.</p>
+          <dl id="host-memory-stats" class="detail-grid"></dl>
+        </section>
         <p class="form-help">Unknown values are not zero. Idle telemetry does not by itself prove that an interrupted request cannot resume.</p>
       </section>
 

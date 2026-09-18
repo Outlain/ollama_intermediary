@@ -158,6 +158,24 @@ test('physical VRAM is distinct from model allocation and null or stale hardware
   assert.doesNotMatch(nodes.get('host-gpu-list').textContent, /No GPU processes reported/);
 });
 
+test('host RAM is separate from VRAM and becomes unknown when telemetry is stale', () => {
+  const { ui, nodes } = harness('dashboard');
+  const host = { enabled: true, available: true, stale: false, gpus: [],
+    memory: { available: true, total_bytes: 30 * 1024 ** 3, available_bytes: 1024 ** 3,
+      swap_total_bytes: 4 * 1024 ** 3, swap_used_bytes: 2 * 1024 ** 3, pressure_full_avg10: null, oom_kill_count: 1 } };
+  ui.renderHostGpu({ host_gpu: host, scheduler: { background: { reason: 'host_memory_low' } } });
+  assert.match(nodes.get('host-memory-stats').textContent, /Total RAM30 GB.*Available RAM1 GB.*Swap used2 GB/);
+  assert.match(nodes.get('host-memory-stats').textContent, /Memory stall \(10s\)Unknown/);
+  assert.match(nodes.get('host-memory-state').textContent, /Jobs are retained/);
+  ui.renderHostGpu({ host_gpu: { ...host, stale: true } });
+  assert.doesNotMatch(nodes.get('host-memory-stats').textContent, /30 GB|1 GB|2 GB/);
+  assert.match(nodes.get('host-memory-state').textContent, /unknown or stale/);
+  const settings = harness('settings');
+  for (const key of ['enabled', 'min_available_mb', 'rescue_min_available_mb', 'max_pressure_full_percent']) {
+    assert.ok(settings.inputs.some(input => input.dataset.path === 'host_helper.memory_guard.' + key));
+  }
+});
+
 test('automatic recovery storage unavailability does not invent an inference lock', () => {
   const { ui, nodes } = harness('dashboard');
   const data = { backend: { reachable: true, state: 'healthy', recovery_required: false }, service: { ready: true }, scheduler: { state: 'idle' },

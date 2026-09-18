@@ -513,11 +513,15 @@
       restart_cooldown: 'Waiting for the minimum interval between service restarts.',
       other_gpu_work_or_unknown_processes: 'Other GPU work or unknown process ownership prevents a safe automatic restart.',
       restart_outcome_unknown: 'The service restart outcome is uncertain. Host verification is required.',
+      waiting_for_restart_settle: 'Ollama is settling after restart. Rechecking the same operation without another restart; inference stays blocked.',
+      restart_verification_timeout: 'The bounded restart verification window expired. Check the host, then use Check / recover now to reverify the same operation. It does not repeat that restart.',
+      verifying_existing_service_restart: 'A service restart already occurred after this incident. Verifying it without restarting Ollama again.',
       manual_pause_preserved: 'Recovery succeeded. Your manual pause remains in effect.',
       inference_reenabled: 'Recovery succeeded. Normal scheduling and live priority apply.'
     };
     setHidden('recovery-step', !recovery.reason);
     setText('recovery-step', recovery.reason ? 'Current check: ' + (steps[recovery.reason] || titleCase(recovery.reason)) : '');
+    if (recovery.host_failure === 'ollama_host_oom') setText('recovery-step', 'Host evidence: systemd reported that Ollama was killed by system out-of-memory. Check VM RAM and swap; this is not a confirmed GPU VRAM fault.');
     var reason = backend.recovery_reason || recovery.reason;
     setHidden('recovery-cause', !reason);
     setText('recovery-cause', reason);
@@ -547,6 +551,21 @@
     var host = data.host_gpu || {};
     var fresh = host.enabled === true && host.available === true && host.stale === false;
     var gpus = Array.isArray(host.gpus) ? host.gpus : [];
+    var memory = host.memory || {};
+    var memoryFresh = host.enabled === true && host.stale === false && memory.available === true;
+    var memoryReason = data.scheduler && data.scheduler.background && data.scheduler.background.reason;
+    setText('host-memory-state', !memoryFresh ? 'System RAM is unknown or stale. Update/check the host helper; guarded catch-up and context rescue require fresh RAM telemetry.'
+      : ['host_memory_low', 'host_memory_pressure'].includes(memoryReason) ? 'Catch-up is waiting for system RAM headroom. Jobs are retained; no service restart is triggered by this guard.'
+        : 'System RAM telemetry is current. Headroom checks reduce risk but cannot predict a request’s peak memory use.');
+    byId('host-memory-state').className = memoryFresh && !['host_memory_low', 'host_memory_pressure'].includes(memoryReason)
+      ? 'form-help' : 'notice notice-warning';
+    var memoryStats = byId('host-memory-stats'); memoryStats.replaceChildren();
+    [['Total RAM', hardwareBytes(memory.total_bytes, memoryFresh)], ['Available RAM', hardwareBytes(memory.available_bytes, memoryFresh)],
+      ['Swap used', hardwareBytes(memory.swap_used_bytes, memoryFresh)], ['Swap total', hardwareBytes(memory.swap_total_bytes, memoryFresh)],
+      ['Memory stall (10s)', hardwareValue(memory.pressure_full_avg10, '%', memoryFresh)],
+      ['System OOM kills since boot', hardwareValue(memory.oom_kill_count, '', memoryFresh)]].forEach(function (entry) {
+        var pair = create('div'); pair.appendChild(create('dt', '', entry[0])); pair.appendChild(create('dd', '', entry[1])); memoryStats.appendChild(pair);
+      });
     var setupErrors = {
       host_helper_socket_missing: 'The helper socket is not visible in this container. The helper may not be installed, or its socket directory is not mounted. Run the host installer on ubuntu-ai; the container cannot determine which host-side step is missing.',
       host_helper_permission_denied: 'The helper socket is present but access is denied. Check the container’s supplementary helper group and socket permissions. Do not make the socket world-writable.',
@@ -739,6 +758,9 @@
       backend_unavailable: 'Waiting for the Ollama backend to become available.',
       live_requests_pending: 'Waiting for incoming live requests to be admitted.',
       backend_operation: 'Waiting for the current backend operation to finish.',
+      host_memory_unavailable: 'Waiting for fresh host RAM telemetry. Update/check the host helper; unknown memory is not free memory.',
+      host_memory_low: 'Waiting for available system RAM to recover. Saved jobs are retained; GPU VRAM is a separate resource.',
+      host_memory_pressure: 'Waiting for host memory pressure to ease. Saved jobs are retained.',
       service_stopping: 'The intermediary is stopping or preparing a safe restart.',
       shutting_down: 'The intermediary is shutting down.'
     };
@@ -826,6 +848,9 @@
             rescue_telemetry_unavailable: 'Fresh, backend-matched GPU readings are unavailable',
             rescue_gpu_busy: 'GPU activity or another application prevents rescue',
             rescue_vram_headroom: 'Less than 2 GiB of free VRAM; rescue is blocked',
+            rescue_host_memory_low: 'Not enough available system RAM for a larger-context attempt',
+            rescue_host_memory_unavailable: 'Fresh host RAM readings are required; update/check the host helper',
+            rescue_host_memory_pressure: 'System RAM is under sustained pressure; rescue is deferred',
             rescue_used: 'The one larger attempt has been reserved/used; no further enlargement',
             rescue_request_succeeded: 'Larger Ollama request succeeded; Frigate still determines the saved result',
             rescue_request_failed: 'Larger request failed; no further enlargement',

@@ -84,6 +84,8 @@ const EDITABLE_TREE = Object.freeze({
     poll_interval: duration({ minMs: 1000, maxMs: 60000 }),
     request_timeout: duration({ minMs: 1000, maxMs: 60000 }),
     stale_after: duration({ minMs: 1000, maxMs: 300000 }),
+    memory_guard: Object.freeze({ enabled: boolean(), min_available_mb: integer({ min: 256, max: 1048576 }),
+      rescue_min_available_mb: integer({ min: 256, max: 1048576 }), max_pressure_full_percent: integer({ min: 1, max: 100 }) }),
   }),
   auto_recovery: Object.freeze({
     enabled: boolean(),

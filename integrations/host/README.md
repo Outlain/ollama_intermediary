@@ -19,7 +19,8 @@ inference through the intermediary and keep its upstream Ollama port private.
   membership grants recovery control, not just telemetry. No TCP listener or
   additional browser token is used between the intermediary and helper.
 - Dedicated unprivileged service account with `render` / `video` access.
-  Only fixed read-only AMD SMI and systemd queries are executed for telemetry.
+  Only fixed read-only AMD SMI/systemd queries and bounded Linux `/proc` reads
+  are used for telemetry and process identity.
   GPU device permissions themselves are not a hardware read-only sandbox.
 - Root-owned helper code/configuration and an exact sudoers rule permitting only
   `/usr/bin/systemctl restart ollama.service`. No Docker socket or privileged
@@ -30,7 +31,7 @@ inference through the intermediary and keep its upstream Ollama port private.
   changed service identity, corrupt state, or unreadable cgroup stops recovery.
 - After restart: the systemd invocation must change; every recorded old worker
   PID/start-time identity must be gone; the new main PID must be in the service
-  cgroup. GPU processes must be empty, activity zero, and residual VRAM no more
+  cgroup. GPU processes must be empty, activity at most 1%, and residual VRAM no more
   than 512 MiB. These checks are in addition to, not a substitute for, the
   intermediary's independent idle samples and empty Ollama model list.
   Raising the intermediary's idle-VRAM threshold does not raise this separate
@@ -42,8 +43,12 @@ inference through the intermediary and keep its upstream Ollama port private.
   are bypassed by clicking retry.
 - A UUID operation ID is durably recorded **before** a restart. Retrying that same
   ID never restarts the service again, even after a timeout or helper crash. An
-  uncertain operation stays uncertain until manual recovery; it is not silently
-  reissued. Do not delete the helper journal to clear a limit or uncertainty.
+  uncertain operation with saved worker/boot evidence can be verified again via
+  a read-only GET. Transient post-restart activity does not permanently freeze
+  its outcome. The intermediary bounds the verification window; missing proof,
+  a changed host boot, or persistent activity remains blocked. Legacy uncertain
+  records without proof still require manual verification. The operation is
+  never silently reissued. Do not delete the journal to clear a limit.
 - Inactive/unknown GPU telemetry never becomes a fictional zero. Process names
   and per-process VRAM may be unavailable. Reported physical VRAM is distinct from
   Ollama's loaded-model allocation and from CPU-visible VRAM/GTT.
@@ -52,6 +57,90 @@ An idle GPU reading by itself does **not** clear the intermediary's recovery
 latch. The changed service incarnation and old-worker termination are the
 recovery boundary. Manual pause remains a separate state; recovery must not
 resume inference while an operator pause is active.
+
+The helper keeps up to four durable service-incarnation observations, including
+worker PID/start-time identities and host boot ID. It can verify an external
+systemd/operator replacement only if the new main process started strictly after
+the incident and every recorded old worker is gone. An unchanged service or
+idle hardware without prior observations is insufficient. Incarnation evidence
+does not prove that arbitrary GPU workloads are safe: non-Ollama work still blocks
+automatic recovery.
+
+Protocol additions retain `ollama-intermediary-host-v1` for compatibility:
+
+- `GET /v1/status`: adds `memory`, capability flags, and captured systemd OOM evidence.
+- `GET /v1/ollama/operations/<uuid>`: rechecks a known operation; unknown IDs never create one.
+- `GET /v1/ollama/replacement?since=<Unix-seconds>`: read-only external-replacement proof.
+- `POST /v1/ollama/restart`: unchanged authorization and durable operation ID;
+  a repeated ID may recheck its result but can never dispatch another restart.
+
+Worker/boot proof is private to the host journal, not returned to the browser.
+
+## Upgrading to 1.6
+
+1. In the dashboard, pause inference **until manually resumed** and wait for
+   active work to drain. Disable automatic recovery in Settings during the update.
+2. Update the intermediary using your normal source-build or published-release
+   procedure, preserving configuration, secrets, Compose overrides and state volumes.
+   Update this repository/deployment bundle too; updating only the container does
+   not update the host-installed Python helper.
+3. On the Ollama VM, as the normal Docker-capable user, run the updated installer:
+
+   ```bash
+   cd /opt/ollama_intermediary
+   python3 integrations/host/install.py
+   ```
+
+   Review its plan and confirm. It replaces the helper code/service definition,
+   preserves the host journal, and restarts the helper—not Ollama. Existing
+   supported Compose mounts/groups are merged without duplication. Advanced
+   deployments can instead reinstall the helper files using the manual steps
+   below and explicitly restart `ollama-intermediary-host.service`; preserve the
+   configured environment file and both recovery journals.
+4. Verify that both physical GPU readings and **Host RAM & swap** are fresh.
+   Re-enable automatic recovery. For an existing lock use **Check / recover now**;
+   a legacy uncertain operation may still require the manual host-verification
+   and acknowledgment procedure. Do not clear a lock just because the GPU looks idle.
+5. Resume maintenance explicitly when verification succeeds. Guarded catch-up
+   will wait if RAM data is missing or below its floor, retaining all jobs.
+
+## Host memory and Ollama cache budget
+
+GPU VRAM and VM system RAM are separate resources. Serial GPU inference does not
+limit the RAM peak of one request or the RAM occupied by cached prompt states.
+The helper reads host `MemAvailable` (including reclaimable memory), swap use,
+optional PSI `full avg10`, and the system-wide `oom_kill` counter. Missing values
+remain unknown. An occupied swap file is not itself proof of active pressure.
+
+Avoid ballooning away RAM needed by this workload and leave sufficient real
+memory for the hypervisor and other VMs. The default admission floors (2 GiB for
+catch-up, 4 GiB for context rescue) are starting safeguards, not a measured safe
+request size. A 30 GiB VM or 32 GiB GPU does not establish a tested context cap.
+
+For **Ollama 0.34.0's llama-server runner**, an optional operator-managed reduction
+of the prompt-state RAM cache is `LLAMA_ARG_CACHE_RAM=1024` (MiB). This limits that
+cache, not total process RAM or the model's context. Smaller caches can reduce
+reuse and require more recomputation. Ollama's [pinned runner version](https://github.com/ollama/ollama/blob/v0.34.0/LLAMA_CPP_VERSION)
+uses llama.cpp b10760, which defines [this cache control](https://github.com/ggml-org/llama.cpp/blob/b10760/common/arg.cpp#L1608).
+Recheck support after changing Ollama/runner versions; this is not a universal
+Ollama setting. The installer does **not** apply it automatically.
+
+If choosing this mitigation, keep inference paused and automatic recovery off.
+Run `sudo systemctl edit ollama.service` on the Ollama host and add the following
+to the editable section, preserving existing overrides:
+
+```ini
+[Service]
+Environment="LLAMA_ARG_CACHE_RAM=1024"
+```
+
+Then run `sudo systemctl daemon-reload` and `sudo systemctl restart ollama.service`.
+This interrupts Ollama clients, so do it only after draining. Re-enable recovery,
+verify/acknowledge any existing lock safely, and resume deliberately. Inspect
+runner startup/cache diagnostics after the next normal load to confirm a
+1024 MiB budget before relying on it. Do not stress-test production memory merely
+to validate this upgrade. This setting belongs to native Ollama's service, **not**
+the intermediary's `secrets.env` or Frigate's provider options.
 
 ## Recommended: interactive one-command setup
 

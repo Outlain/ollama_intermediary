@@ -227,6 +227,46 @@ The helper also enforces its own 512 MiB post-restart residual-VRAM ceiling. Low
 
 This is failure containment and bounded recovery, not a guarantee against AMD driver faults. A context-window overflow is a definite rejected request, not a reason to restart Ollama. Fix its input sizing/context separately. If driver allocations persist after the allowed service restart, recovery requires operator attention; automatic GPU resets and host rebooting are intentionally not implemented.
 
+### Recovery reconciliation and host RAM guards (1.6)
+
+Update **both the intermediary and the host helper** for this upgrade. The
+[upgrade procedure](integrations/host/README.md#upgrading-to-16) preserves saved
+jobs, credentials, recovery records, and restart limits. No Frigate rebuild is
+needed. Version numbers in source do not imply that an image has been published.
+
+- A transient busy-GPU reading immediately after an Ollama restart no longer
+  strands the incident indefinitely. The intermediary rechecks the same durable
+  operation within a bounded settling window, without dispatching a second
+  restart. Old-worker termination, changed service identity, and stable idle
+  samples are still required. A timeout remains a visible safety lock; **Check /
+  recover now** can open another read-only verification window for that operation.
+- A systemd/operator restart can be adopted without an extra helper restart if
+  the helper has prior durable worker observations and proves that the new
+  service started after the incident, the old workers are gone, and the GPU is
+  idle. Empty VRAM alone never qualifies. Legacy uncertain records without this
+  evidence still need manual host verification.
+- Host telemetry now includes VM RAM total/available, swap total/used, optional
+  Linux memory-pressure measurements, and the system-wide OOM-kill counter since
+  boot. A captured systemd `oom-kill` result is identified separately from GPU
+  faults. Polling may miss a short-lived service failure; the global counter
+  alone cannot attribute an OOM to Ollama.
+- With host monitoring enabled, catch-up admission defaults to waiting below
+  **2 GiB available system RAM** or at **10% full memory pressure over 10 seconds**.
+  Correlated requests are checked again before inference dispatch. Larger-context
+  rescue always requires fresh RAM data and at least **4 GiB available**, even
+  if the ordinary catch-up guard is disabled. Thresholds are editable in Settings.
+  Unknown/stale RAM readings also block guarded background work; an older helper
+  must be updated to supply them. Without host monitoring, ordinary catch-up keeps
+  its existing behavior; context rescue still requires monitoring.
+
+These checks defer background work without discarding jobs, triggering a service
+restart, or changing live Odysseus/Frigate priority. Ordinary live requests remain
+subject to the existing serial inference and recovery gates, not the new RAM
+admission guard. Full swap alone is not a blocker: old cold pages can remain there
+after pressure subsides. RAM floors are **not peak-memory predictions** and cannot
+guarantee an oversized request will fit. Fixed VM memory, workload sizing, and
+Ollama cache budgets still matter; see the [host memory guidance](integrations/host/README.md#host-memory-and-ollama-cache-budget).
+
 ## Frigate description catch-up
 
 Catch-up is opt-in (`frigate.enabled: false` by default). It is a durable to-do list of Frigate object/review IDs, timestamps, state, and retry metadata—not a second copy of camera images, prompts, or recordings. Frigate still retrieves its own retained media and stores the resulting descriptions.

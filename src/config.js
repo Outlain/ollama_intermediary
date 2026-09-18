@@ -68,6 +68,7 @@ const DEFAULTS = {
     poll_interval: '5s',
     request_timeout: '15s',
     stale_after: '30s',
+    memory_guard: { enabled: true, min_available_mb: 2048, rescue_min_available_mb: 4096, max_pressure_full_percent: 10 },
   },
   auto_recovery: {
     enabled: false,
@@ -267,6 +268,17 @@ function validate(config) {
   }
   if (config.host_helper.staleAfterMs < config.host_helper.pollIntervalMs) {
     throw new Error('host_helper.stale_after must be at least host_helper.poll_interval');
+  }
+  const memory = config.host_helper.memory_guard;
+  if (typeof memory.enabled !== 'boolean') throw new Error('host_helper.memory_guard.enabled must be boolean');
+  for (const key of ['min_available_mb', 'rescue_min_available_mb']) {
+    if (!Number.isInteger(memory[key]) || memory[key] < 256 || memory[key] > 1048576) {
+      throw new Error(`host_helper.memory_guard.${key} must be between 256 and 1048576`);
+    }
+  }
+  if (memory.rescue_min_available_mb < memory.min_available_mb) throw new Error('host_helper.memory_guard rescue headroom must be at least normal headroom');
+  if (!Number.isInteger(memory.max_pressure_full_percent) || memory.max_pressure_full_percent < 1 || memory.max_pressure_full_percent > 100) {
+    throw new Error('host_helper.memory_guard.max_pressure_full_percent must be between 1 and 100');
   }
   for (const [field, min, max] of [['max_restarts', 1, 2], ['stable_samples', 2, 10], ['max_idle_vram_mb', 64, 4096]]) {
     if (!Number.isInteger(config.auto_recovery[field]) || config.auto_recovery[field] < min || config.auto_recovery[field] > max) {

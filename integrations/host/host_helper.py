@@ -22,7 +22,7 @@ import tempfile
 import threading
 import time
 import uuid
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 
 PROTOCOL = "ollama-intermediary-host-v1"
 MAX_OUTPUT = 1024 * 1024
@@ -31,6 +31,27 @@ MAX_OPERATIONS = 100000
 COOLDOWN = 300
 WINDOW = 3600
 MAX_RESTARTS = 2
+
+
+def read_small(path, limit=65536):
+    with open(path, encoding="utf-8") as stream:
+        value = stream.read(limit + 1)
+    if len(value) > limit:
+        raise SafeError("host_data_limit")
+    return value
+
+
+def valid_workers(value):
+    return (isinstance(value, dict) and 0 < len(value) <= 4096
+            and all(re.fullmatch(r"[1-9][0-9]{0,9}", str(pid))
+                    and isinstance(start, str) and re.fullmatch(r"[0-9]{1,24}", start)
+                    for pid, start in value.items()))
+
+
+def valid_proof(value):
+    return bool(isinstance(value, dict) and valid_workers(value.get("workers"))
+            and isinstance(value.get("boot_id"), str)
+            and re.fullmatch(r"[a-f0-9-]{36}", value["boot_id"]))
 
 
 class SafeError(Exception):
@@ -226,10 +247,60 @@ class SystemHost:
         self.amd_smi, self.runner = amd_smi, runner
         self.proc_root, self.cgroup_root = Path(proc_root), Path(cgroup_root)
 
+    def boot_id(self):
+        try:
+            value = read_small(self.proc_root / "sys/kernel/random/boot_id").strip()
+            if not re.fullmatch(r"[a-f0-9-]{36}", value):
+                raise ValueError()
+            return value
+        except (OSError, ValueError):
+            raise SafeError("host_boot_identity_unknown") from None
+
+    def process_started_at(self, pid):
+        # btime has one-second precision. This is a conservative LOWER bound;
+        # external recovery requires it to be strictly after the incident.
+        try:
+            boot = re.search(r"^btime ([0-9]+)$", read_small(self.proc_root / "stat"), re.M)
+            ticks = self.process_identity(pid)
+            if not boot or ticks is None:
+                raise ValueError()
+            return int(boot[1]) + int(ticks) / os.sysconf("SC_CLK_TCK")
+        except (OSError, ValueError):
+            raise SafeError("service_start_time_unknown") from None
+
+    def memory(self):
+        try:
+            info = dict(re.findall(r"^([A-Za-z_]+):\s+(\d+) kB$", read_small(self.proc_root / "meminfo"), re.M))
+            values = {key: int(info[key]) * 1024 for key in ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree")}
+            if values["MemTotal"] <= 0 or values["MemAvailable"] > values["MemTotal"] or values["SwapFree"] > values["SwapTotal"]:
+                raise ValueError()
+            result = {"available": True, "error": None, "total_bytes": values["MemTotal"],
+                      "available_bytes": values["MemAvailable"], "swap_total_bytes": values["SwapTotal"],
+                      "swap_used_bytes": values["SwapTotal"] - values["SwapFree"],
+                      "pressure_some_avg10": None, "pressure_full_avg10": None, "oom_kill_count": None}
+            try:
+                for kind, value in re.findall(r"^(some|full) avg10=([0-9.]+)", read_small(self.proc_root / "pressure/memory"), re.M):
+                    metric = float(value)
+                    if math.isfinite(metric) and 0 <= metric <= 100:
+                        result[f"pressure_{kind}_avg10"] = metric
+            except (OSError, ValueError, SafeError):
+                pass
+            try:
+                counter = re.search(r"^oom_kill (\d+)$", read_small(self.proc_root / "vmstat"), re.M)
+                if counter:
+                    result["oom_kill_count"] = int(counter[1])
+            except (OSError, SafeError):
+                pass
+            return result
+        except (OSError, ValueError, KeyError, SafeError):
+            return {"available": False, "error": "host_memory_unavailable"}
+
     def service(self):
-        fields = "ActiveState,SubState,MainPID,InvocationID,ControlGroup,KillMode,LoadState"
+        fields = "ActiveState,SubState,MainPID,InvocationID,ControlGroup,KillMode,LoadState,Result"
         raw = self.runner(["/usr/bin/systemctl", "show", "ollama.service", "--no-pager", "--property=" + fields], timeout=2)
         values = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
+        if values.get("Result") == "oom-kill":
+            raise SafeError("ollama_host_oom")
         invocation = values.get("InvocationID", "")
         cgroup = values.get("ControlGroup", "")
         if values.get("LoadState") != "loaded" or not re.fullmatch(r"[a-f0-9]{32}", invocation):
@@ -300,7 +371,7 @@ class SystemHost:
         self.runner(["/usr/bin/sudo", "-n", "/usr/bin/systemctl", "restart", "ollama.service"], timeout=45)
 
     def old_workers_gone(self, workers):
-        return all(self.process_identity(pid) != identity for pid, identity in workers.items())
+        return all(self.process_identity(int(pid)) != identity for pid, identity in workers.items())
 
 
 class Journal:
@@ -328,6 +399,8 @@ class Journal:
                 for key, entry in data["operations"].items():
                     if str(uuid.UUID(key)) != key or not isinstance(entry, dict):
                         raise ValueError()
+                    if "proof" in entry and not valid_proof(entry["proof"]):
+                        raise ValueError()
                     if entry.get("state") not in ("uncertain", "failed", "completed"):
                         raise ValueError()
                     if not isinstance(entry.get("dispatched_at", 0), (float, int)):
@@ -337,6 +410,11 @@ class Journal:
                             or not isinstance(entry.get("after_invocation_id"), str)
                             or not math.isfinite(entry.get("dispatched_at", 0))):
                         raise ValueError()
+                observations = data.get("observations", [])
+                if (not isinstance(observations, list) or len(observations) > 4
+                        or any(not valid_proof(item) or not re.fullmatch(r"[a-f0-9]{32}", item.get("invocation_id", ""))
+                               for item in observations)):
+                    raise ValueError()
                 if not math.isfinite(data["last_time"]):
                     raise ValueError()
                 self.data = data
@@ -409,13 +487,97 @@ class Controller:
             after = self.host.service()
             if any(service[key] != after[key] for key in ("invocation_id", "main_pid", "active", "kill_mode")):
                 raise SafeError("service_changed_during_sample")
+            self.observe(service)
         except SafeError as error:
             telemetry = {"available": False, "error": str(error), "gpus": []}
+            if str(error) == "ollama_host_oom" and not self.journal.error:
+                self.journal.data["last_service_failure"] = {"code": "ollama_host_oom", "observed_at": sampled}
+                self.journal.save()
         # Sample time marks the beginning, so slow checks cannot masquerade as fresh.
         return {"protocol": PROTOCOL, "sampled_at": sampled,
                 "managed_ollama_origin": self.origin,
                 "service": {key: value for key, value in service.items() if key != "control_group"},
-                "telemetry": telemetry, "restart_policy": self.policy()}
+                "telemetry": telemetry, "memory": self.host.memory(),
+                "last_service_failure": self.journal.data.get("last_service_failure"),
+                "capabilities": {"restart_reconciliation": True, "external_replacement": True, "system_memory": True},
+                "restart_policy": self.policy()}
+
+    def observe(self, service):
+        if not service["active"] or service["kill_mode"] != "control-group" or self.journal.error:
+            return
+        workers = {str(pid): start for pid, start in self.host.workers(service).items()}
+        boot = self.host.boot_id()
+        if self.host.service()["invocation_id"] != service["invocation_id"]:
+            raise SafeError("service_changed_during_sample")
+        observations = self.journal.data.get("observations", [])
+        same = next((item for item in observations if item["invocation_id"] == service["invocation_id"] and item["boot_id"] == boot), None)
+        combined = {**(same["workers"] if same else {}), **workers}
+        if not valid_workers(combined):
+            raise SafeError("cgroup_limit")
+        if same and combined == same["workers"]:
+            return
+        item = {"invocation_id": service["invocation_id"], "boot_id": boot, "workers": combined}
+        self.journal.data["observations"] = [entry for entry in observations if entry is not same][-3:] + [item]
+        self.journal.save()
+
+    def replacement(self, since):
+        """Read-only host verification: never invoke systemctl restart here."""
+        with self.mutex:
+            if self.journal.error:
+                raise SafeError(self.journal.error)
+            if not math.isfinite(since) or since <= 0 or since > self.now():
+                raise SafeError("invalid_incident_time")
+            service = self.host.service()
+            if self.host.process_started_at(service["main_pid"]) <= since:
+                raise SafeError("no_new_service_after_incident")
+            boot = self.host.boot_id()
+            old = [item for item in self.journal.data.get("observations", [])
+                   if item["boot_id"] == boot and item["invocation_id"] != service["invocation_id"]]
+            if not old:
+                raise SafeError("replacement_proof_unavailable")
+            proof = {"workers": {pid: start for item in old for pid, start in item["workers"].items()}, "boot_id": boot}
+            self.verify_replacement(old[-1]["invocation_id"], proof)
+            if self.host.service()["invocation_id"] != service["invocation_id"]:
+                raise SafeError("service_changed_during_sample")
+            return {"state": "completed", "service_replaced": True, "before_invocation_id": old[-1]["invocation_id"],
+                    "after_invocation_id": service["invocation_id"], "started_after": since}
+
+    def verify_replacement(self, before, proof):
+        if not valid_proof(proof):
+            raise SafeError("legacy_restart_proof_unavailable")
+        if self.host.boot_id() != proof["boot_id"]:
+            raise SafeError("host_boot_changed")
+        after = self.host.service()
+        if not after["active"] or after["invocation_id"] == before or after["kill_mode"] != "control-group":
+            raise SafeError("restart_not_verified")
+        if not self.host.old_workers_gone(proof["workers"]):
+            raise SafeError("old_ollama_workers_present")
+        self.host.workers(after)
+        self.assert_safe_gpu(self.host.telemetry(after), after=True)
+        if self.host.service()["invocation_id"] != after["invocation_id"]:
+            raise SafeError("service_changed_during_sample")
+        return after["invocation_id"]
+
+    def reconcile(self, result):
+        if result["state"] != "uncertain" or not result.get("proof"):
+            return self.public_result(result)
+        try:
+            result["after_invocation_id"] = self.verify_replacement(result["before_invocation_id"], result["proof"])
+            result.update(state="completed", restarted=True)
+            result.pop("error", None)
+        except SafeError as error:
+            result["error"] = str(error)
+        self.journal.save()
+        return self.public_result(result)
+
+    def operation(self, operation_id):
+        with self.mutex:
+            if self.journal.error:
+                raise SafeError(self.journal.error)
+            result = self.journal.data["operations"].get(operation_id)
+            if result is None:
+                raise SafeError("operation_not_found")
+            return self.reconcile(result)
 
     @staticmethod
     def assert_safe_gpu(telemetry, after=False):
@@ -427,9 +589,15 @@ class Controller:
                 raise SafeError("telemetry_incomplete")
             if any(not process["is_ollama"] for process in gpu["processes"]):
                 raise SafeError("unrelated_gpu_process")
-            if after and (gpu["processes"] or gpu.get("utilization_percent") != 0
-                          or gpu["vram_used_bytes"] > 512 * 1024 * 1024):
-                raise SafeError("gpu_not_idle_after_restart")
+            if after:
+                if gpu["processes"]:
+                    raise SafeError("gpu_processes_after_restart")
+                if gpu.get("utilization_percent") is None:
+                    raise SafeError("gpu_utilization_unknown")
+                if gpu["utilization_percent"] > 1:
+                    raise SafeError("gpu_active_after_restart")
+                if gpu["vram_used_bytes"] > 512 * 1024 * 1024:
+                    raise SafeError("gpu_vram_after_restart")
 
     def restart(self, payload):
         if not isinstance(payload, dict) or set(payload) != {"operation_id", "expected_invocation_id"}:
@@ -449,7 +617,7 @@ class Controller:
             if previous:
                 if previous["before_invocation_id"] != expected:
                     raise SafeError("operation_identity_mismatch")
-                return self.public_result(previous)
+                return self.reconcile(previous)
             if len(self.journal.data["operations"]) >= MAX_OPERATIONS:
                 raise SafeError("state_capacity")
             result = {"operation_id": operation_id, "state": "failed", "restarted": False,
@@ -473,29 +641,16 @@ class Controller:
                     raise SafeError("service_identity_mismatch")
                 if rechecked["kill_mode"] != "control-group":
                     raise SafeError("unsafe_service_kill_mode")
-                result.update(state="uncertain", error="restart_outcome_uncertain", dispatched_at=self.now())
+                result.update(state="uncertain", error="restart_outcome_uncertain", dispatched_at=self.now(),
+                              proof={"workers": {str(pid): start for pid, start in workers.items()}, "boot_id": self.host.boot_id()})
                 self.journal.data["last_time"] = self.now()
                 self.journal.data["operations"][operation_id] = result
                 self.journal.save()  # Durable intent BEFORE invoking systemctl.
                 self.host.restart()
                 result["restarted"] = True
-                for attempt in range(5):
-                    after = self.host.service()
-                    result["after_invocation_id"] = after["invocation_id"]
-                    if (after["active"] and after["invocation_id"] != expected
-                            and after["kill_mode"] == "control-group"
-                            and self.host.old_workers_gone(workers)):
-                        self.host.workers(after)  # Verify new main PID belongs to cgroup.
-                        self.assert_safe_gpu(self.host.telemetry(after), after=True)
-                        if self.host.service()["invocation_id"] != after["invocation_id"]:
-                            raise SafeError("service_changed_during_sample")
-                        result.update(state="completed")
-                        result.pop("error", None)
-                        break
-                    if attempt < 4:
-                        self.sleep(1)
-                else:
-                    raise SafeError("restart_not_verified")
+                # Polling the read-only operation endpoint supplies the bounded
+                # settling window. Transient activity never triggers a second restart.
+                return self.reconcile(result)
             except SafeError as error:
                 result["error"] = str(error)
             self.journal.data["operations"][operation_id] = result
@@ -505,7 +660,8 @@ class Controller:
 
     @staticmethod
     def public_result(result):
-        return {key: value for key, value in result.items() if key != "dispatched_at"}
+        return {**{key: value for key, value in result.items() if key not in ("dispatched_at", "proof")},
+                "recheckable": valid_proof(result.get("proof")) is True}
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -529,9 +685,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path != "/v1/status":
+        try:
+            url = urlsplit(self.path)
+            if self.path == "/v1/status":
+                return self.respond(200, self.server.controller.status())
+            if re.fullmatch(r"/v1/ollama/operations/[a-f0-9-]{36}", self.path):
+                return self.respond(200, self.server.controller.operation(self.path.rsplit("/", 1)[1]))
+            if url.path == "/v1/ollama/replacement":
+                query = parse_qs(url.query, strict_parsing=True)
+                if set(query) != {"since"} or len(query["since"]) != 1:
+                    raise ValueError()
+                return self.respond(200, self.server.controller.replacement(float(query["since"][0])))
             return self.respond(404, {"error": "not_found"})
-        self.respond(200, self.server.controller.status())
+        except (ValueError, SafeError) as error:
+            self.respond(409, {"error": str(error) if isinstance(error, SafeError) else "invalid_request"})
 
     def do_POST(self):
         if self.path != "/v1/ollama/restart":

@@ -37,6 +37,17 @@ class FakeHost:
         self.failure = None
         self.gone = True
         self.change_during_sample = False
+        self.started_at = 9999.0
+
+    def boot_id(self):
+        return "11111111-1111-4111-8111-111111111111"
+
+    def process_started_at(self, pid):
+        return self.started_at
+
+    def memory(self):
+        return {"available": True, "total_bytes": 30 * 1024 ** 3, "available_bytes": 10 * 1024 ** 3,
+                "swap_total_bytes": 4 * 1024 ** 3, "swap_used_bytes": 0}
 
     def service(self):
         self.reads += 1
@@ -85,7 +96,8 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result["state"], "completed")
         self.assertEqual(result["after_invocation_id"], NEW)
         self.assertTrue(result["restarted"])
-        self.assertEqual(self.controller.restart(payload), result)
+        replay = self.controller.restart(payload)
+        self.assertEqual(replay, result)
         self.assertEqual(self.host.calls, 1)
         self.assertNotIn("dispatched_at", result)
 
@@ -99,7 +111,9 @@ class ControllerTests(unittest.TestCase):
         self.controller.journal = self.journal
         self.clock += 4000
         self.host.failure = None
-        self.assertEqual(self.controller.restart(payload), result)
+        replay = self.controller.restart(payload)
+        self.assertEqual(replay["state"], "uncertain")
+        self.assertEqual(replay["error"], "restart_not_verified")
         self.assertEqual(self.host.calls, 1)
 
     def test_crash_after_durable_intent_is_uncertain_on_replay(self):
@@ -180,19 +194,19 @@ class ControllerTests(unittest.TestCase):
         self.host.gone = False
         result = self.controller.restart(self.payload())
         self.assertEqual(result["state"], "uncertain")
-        self.assertEqual(result["error"], "restart_not_verified")
+        self.assertEqual(result["error"], "old_ollama_workers_present")
 
     def test_vram_remains_high_no_completion_claim(self):
         self.host.sample["gpus"][0]["vram_used_bytes"] = 2 * 1024 ** 3
         result = self.controller.restart(self.payload())
         self.assertEqual(result["state"], "uncertain")
-        self.assertEqual(result["error"], "gpu_not_idle_after_restart")
+        self.assertEqual(result["error"], "gpu_vram_after_restart")
 
     def test_gpu_process_remains_no_completion_claim(self):
         self.host.sample["gpus"][0]["processes"] = [{"pid": 12, "is_ollama": True}]
         result = self.controller.restart(self.payload())
         self.assertEqual(result["state"], "uncertain")
-        self.assertEqual(result["error"], "gpu_not_idle_after_restart")
+        self.assertEqual(result["error"], "gpu_processes_after_restart")
 
     def test_journal_invalid_refuses_mutation(self):
         self.journal.close()
@@ -234,6 +248,74 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result["managed_ollama_origin"], "http://192.0.2.10:11434")
         self.assertEqual(result["protocol"], helper.PROTOCOL)
         self.assertTrue(result["telemetry"]["available"])
+
+    def test_transient_restart_activity_settles_after_helper_restart_without_second_restart(self):
+        payload = self.payload()
+        self.host.sample["gpus"][0]["utilization_percent"] = 2
+        result = self.controller.restart(payload)
+        self.assertEqual(result["state"], "uncertain")
+        self.assertTrue(result["recheckable"])
+        self.assertNotIn("proof", result)
+        self.journal.close()
+        self.journal = helper.Journal(self.path)
+        self.controller.journal = self.journal
+        self.host.sample["gpus"][0]["utilization_percent"] = 0
+        result = self.controller.operation(payload["operation_id"])
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(self.host.calls, 1)
+
+    def test_timeout_can_be_verified_later_but_boot_change_cannot(self):
+        payload = self.payload()
+        self.host.failure = "command_timeout"
+        self.controller.restart(payload)
+        self.host.invocation = NEW
+        with mock.patch.object(self.host, "boot_id", return_value="2" * 36):
+            self.assertEqual(self.controller.operation(payload["operation_id"])["error"], "host_boot_changed")
+        self.assertEqual(self.controller.operation(payload["operation_id"])["state"], "completed")
+        self.assertEqual(self.host.calls, 1)
+
+    def test_legacy_uncertain_record_has_no_automatic_proof(self):
+        payload = self.payload()
+        self.host.failure = "command_timeout"
+        self.controller.restart(payload)
+        del self.journal.data["operations"][payload["operation_id"]]["proof"]
+        self.journal.save()
+        self.host.invocation = NEW
+        result = self.controller.operation(payload["operation_id"])
+        self.assertEqual(result["state"], "uncertain")
+        self.assertFalse(result["recheckable"])
+
+    def test_adopt_external_restart_only_after_incident_with_durable_worker_proof(self):
+        self.controller.status()
+        self.journal.close()
+        self.journal = helper.Journal(self.path)
+        self.controller.journal = self.journal
+        self.clock += 10
+        self.host.invocation = NEW
+        self.host.started_at = self.clock - 1
+        result = self.controller.replacement(self.clock - 5)
+        self.assertTrue(result["service_replaced"])
+        self.assertEqual(result["before_invocation_id"], OLD)
+        self.assertEqual(self.host.calls, 0)
+        with self.assertRaisesRegex(helper.SafeError, "no_new_service_after_incident"):
+            self.controller.replacement(self.clock)
+        self.host.gone = False
+        with self.assertRaisesRegex(helper.SafeError, "old_ollama_workers_present"):
+            self.controller.replacement(self.clock - 5)
+
+    def test_empty_gpu_without_old_worker_observation_is_not_replacement_proof(self):
+        with self.assertRaisesRegex(helper.SafeError, "replacement_proof_unavailable"):
+            self.controller.replacement(self.clock - 10)
+        self.assertEqual(self.host.calls, 0)
+
+    def test_invalid_persisted_worker_proof_fails_closed(self):
+        payload = self.payload()
+        self.controller.restart(payload)
+        self.journal.data["operations"][payload["operation_id"]]["proof"]["workers"] = {}
+        self.journal.save()
+        self.journal.close()
+        self.journal = helper.Journal(self.path)
+        self.assertEqual(self.journal.error, "state_invalid")
 
 
 class ParserTests(unittest.TestCase):
@@ -389,6 +471,44 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(rules, ["ollama-intermediary-host ALL=(root) NOPASSWD: /usr/bin/systemctl restart ollama.service"])
 
 
+class MemoryTests(unittest.TestCase):
+    def test_process_start_bound_uses_kernel_identity_not_service_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "stat").write_text("cpu 1 2 3\nbtime 1000\n")
+            host = helper.SystemHost(proc_root=root)
+            with mock.patch.object(host, "process_identity", return_value="500"), mock.patch.object(os, "sysconf", return_value=100):
+                self.assertEqual(host.process_started_at(12), 1005)
+            with mock.patch.object(host, "process_identity", return_value=None):
+                with self.assertRaisesRegex(helper.SafeError, "service_start_time_unknown"):
+                    host.process_started_at(12)
+
+    def test_memavailable_swap_pressure_and_oom_counter_are_host_not_gpu_memory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "meminfo").write_text("MemTotal: 31457280 kB\nMemAvailable: 8388608 kB\nSwapTotal: 4194304 kB\nSwapFree: 0 kB\n")
+            (root / "pressure").mkdir()
+            (root / "pressure/memory").write_text("some avg10=2.50 avg60=0 total=20\nfull avg10=1.25 avg60=0 total=10\n")
+            (root / "vmstat").write_text("oom_kill 2\n")
+            host = helper.SystemHost(proc_root=root)
+            result = host.memory()
+            self.assertEqual(result["total_bytes"], 30 * 1024 ** 3)
+            self.assertEqual(result["available_bytes"], 8 * 1024 ** 3)
+            self.assertEqual(result["swap_used_bytes"], 4 * 1024 ** 3)
+            self.assertEqual(result["pressure_full_avg10"], 1.25)
+            self.assertEqual(result["oom_kill_count"], 2)
+            (root / "pressure/memory").unlink()
+            self.assertTrue(host.memory()["available"])
+            self.assertIsNone(host.memory()["pressure_full_avg10"])
+            (root / "meminfo").write_text("MemTotal: 100 kB\n")
+            self.assertFalse(host.memory()["available"])
+
+    def test_oom_result_is_distinct_from_gpu_failure(self):
+        host = helper.SystemHost(runner=lambda *args, **kwargs: "Result=oom-kill\n")
+        with self.assertRaisesRegex(helper.SafeError, "ollama_host_oom"):
+            host.service()
+
+
 class UnixHTTPTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -436,6 +556,13 @@ class UnixHTTPTests(unittest.TestCase):
 
     def test_unknown_routes_never_execute(self):
         self.assertEqual(self.request("POST", "/v1/reboot")[0], 404)
+        self.assertEqual(self.controller.host.calls, 0)
+
+    def test_read_only_operation_endpoints_never_restart(self):
+        status, body = self.request("GET", "/v1/ollama/operations/" + str(uuid.uuid4()))
+        self.assertEqual(status, 409)
+        self.assertEqual(body["error"], "operation_not_found")
+        self.assertEqual(self.request("GET", "/v1/ollama/replacement?since=not-a-time")[0], 409)
         self.assertEqual(self.controller.host.calls, 0)
 
 

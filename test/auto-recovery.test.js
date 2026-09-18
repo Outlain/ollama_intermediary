@@ -72,6 +72,93 @@ test('replacement proof plus three independent samples clears recovery, not an e
   assert.equal(f.gate.active, false);
 });
 
+test('transient post-restart activity is rechecked read-only across restart and manual pause', async (t) => {
+  const f = fixture(t); let checks = 0;
+  f.helper.restart = async (id, before) => {
+    f.calls.push(id); f.host.service.invocation_id = 'after';
+    return { operation_id: id, before_invocation_id: before, state: 'uncertain', recheckable: true,
+      error: 'gpu_active_after_restart', restarted: true };
+  };
+  f.helper.reconcile = async id => {
+    checks++;
+    assert.equal(f.gate.activeKind, 'maintenance');
+    return { operation_id: id, state: 'completed', restarted: true,
+      before_invocation_id: 'before', after_invocation_id: 'after' };
+  };
+  await f.step();
+  assert.equal(f.engine.reason, 'waiting_for_restart_settle');
+  f.maintenance.paused = true;
+  f.engine = f.make();
+  await f.step();
+  for (let i = 0; i < 3; i++) await f.step();
+  assert.equal(checks, 1);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.cleared, 1);
+  assert.equal(f.maintenance.paused, true);
+});
+
+test('settling window is bounded; manual recheck extends verification but cannot restart again', async (t) => {
+  const f = fixture(t); let reply; let checks = 0;
+  f.helper.restart = async id => {
+    f.calls.push(id);
+    reply = { operation_id: id, state: 'uncertain', recheckable: true, error: 'gpu_vram_after_restart' };
+    return reply;
+  };
+  f.helper.reconcile = async () => { checks++; return reply; };
+  await f.step();
+  await f.step();
+  await f.step(30_000);
+  assert.equal(f.engine.reason, 'restart_verification_timeout');
+  await f.step(3_600_000);
+  assert.equal(checks, 1);
+  f.engine.checkNow(); await f.engine.busy;
+  assert.equal(checks, 2);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.cleared, 0);
+});
+
+test('verified external service replacement is adopted without spending restart budget', async (t) => {
+  const f = fixture(t);
+  f.host.capabilities = { external_replacement: true };
+  f.host.service.invocation_id = 'after';
+  f.helper.replacement = async since => ({ state: 'completed', service_replaced: true,
+    started_after: since / 1000, before_invocation_id: 'before', after_invocation_id: 'after' });
+  await f.step();
+  assert.equal(f.engine.reason, 'verifying_existing_service_restart');
+  for (let i = 0; i < 3; i++) await f.step();
+  assert.equal(f.cleared, 1);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.engine.status().episode_attempts, 0);
+});
+
+test('only current captured systemd OOM evidence is reported as host OOM', (t) => {
+  const f = fixture(t);
+  f.host.last_service_failure = { code: 'ollama_host_oom', observed_at: new Date(f.now).toISOString() };
+  assert.equal(f.engine.status().host_failure, 'ollama_host_oom');
+  f.backend.recoverySince += 10_000;
+  assert.equal(f.engine.status().host_failure, null, 'old OOM evidence is not a diagnosis of a later disconnect');
+});
+
+test('failed verification cannot endlessly re-adopt the same external service epoch', async (t) => {
+  const f = fixture(t);
+  f.host.capabilities = { external_replacement: true };
+  f.host.service.invocation_id = 'after';
+  f.helper.replacement = async since => ({ state: 'completed', service_replaced: true,
+    started_after: since / 1000, before_invocation_id: 'before', after_invocation_id: 'after' });
+  await f.step();
+  await f.step(11_000);
+  assert.equal(f.engine.saved.current.phase, 'failed');
+  f.helper.restart = async id => {
+    f.calls.push(id);
+    return { operation_id: id, state: 'failed', restarted: false, error: 'unrelated_gpu_process' };
+  };
+  await f.step();
+  assert.equal(f.calls.length, 1, 'fall back to bounded restart instead of resetting external verification indefinitely');
+  f.engine = f.make();
+  await f.step();
+  assert.equal(f.engine.reason, 'restart_cooldown', 'a later failed restart must not erase the rejected external epoch');
+});
+
 test('pause blocks automatic restart; explicit manual check can recover but never resumes', async (t) => {
   const f = fixture(t);
   f.maintenance.paused = true;

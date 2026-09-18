@@ -20,6 +20,7 @@ import { FrigateCatchup } from './frigate-catchup.js';
 import { FrigateController } from './frigate-controller.js';
 import { BUILD_INFO } from './build-info.js';
 import { contextOverflow, contextRequest, rescueHardwareBlock } from './context-rescue.js';
+import { memoryBlock } from './memory-guard.js';
 
 function contentHeaders(headers, body) {
   const result = { ...headers };
@@ -281,6 +282,9 @@ export class ProxyService {
     if (this.maintenance.paused) return { allowed: false, reason: 'maintenance_paused' };
     if (!this.backend.canDispatch()) return { allowed: false, reason: this.backend.recoveryRequired ? 'recovery_required' : 'backend_unavailable' };
     if (this.gate.active || this.gate.managementPending || this.gate.maintenancePending) return { allowed: false, reason: 'backend_operation' };
+    const memoryReason = this.config.host_helper.enabled
+      ? memoryBlock(this.hostHelper.snapshot(), this.config.host_helper.memory_guard) : null;
+    if (memoryReason) return { allowed: false, reason: memoryReason };
     return { allowed: readiness.ready, reason: readiness.reason, wait_seconds: readiness.wait_seconds };
   }
 
@@ -1128,6 +1132,10 @@ export class ProxyService {
     catch { block('rescue_telemetry_unavailable'); }
     const hardwareBlock = rescueHardwareBlock(host);
     if (hardwareBlock) block(hardwareBlock);
+    // Rescue always requires system RAM evidence, even if the ordinary
+    // catch-up guard is explicitly disabled. More VRAM is not more host RAM.
+    const ramBlock = memoryBlock(host, { ...this.config.host_helper.memory_guard, enabled: true }, { rescue: true });
+    if (ramBlock) block(`rescue_${ramBlock}`);
 
     const parsed = parseJson(job.body);
     parsed.options.num_ctx = plan.context;
@@ -1157,6 +1165,20 @@ export class ProxyService {
       error.code = 'context_rescue_interrupted';
       throw error;
     }
+  }
+
+  async prepareCatchupMemory(job) {
+    if (!job.attemptRef || !this.config.host_helper.enabled || !this.config.host_helper.memory_guard.enabled) return;
+    job.phase = 'host_memory_preflight';
+    let host;
+    try { host = await this.hostHelper.refresh(); } catch { /* missing is unsafe, not zero */ }
+    const reason = memoryBlock(host, this.config.host_helper.memory_guard);
+    if (reason) {
+      const error = new Error('Catch-up deferred before Ollama dispatch; host RAM is low or unavailable.');
+      error.code = 'host_memory_blocked'; error.reason = reason;
+      throw error;
+    }
+    this.assertRescueDispatchAllowed(job);
   }
 
   async dispatchLoop() {
@@ -1229,6 +1251,7 @@ export class ProxyService {
             duration_seconds: unloadDuration,
           }));
         }
+        await this.prepareCatchupMemory(job);
         await this.prepareContextRescue(job);
         if (job.phase === 'context_rescue_preflight') this.assertRescueDispatchAllowed(job);
         job.phase = 'connecting';
@@ -1317,7 +1340,7 @@ export class ProxyService {
             reason: 'active_client_disconnect',
             duration_seconds: (Date.now() - job.dispatchedAt) / 1000,
           })];
-        } else if (['context_rescue_blocked', 'context_rescue_interrupted'].includes(error.code)) {
+        } else if (['context_rescue_blocked', 'context_rescue_interrupted', 'host_memory_blocked'].includes(error.code)) {
           // A local safety refusal is not an Ollama failure and must not open
           // the circuit breaker or trigger a host-service restart.
           const status = error.code === 'context_rescue_blocked' ? 422 : 503;

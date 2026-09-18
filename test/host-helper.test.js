@@ -90,3 +90,32 @@ test('restart request contains only immutable operation ID and expected service 
   assert.deepEqual(call, ['/v1/ollama/restart', { method: 'POST',
     body: { operation_id: 'test-id', expected_invocation_id: 'before' }, timeoutMs: 200, signal: undefined }]);
 });
+
+test('host RAM is independently validated and expires with its sample', async () => {
+  const f = fixture();
+  f.value.memory = { available: true, total_bytes: 30 * 1024 ** 3, available_bytes: 8 * 1024 ** 3,
+    swap_total_bytes: 4 * 1024 ** 3, swap_used_bytes: 4 * 1024 ** 3, pressure_full_avg10: 0, oom_kill_count: 2 };
+  f.value.capabilities = { restart_reconciliation: true, external_replacement: true };
+  let h = await f.client.refresh();
+  assert.equal(h.memory.available, true);
+  assert.equal(h.memory.oom_kill_count, 2);
+  assert.equal(h.capabilities.external_replacement, true);
+  f.value.telemetry.available = false;
+  h = await f.client.refresh();
+  assert.equal(h.memory.available, true, 'SMI failure does not erase independent RAM measurements');
+  f.advance(31_000);
+  assert.equal(f.client.snapshot().memory.available, false);
+  f.value.sampled_at = new Date(1_800_000_031_000).toISOString();
+  f.value.memory.available_bytes = f.value.memory.total_bytes + 1;
+  assert.equal((await f.client.refresh()).memory.available, false);
+});
+
+test('restart reconciliation and external proof use read-only GET requests', async () => {
+  const f = fixture(); const calls = [];
+  f.client.request = async (...args) => calls.push(args);
+  await f.client.reconcile('known-id', { timeoutMs: 50 });
+  await f.client.replacement(1_800_000_000_000, { timeoutMs: 50 });
+  assert.equal(calls[0][0], '/v1/ollama/operations/known-id');
+  assert.equal(calls[1][0], '/v1/ollama/replacement?since=1800000000');
+  assert.equal(calls.every(call => call[1].method !== 'POST'), true);
+});

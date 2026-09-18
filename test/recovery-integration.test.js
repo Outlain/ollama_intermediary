@@ -35,6 +35,7 @@ async function fixture(t) {
     enabled: true, available: true, stale: false, error: null, bound: true,
     service: { active: true, invocation_id: 'service-before', kill_mode: 'control-group' },
     restart_policy: { available: true },
+    memory: { available: true, total_bytes: 30 * 1024 ** 3, available_bytes: 10 * 1024 ** 3 },
     gpus: [{ id: '0', name: 'Mock AMD GPU', vram_total_bytes: 32 * 1024 ** 3,
       vram_used_bytes: 57 * 1024 ** 2, utilization_percent: 0, processes_known: true, processes: [] }],
   };

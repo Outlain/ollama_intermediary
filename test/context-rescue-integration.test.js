@@ -8,7 +8,8 @@ import { MockOllama, requestJson, SilentLogger, testConfig, waitFor } from './he
 
 const input = { model: 'f-model', prompt: 'PRIVATE-INPUT', images: ['PRIVATE-IMAGE'], stream: false,
   options: { num_ctx: 8192, temperature: 0.2 }, format: 'json' };
-const telemetry = () => ({ available: true, stale: false, bound: true, gpus: [{
+const telemetry = () => ({ enabled: true, available: true, stale: false, bound: true,
+  memory: { available: true, total_bytes: 30 * 1024 ** 3, available_bytes: 10 * 1024 ** 3 }, gpus: [{
   vram_free_bytes: 8 * 1024 ** 3, processes_known: true, processes: [{ is_ollama: true }], utilization_percent: 0,
 }] });
 const overflow = (tokens = 14407, context = 8192) => ({ error: JSON.stringify({ error: {
@@ -52,7 +53,9 @@ async function setup(t, rescue = {}) {
   const config = testConfig({ ollama: { url: backendUrl, health_timeout: '1s' },
     gpu_safety: { recovery_state_path: path.join(directory, 'recovery.json') },
     maintenance: { enabled: true, auth_token: 'maintenance', state_path: path.join(directory, 'maintenance.json') },
-    host_helper: { enabled: true },
+    // Isolate rescue preflight in this suite; ordinary catch-up admission has
+    // separate tests below. Rescue always checks RAM even with this disabled.
+    host_helper: { enabled: true, memory_guard: { enabled: false } },
     frigate: { enabled: true, url: 'http://frigate.test:5000', state_path: path.join(directory, 'backlog.json'),
       live_grace: '0s', retry_interval: '1h', max_retry_interval: '5h',
       context_rescue: { enabled: true, model: 'f-model', max_context: 24576, ...rescue } },
@@ -98,6 +101,27 @@ async function setup(t, rescue = {}) {
   };
   return { config, service, worker, helper, mock, state, calls, job, row, tickets, proxyUrl, report, send, retry };
 }
+
+test('catch-up RAM pressure pauses admission and pre-dispatch while live requests keep their normal path', async (t) => {
+  const f = await setup(t);
+  f.config.host_helper.memory_guard.enabled = true;
+  f.state.host.memory.available_bytes = 1024 ** 3;
+  assert.equal(f.service.backgroundReadiness().reason, 'host_memory_low');
+  assert.equal(await f.send(), 503, 'RAM can drop after the native handoff');
+  assert.equal(f.calls.length, 0, 'no inference reached Ollama');
+  assert.equal(f.job.state, 'retrying');
+  assert.equal(f.service.backend.recoveryRequired, false);
+  assert.equal(f.service.backend.canDispatch(), true);
+  f.state.mode = 'success';
+  const live = await requestJson(f.proxyUrl + '/api/generate', input);
+  assert.equal(live.status, 200);
+  await live.text();
+  await waitFor(() => !f.service.scheduler.active);
+  f.state.host.memory.available_bytes = 10 * 1024 ** 3;
+  await f.retry();
+  assert.equal(await f.send(), 200);
+  assert.equal(f.mock.maxActive, 1);
+});
 
 test('confirmed catch-up overflow gets one larger later dispatch, unchanged content, single GPU and separate saved confirmation', async (t) => {
   const f = await setup(t);
@@ -145,6 +169,9 @@ for (const [name, change, reason] of [
   ['stale GPU readings', (f) => { f.state.host.stale = true; }, 'rescue_telemetry_unavailable'],
   ['foreign GPU process', (f) => { f.state.host.gpus[0].processes = [{ is_ollama: false }]; }, 'rescue_gpu_busy'],
   ['insufficient VRAM', (f) => { f.state.host.gpus[0].vram_free_bytes = 1; }, 'rescue_vram_headroom'],
+  ['insufficient host RAM', (f) => { f.state.host.memory.available_bytes = 3 * 1024 ** 3; }, 'rescue_host_memory_low'],
+  ['unknown host RAM', (f) => { delete f.state.host.memory; }, 'rescue_host_memory_unavailable'],
+  ['host memory pressure', (f) => { f.state.host.memory.pressure_full_avg10 = 20; }, 'rescue_host_memory_pressure'],
   ['body memory limit', (f) => { f.config.server.body_limit_bytes = Buffer.byteLength(JSON.stringify({ ...input, keep_alive: '1s' })); }, 'rescue_body_limit'],
 ]) test(`rescue refuses ${name} locally without a GPU run, consumed attempt or recovery restart`, async (t) => {
   const f = await setup(t);
