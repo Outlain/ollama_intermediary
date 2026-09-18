@@ -205,3 +205,11 @@ frigate:
   max_jobs: 10000
   # Completed/skipped metadata history; pending jobs have a separate limit above.
   history_limit: 1000
+  # Opt-in, correlated catch-up only. Never infer a safe cap from VRAM size.
+  # Requires the existing Frigate bridge and host_helper.enabled monitoring.
+  context_rescue:
+    enabled: false
+    model: "" # Exact model tag independently tested on this GPU/Ollama setup.
+    max_context: 0 # Set a tested maximum before enabling; 0 is deliberately unset.
+    output_reserve: 2048
+    safety_margin: 1024

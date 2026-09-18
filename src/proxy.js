@@ -19,6 +19,7 @@ import { DASHBOARD_CSS, DASHBOARD_HTML, DASHBOARD_JS } from './dashboard.js';
 import { FrigateCatchup } from './frigate-catchup.js';
 import { FrigateController } from './frigate-controller.js';
 import { BUILD_INFO } from './build-info.js';
+import { contextOverflow, contextRequest, rescueHardwareBlock } from './context-rescue.js';
 
 function contentHeaders(headers, body) {
   const result = { ...headers };
@@ -266,9 +267,11 @@ export class ProxyService {
     // Reserve before buffering, including chunked bodies. Keep the reservation
     // through the full queued/active/draining lifetime, not only admission.
     this.reservedBodyBytes += bytes;
+    const reservation = { bytes };
+    request.bodyReservation = reservation;
     this.incomingRequests += 1;
     try { return await operation(); }
-    finally { this.reservedBodyBytes -= bytes; this.incomingRequests -= 1; this.scheduler.wake(); }
+    finally { this.reservedBodyBytes -= reservation.bytes; this.incomingRequests -= 1; this.scheduler.wake(); }
   }
 
   backgroundReadiness() {
@@ -876,7 +879,10 @@ export class ProxyService {
         if (typeof ticket !== 'string' || !/^[a-f0-9]{64}$/.test(ticket) || !this.catchup.claimInference) {
           return sendJson(response, 401, { error: 'A valid current catch-up attempt is required.', code: 'invalid_attempt_ticket' }, id);
         }
-        attemptRef = this.catchup.claimInference(ticket, attemptRequestId);
+        const context = this.config.frigate.context_rescue.enabled
+          && parsed.model === this.config.frigate.context_rescue.model
+          ? contextRequest(url.pathname, body, normalized.parsed, this.config.ollama.url) : null;
+        attemptRef = this.catchup.claimInference(ticket, attemptRequestId, context);
       } catch (error) {
         return sendJson(response, [401, 409, 503].includes(error.statusCode) ? error.statusCode : 503, {
           error: 'Catch-up attempt is unknown, expired, or unavailable.', code: 'catchup_attempt_rejected',
@@ -898,6 +904,7 @@ export class ProxyService {
       path: `${url.pathname}${url.search}`,
       method: request.method,
       body,
+      bodyReservation: request.bodyReservation,
       headers: contentHeaders(copyRequestHeaders(request.headers, this.config.ollama.url, id), body),
       streaming,
       requestType: requestType(url.pathname),
@@ -1096,6 +1103,62 @@ export class ProxyService {
     }
   }
 
+  async prepareContextRescue(job) {
+    if (!job.attemptRef) return;
+    const plan = this.catchup.contextRescuePlan?.(job.attemptRef, job.attemptRequestId);
+    if (!plan) return;
+    job.phase = 'context_rescue_preflight';
+    const block = (reason) => {
+      this.catchup.recordContextRescue(job.attemptRef, job.attemptRequestId, { blocked: reason });
+      const error = new Error('Context rescue was not dispatched; see the catch-up job for its safety check.');
+      error.code = 'context_rescue_blocked';
+      error.reason = reason;
+      throw error;
+    };
+    if (plan.blocked) block(plan.blocked);
+    // Metadata/telemetry only. The existing inference gate is held throughout
+    // this check and dispatch; neither probe loads a model or runs inference.
+    let modelLimit;
+    try { modelLimit = await this.backendClient.modelContextLength(job.model, job.signal); }
+    catch { block('rescue_model_unknown'); }
+    if (!modelLimit) block('rescue_model_unknown');
+    if (plan.context > modelLimit) block('rescue_model_limit');
+    let host;
+    try { host = await this.hostHelper.refresh(); }
+    catch { block('rescue_telemetry_unavailable'); }
+    const hardwareBlock = rescueHardwareBlock(host);
+    if (hardwareBlock) block(hardwareBlock);
+
+    const parsed = parseJson(job.body);
+    parsed.options.num_ctx = plan.context;
+    const body = Buffer.from(JSON.stringify(parsed));
+    const extra = Math.max(0, body.length - (job.bodyReservation?.bytes ?? job.body.length));
+    if (body.length > this.config.server.body_limit_bytes
+      || this.scheduler.memoryUsage().total - job.body.length + body.length > this.config.scheduler.max_queue_bytes
+      || this.reservedBodyBytes + extra > this.config.scheduler.max_queue_bytes) block('rescue_body_limit');
+    // Pause/shutdown/recovery may have arrived during either read-only probe.
+    // A skipped preflight must not consume the one enlarged attempt.
+    this.assertRescueDispatchAllowed(job);
+    this.catchup.recordContextRescue(job.attemptRef, job.attemptRequestId, { context: plan.context });
+    if (job.bodyReservation) {
+      this.reservedBodyBytes += extra;
+      job.bodyReservation.bytes += extra;
+    }
+    job.body = body;
+    job.headers = contentHeaders(job.headers, body);
+    this.observability.record('context_rescue_reserved', this.scheduler.eventFields(job, { context: plan.context }));
+  }
+
+  assertRescueDispatchAllowed(job) {
+    if (job.signal.aborted) throw job.signal.reason;
+    if (this.maintenance.paused || !this.running || !this.scheduler.accepting || this.settingsRestartPending
+      || !this.backend.canDispatch()) {
+      const error = new Error('Context rescue stopped before dispatch because inference admission changed.');
+      error.code = 'context_rescue_interrupted';
+      throw error;
+    }
+  }
+
   async dispatchLoop() {
     const signal = this.workerController.signal;
     while (!signal.aborted) {
@@ -1166,6 +1229,8 @@ export class ProxyService {
             duration_seconds: unloadDuration,
           }));
         }
+        await this.prepareContextRescue(job);
+        if (job.phase === 'context_rescue_preflight') this.assertRescueDispatchAllowed(job);
         job.phase = 'connecting';
         const { response, cleanup } = await this.backendClient.request({
           method: job.method, path: job.path, headers: job.headers, body: job.body, signal: job.signal,
@@ -1208,7 +1273,11 @@ export class ProxyService {
         }
         const failed = outcome.status >= 400 || Boolean(outcome.inferenceError || outcome.error);
         const finalStatus = failed && outcome.status < 400 ? 502 : outcome.status;
-        catchupOutcome = { certain: !outcome.completionUncertain, status: finalStatus };
+        const overflow = job.attemptRef && this.config.frigate.context_rescue.enabled
+          ? contextOverflow(outcome.status, outcome.responseBody,
+            !outcome.completionUncertain && outcome.responseStats?.response_bytes === outcome.responseBody?.length) : null;
+        catchupOutcome = { certain: !outcome.completionUncertain, status: finalStatus,
+          ...(overflow ? { contextOverflow: overflow } : {}) };
         const failureReason = outcome.completionUncertain ? 'upstream_completion_uncertain'
           : outcome.inferenceError ? 'upstream_inference_error' : 'upstream_http_error';
         this.logger[failed ? 'error' : 'info'](failed ? 'request failed' : 'request completed', {
@@ -1246,6 +1315,16 @@ export class ProxyService {
           finalEvent = ['request_cancelled', this.scheduler.eventFields(job, {
             status: 499,
             reason: 'active_client_disconnect',
+            duration_seconds: (Date.now() - job.dispatchedAt) / 1000,
+          })];
+        } else if (['context_rescue_blocked', 'context_rescue_interrupted'].includes(error.code)) {
+          // A local safety refusal is not an Ollama failure and must not open
+          // the circuit breaker or trigger a host-service restart.
+          const status = error.code === 'context_rescue_blocked' ? 422 : 503;
+          catchupOutcome = { certain: true, status };
+          job.settle({ type: 'local_error', status, code: error.code, message: error.message });
+          finalEvent = ['request_failed', this.scheduler.eventFields(job, {
+            status, reason: error.reason ?? error.code,
             duration_seconds: (Date.now() - job.dispatchedAt) / 1000,
           })];
         } else {

@@ -107,6 +107,19 @@ test('host monitoring and recovery controls are editable while socket and state 
   }
 });
 
+test('context rescue is an allowlisted opt-in setting requiring a tested model cap and monitoring', (t) => {
+  const options = fixture(t);
+  const draft = { host_helper: { enabled: true }, frigate: { enabled: true, url: 'http://frigate:5000',
+    context_rescue: { enabled: true, model: 'qwen3-vl:8b-instruct', max_context: 90000, output_reserve: 2048, safety_margin: 1024 } } };
+  const result = validateSettingsDraft({ ...options, draft });
+  assert.equal(result.valid, true);
+  assert.deepEqual(result.settings.frigate.context_rescue, draft.frigate.context_rescue);
+  assert.equal(result.effectiveConfig.auto_recovery.enabled, false, 'service restarts are not required or enabled');
+  const invalid = validateSettingsDraft({ ...options, draft: { frigate: { context_rescue: { enabled: true } } } });
+  assert.equal(invalid.valid, false);
+  assert.ok(invalid.diagnostics.some((item) => item.path.startsWith('frigate.context_rescue')));
+});
+
 test('host recovery settings cannot bypass bounded safety or credential requirements', (t) => {
   const options = fixture(t);
   for (const draft of [

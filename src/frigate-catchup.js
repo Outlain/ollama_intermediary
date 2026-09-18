@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { FrigateClient, FrigateError } from './frigate-client.js';
+import { RESCUE_REASONS, rescueTarget, validContextRequest, validRescue } from './context-rescue.js';
 
 const SCHEMA = 2;
 const ATTEMPT_PHASES = new Set(['handed_off', 'queued', 'running', 'verifying_saved', 'uncertain', 'retired']);
@@ -29,6 +30,7 @@ const JOB_REASONS = new Set([
   'authentication_failed', 'invalid_json_response', 'invalid_event_response', 'invalid_recording_list',
   'invalid_media_response', 'invalid_camera_configuration', 'generation_not_accepted', 'frigate_operation_failed',
   'generation_failed', 'generation_finished', 'generation_uncertain', 'bridge_result_timeout', 'recovery_verified', 'native_error',
+  ...RESCUE_REASONS,
 ]);
 const text = (value, limit = 120) => String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, limit);
 const seconds = (value) => Number.isFinite(Number(value)) && value !== null ? Number(value) : null;
@@ -48,10 +50,18 @@ const restoredJob = (job) => ({
   last_attempt_at: Number.isFinite(job.last_attempt_at) ? job.last_attempt_at : null,
   next_attempt_at: job.next_attempt_at, ...(Number.isFinite(job.completed_at) ? { completed_at: job.completed_at } : {}),
   ...(job.attempt ? { attempt: restoredAttempt(job.attempt) } : {}),
+  ...(job.context_rescue ? { context_rescue: restoredRescue(job.context_rescue) } : {}),
 });
+const restoredContext = (value) => ({ model: value.model, signature: value.signature,
+  context: value.context, output_tokens: value.output_tokens });
+const restoredRescue = (value) => ({ ...restoredContext(value), prompt_tokens: value.prompt_tokens,
+  reported_context: value.reported_context, failed_attempt: value.failed_attempt, attempted: value.attempted,
+  target_context: value.target_context, reason: value.reason });
 const restoredAttempt = (attempt) => ({
   ticket_hash: attempt.ticket_hash, phase: attempt.phase,
-  requests: attempt.requests.map((request) => ({ id: request.id, state: request.state, status: request.status ?? null })),
+  requests: attempt.requests.map((request) => ({ id: request.id, state: request.state, status: request.status ?? null,
+    ...(request.context_request ? { context_request: restoredContext(request.context_request) } : {}),
+    ...(request.rescue_context ? { rescue_context: request.rescue_context } : {}) })),
   native_outcome: attempt.native_outcome ?? null, native_reason: safeReason(attempt.native_reason),
   deadline: attempt.deadline, revoked: Boolean(attempt.revoked),
 });
@@ -64,6 +74,12 @@ const publicJob = (job, now, attentionAfterMs) => ({
   needs_attention: STATES.has(job.state) && Number.isFinite(job.first_failed_at)
     && now - job.first_failed_at >= attentionAfterMs,
   next_attempt_at: job.next_attempt_at ?? null, completed_at: job.completed_at ?? null,
+  ...(job.context_rescue ? { context_rescue: {
+    model: text(job.context_rescue.model, 256), original_context: job.context_rescue.context,
+    prompt_tokens: job.context_rescue.prompt_tokens, reported_context: job.context_rescue.reported_context,
+    target_context: job.context_rescue.target_context, attempted: job.context_rescue.attempted,
+    reason: job.context_rescue.reason,
+  } } : {}),
 });
 const newestFirst = (a, b) => b.event_time - a.event_time || key(a.kind, a.id).localeCompare(key(b.kind, b.id));
 
@@ -191,6 +207,7 @@ export class FrigateCatchup {
           || !Number.isFinite(job.event_time) || !Number.isFinite(job.next_attempt_at)
           || !Number.isSafeInteger(job.attempts) || job.attempts < 0 || ids.has(key(job.kind, job.id))) throw new Error('invalid_job');
         ids.add(key(job.kind, job.id));
+        if (job.context_rescue && !validRescue(job.context_rescue)) throw new Error('invalid_context_rescue');
         if (job.attempt) {
           const attempt = job.attempt;
           if (raw.schema_version !== SCHEMA || !/^[a-f0-9]{64}$/.test(attempt.ticket_hash)
@@ -201,7 +218,13 @@ export class FrigateCatchup {
             || new Set(attempt.requests.map((request) => request.id)).size !== attempt.requests.length
             || attempt.requests.some((request) => typeof request.id !== 'string' || !request.id || request.id.length > 256
               || !REQUEST_STATES.has(request.state) || (request.status !== null && request.status !== undefined
-                && (!Number.isInteger(request.status) || request.status < 100 || request.status > 599)))) throw new Error('invalid_attempt');
+                && (!Number.isInteger(request.status) || request.status < 100 || request.status > 599))
+              || (request.context_request && !validContextRequest(request.context_request))
+              || (request.rescue_context !== undefined && (!Number.isSafeInteger(request.rescue_context)
+                || request.rescue_context < 1 || request.rescue_context > 1048576)))) throw new Error('invalid_attempt');
+          if (attempt.requests.some((request) => request.rescue_context
+            && (!job.context_rescue?.attempted || request.rescue_context !== job.context_rescue.target_context
+              || request.context_request?.signature !== job.context_rescue.signature))) throw new Error('invalid_rescue_dispatch');
           if (attempt.phase === 'verifying_saved' && (attempt.native_outcome !== 'success' || outstanding(attempt))) {
             throw new Error('invalid_verification');
           }
@@ -242,7 +265,8 @@ export class FrigateCatchup {
         scans: { automatic: {}, manual: {} }, jobs: raw.jobs.map(restoredJob),
         recent: raw.recent.slice(-(this.settings.history_limit ?? HISTORY_LIMIT)).filter((job) => KINDS.includes(job.kind)
           && ['completed', 'skipped'].includes(job.state) && typeof job.id === 'string'
-          && typeof job.camera === 'string' && Number.isFinite(job.event_time)).map(restoredJob),
+          && typeof job.camera === 'string' && Number.isFinite(job.event_time)
+          && (!job.context_rescue || validRescue(job.context_rescue))).map(restoredJob),
         suppressed: (raw.suppressed ?? []).filter((entry) => entry.recheck_after > this.clock()).map((entry) => ({
           kind: entry.kind, id: entry.id, reason: entry.reason, recheck_after: entry.recheck_after,
         })),
@@ -403,6 +427,8 @@ export class FrigateCatchup {
       bridge_mode: this.capabilities.bridge === true ? 'correlated' : 'conservative',
       verifying_count: (this.state?.jobs ?? []).filter((job) => job.state === 'waiting_result' && job.attempt?.phase === 'verifying_saved').length,
       max_verifying: this.settings.max_verifying ?? 4,
+      context_rescue: { enabled: this.settings.context_rescue?.enabled === true,
+        model: this.settings.context_rescue?.model ?? '', max_context: this.settings.context_rescue?.max_context ?? 0 },
       requires_recovery: this.requiresRecovery,
       views, attention_count: views.attention, history_limit: this.settings.history_limit ?? HISTORY_LIMIT,
       total_queued: Object.values(counts).reduce((sum, value) => sum + value, 0),
@@ -451,14 +477,16 @@ export class FrigateCatchup {
     return job;
   }
 
-  claimInference(ticket, requestId) {
+  claimInference(ticket, requestId, context = null) {
     const job = this.requireAttempt(ticket);
     const attempt = job.attempt;
     if (job.state !== 'waiting_result' || attempt.native_outcome || this.requiresRecovery
       || outstanding(attempt) || this.clock() >= attempt.deadline || attempt.requests.length >= 16
       || typeof requestId !== 'string' || !requestId || requestId.length > 256
       || attempt.requests.some((request) => request.id === requestId)) throw new FrigateError('attempt_not_accepting', 409);
-    attempt.requests.push({ id: requestId, state: 'queued', status: null });
+    if (context !== null && !validContextRequest(context)) throw new FrigateError('invalid_context_request', 400);
+    attempt.requests.push({ id: requestId, state: 'queued', status: null,
+      ...(context ? { context_request: restoredContext(context) } : {}) });
     attempt.phase = 'queued';
     if (!this.persist()) throw new FrigateError('catchup_unavailable', 503);
     return attempt.ticket_hash;
@@ -475,12 +503,52 @@ export class FrigateCatchup {
     if (!this.persist()) throw new FrigateError('catchup_unavailable', 503);
   }
 
-  inferenceFinished(reference, requestId, { certain, status } = {}) {
+  contextRescuePlan(reference, requestId) {
+    const job = this.findAttempt(reference);
+    const request = job?.attempt.requests.find((entry) => entry.id === requestId);
+    if (!job || !this.running || this.storeError || job.attempt.revoked || request?.state !== 'running') return null;
+    // A provider's own serial retries inside the same native attempt do not
+    // bypass the catch-up retry/backoff boundary.
+    if (job.context_rescue?.failed_attempt === job.attempt.ticket_hash) return null;
+    return rescueTarget(job.context_rescue, request.context_request, this.settings.context_rescue);
+  }
+
+  recordContextRescue(reference, requestId, { blocked, context } = {}) {
+    const job = this.findAttempt(reference);
+    const request = job?.attempt.requests.find((entry) => entry.id === requestId);
+    const plan = this.contextRescuePlan(reference, requestId);
+    if (!job || !plan || this.storeError) throw new FrigateError('rescue_state_changed', 503);
+    if (blocked) {
+      if (!RESCUE_REASONS.has(blocked)) throw new FrigateError('invalid_rescue_reason', 400);
+      job.context_rescue.reason = blocked;
+    } else {
+      if (plan.blocked || context !== plan.context || job.context_rescue.attempted) throw new FrigateError('rescue_already_used', 409);
+      // Persist intent BEFORE sending anything: restart, lost responses, manual
+      // retries, or an OOM cannot authorize a second enlarged dispatch.
+      job.context_rescue.attempted = true;
+      job.context_rescue.target_context = context;
+      job.context_rescue.reason = 'rescue_used';
+      request.rescue_context = context;
+    }
+    if (!this.persist()) throw new FrigateError('catchup_unavailable', 503);
+  }
+
+  inferenceFinished(reference, requestId, { certain, status, contextOverflow } = {}) {
     const job = this.findAttempt(reference);
     const request = job?.attempt.requests.find((entry) => entry.id === requestId);
     if (!request || request.state === 'finished' || request.state === 'uncertain') return;
     request.state = certain === true ? 'finished' : 'uncertain';
     request.status = Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
+    if (request.rescue_context && job.context_rescue) {
+      job.context_rescue.reason = certain !== true ? 'rescue_outcome_uncertain'
+        : status >= 200 && status < 300 ? 'rescue_request_succeeded' : 'rescue_request_failed';
+    } else if (certain === true && status === 400 && contextOverflow && request.context_request
+      && this.settings.context_rescue?.enabled && request.context_request.model === this.settings.context_rescue.model
+      && !job.context_rescue?.attempted) {
+      const evidence = { ...restoredContext(request.context_request), ...contextOverflow,
+        failed_attempt: job.attempt.ticket_hash, target_context: null, attempted: false, reason: 'context_overflow' };
+      if (validRescue(evidence)) job.context_rescue = evidence;
+    }
     if (certain !== true) {
       job.attempt.phase = 'uncertain';
       job.reason = 'generation_uncertain';
@@ -521,7 +589,8 @@ export class FrigateCatchup {
     attempt.revoked = true;
     if (attempt.native_outcome === 'failed') {
       const failedRequest = attempt.requests.findLast((request) => request.status >= 400);
-      this.retry(job, failedRequest ? `http_${failedRequest.status}` : attempt.native_reason || 'generation_failed');
+      this.retry(job, failedRequest && job.context_rescue && job.context_rescue.signature === failedRequest.context_request?.signature
+        ? job.context_rescue.reason : failedRequest ? `http_${failedRequest.status}` : attempt.native_reason || 'generation_failed');
     } else {
       attempt.phase = 'verifying_saved';
       job.reason = 'generation_finished';
@@ -604,6 +673,7 @@ export class FrigateCatchup {
       kind, id, camera: history.camera, event_time: history.event_time, state: 'pending', reason: null,
       attempts: 0, failures: 0, created_at: this.clock(), next_attempt_at: this.clock(),
       first_failed_at: null, last_attempt_at: null,
+      ...(history.context_rescue ? { context_rescue: restoredRescue(history.context_rescue) } : {}),
     });
     if (!this.persist()) throw this.actionError('catchup_unavailable', 503);
     this.nextCleanupAt = 0;

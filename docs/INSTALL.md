@@ -309,6 +309,18 @@ This is the content of the Provider options field, not a replacement Frigate con
 
 In compatibility mode the intermediary can continue showing **Waiting Result** until its confirmation window expires even after generation fails. With the pinned bridge, a matched final native failure enters backoff promptly and another eligible job can proceed; successful generation waits for its saved description separately. Missing reports and uncertain transport outcomes still use conservative safety guards. The queue is retained, but retrying cannot fix an unchanged oversized request. A separate `llama-server terminated ... signal: killed` line does not by itself establish an out-of-memory cause; inspect surrounding service/kernel logs. Successful `/api/tags` and `/api/ps` probes prove API reachability, not successful model inference.
 
+### Enable conservative context rescue (optional)
+
+Updating alone leaves this feature disabled. Keep your normal Frigate `num_ctx` and existing bridge image unchanged.
+
+1. Verify **Frigate bridge connected** and working, fresh physical GPU monitoring from the existing host helper. A service-restart policy is not required for rescue; host monitoring is.
+2. Independently validate a higher maximum with this exact model/quantization and GPU/Ollama configuration. Leave rescue off if you have not done so. VRAM capacity alone is insufficient; there is no preselected safe higher value.
+3. In **Settings → Catch-up → Conservative context rescue**, enter the exact tested model tag, tested maximum context and enable the feature. Keep the initial output reserve of `2048` and safety margin of `1024` unless your workload requires more. Validate/apply at a safe idle/paused boundary.
+4. Resume inference if paused. A newly observed, typed context-overflow rejection on a correlated catch-up job supplies the input measurement. A later identical request can use its one bounded rescue after the normal retry delay. Existing generic `http_400` history is not sufficient evidence; there is no immediate replay of old payloads.
+5. Inspect the job's context-rescue details and verify the resulting description in Frigate. **Retry when idle** respects all safety checks and cannot reset an already-used rescue. Missing telemetry, activity, an unverified model limit or an insufficient cap block the enlarged dispatch with an explanation.
+
+See [the complete rescue policy](../README.md#error-only-context-rescue) for limits. It does not raise context for live traffic or Odysseus, delete images to make a request fit, or respond to GPU/OOM failures by allocating more memory. Ordinary retry/backoff and needs-attention behavior remain; one larger attempt is not an unlimited escalation loop.
+
 ## Configuration recovery
 
 If application configuration is invalid, the intermediary starts a restricted recovery listener on the same container port. In recovery mode:

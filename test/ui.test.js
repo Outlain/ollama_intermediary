@@ -310,6 +310,27 @@ test('catch-up rendering separates lifetime totals from stored view counts', asy
   assert.match(nodes.get('catchup-pending-jobs').textContent, /Recheck availability/);
 });
 
+test('context rescue UI shows opt-in status, blocked reason and one-shot outcome without promising a saved description', async () => {
+  const { context, ui, nodes } = harness('dashboard');
+  ui.renderCatchup({});
+  assert.match(nodes.get('catchup-context-rescue').textContent, /disabled/);
+  ui.renderCatchup({ context_rescue: { enabled: true, model: 'f-model', max_context: 24576 } });
+  assert.match(nodes.get('catchup-context-rescue').textContent, /24,576.*Waiting for the Frigate bridge/);
+  const row = { kind: 'review', id: 'review-1', state: 'retrying', context_rescue: {
+    reason: 'rescue_above_cap', prompt_tokens: 14407, reported_context: 8192, attempted: false,
+  } };
+  context.fetch = async () => ({ ok: true, json: async () => ({ offset: 0, total: 1, items: [row] }) });
+  await ui.refreshCatchupPage();
+  assert.match(nodes.get('catchup-pending-jobs').textContent, /exceeds the tested cap.*14,407.*8,192.*0 \/ 1/);
+  Object.assign(row.context_rescue, { reason: 'rescue_request_succeeded', attempted: true, target_context: 20480 });
+  await ui.refreshCatchupPage();
+  assert.match(nodes.get('catchup-pending-jobs').textContent, /Frigate still determines the saved result.*20,480.*1 \/ 1/);
+  const settings = harness('settings');
+  for (const field of ['enabled', 'model', 'max_context', 'output_reserve', 'safety_margin']) {
+    assert.ok(settings.inputs.some((input) => input.dataset.path === 'frigate.context_rescue.' + field));
+  }
+});
+
 test('backlog UI shows 30 jobs and pages through the remaining saved jobs', async () => {
   const { context, ui, nodes } = harness('dashboard');
   const rows = Array.from({ length: 65 }, (_, i) => ({ id: `event-${i}`, kind: 'object', camera: 'Yard', state: 'pending' }));

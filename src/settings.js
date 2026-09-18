@@ -127,6 +127,13 @@ const EDITABLE_TREE = Object.freeze({
     page_size: integer({ min: 1, max: 1000 }),
     max_jobs: integer({ min: 1, max: 100000 }),
     history_limit: integer({ min: 1, max: 5000 }),
+    context_rescue: Object.freeze({
+      enabled: boolean(),
+      model: string({ maxLength: 256 }),
+      max_context: integer({ min: 0, max: 1048576 }),
+      output_reserve: integer({ min: 256, max: 32768 }),
+      safety_margin: integer({ min: 256, max: 32768 }),
+    }),
   }),
   clients: Object.freeze({ $dynamic: CLIENT_FIELDS }),
   models: Object.freeze({ $dynamic: MODEL_POLICY_FIELDS, $modelNames: true }),

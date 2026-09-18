@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { FrigateCatchup, frigateEligibility, hasFrigateDescription } from '../src/frigate-catchup.js';
 import { FrigateError } from '../src/frigate-client.js';
+import { contextRequest } from '../src/context-rescue.js';
 
 function cameraConfig() {
   return {
@@ -1152,6 +1153,123 @@ test('final lifecycle persistence failure is surfaced and empty recovery acknowl
   context.worker.persist = () => { context.worker.storeError = 'backlog_state_write_failed'; return false; };
   assert.throws(() => context.worker.inferenceFinished(reference, 'r', { certain: true, status: 400 }),
     (error) => error.statusCode === 503);
+});
+
+const rescueSettings = { enabled: true, model: 'f-model', max_context: 24576, output_reserve: 2048, safety_margin: 1024 };
+const rescueBody = { model: 'f-model', prompt: 'SECRET-PROMPT', images: ['SECRET-IMAGE'], options: { num_ctx: 8192 } };
+const rescueRequest = contextRequest('/api/generate', Buffer.from(JSON.stringify(rescueBody)), rescueBody, 'http://ollama');
+
+async function overflowJob(t) {
+  const context = correlated(t, { context_rescue: rescueSettings }, 1);
+  await context.worker.processJobs();
+  const ticket = context.client.calls[0].ticket;
+  const reference = context.worker.claimInference(ticket, 'normal', rescueRequest);
+  context.worker.inferenceStarted(reference, 'normal');
+  assert.equal(context.worker.contextRescuePlan(reference, 'normal'), null);
+  // A final report may arrive just before HTTP drain bookkeeping.
+  context.worker.reportAttempt(ticket, { outcome: 'failed' });
+  context.worker.inferenceFinished(reference, 'normal', { certain: true, status: 400,
+    contextOverflow: { prompt_tokens: 14407, reported_context: 8192 } });
+  context.clearTimers();
+  return context;
+}
+
+async function nextRescueAttempt(context, id) {
+  const job = context.worker.state.jobs[0];
+  context.clock.now = job.next_attempt_at;
+  await context.worker.processJobs();
+  context.clearTimers();
+  const ticket = context.client.calls.at(-1).ticket;
+  const reference = context.worker.claimInference(ticket, id, rescueRequest);
+  context.worker.inferenceStarted(reference, id);
+  return { ticket, reference, job };
+}
+
+test('context overflow and one-shot rescue survive retry, restart, manual retry and skipped-record recheck', async (t) => {
+  const context = await overflowJob(t);
+  const { worker } = context;
+  assert.equal(worker.state.jobs[0].reason, 'context_overflow');
+  assert.equal(worker.state.jobs[0].failures, 1);
+  await worker.processJobs();
+  assert.equal(context.client.calls.length, 1, 'ordinary retry backoff still applies');
+  const attempt = await nextRescueAttempt(context, 'rescue');
+  assert.equal(worker.contextRescuePlan(attempt.reference, 'rescue').context, 20480);
+  worker.recordContextRescue(attempt.reference, 'rescue', { context: 20480 });
+  const durable = JSON.parse(fs.readFileSync(context.settings.state_path, 'utf8'));
+  assert.equal(durable.jobs[0].context_rescue.attempted, true, 'consumed before HTTP dispatch');
+  assert.equal(durable.jobs[0].attempt.requests[0].rescue_context, 20480);
+  assert.doesNotMatch(JSON.stringify(durable), /SECRET-PROMPT|SECRET-IMAGE/);
+  assert.doesNotMatch(JSON.stringify(worker.jobs()), /signature|ticket_hash|SECRET/);
+  await worker.stop();
+  const resumed = setup(t, { context_rescue: rescueSettings }, context);
+  assert.equal(resumed.worker.storeError, null);
+  assert.equal(resumed.worker.requiresRecovery, true, 'restart cannot assume the enlarged request finished');
+  resumed.worker.acknowledgeRecovery();
+  resumed.clearTimers();
+  resumed.worker.retryJob('object', attempt.job.id);
+  assert.equal(resumed.worker.state.jobs[0].context_rescue.attempted, true);
+  const saved = resumed.worker.state.jobs[0];
+  resumed.worker.finish(saved, 'skipped', 'media_expired_or_missing');
+  resumed.worker.recheckJob('object', saved.id);
+  resumed.clearTimers();
+  assert.equal(resumed.worker.state.jobs[0].context_rescue.attempted, true);
+});
+
+test('rescue preflight blocks do not consume the chance; used rescue never escalates on another retry', async (t) => {
+  const context = await overflowJob(t);
+  const { worker } = context;
+  let attempt = await nextRescueAttempt(context, 'blocked');
+  worker.recordContextRescue(attempt.reference, 'blocked', { blocked: 'rescue_telemetry_unavailable' });
+  worker.inferenceFinished(attempt.reference, 'blocked', { certain: true, status: 422 });
+  worker.reportAttempt(attempt.ticket, { outcome: 'failed' });
+  context.clearTimers();
+  assert.equal(attempt.job.reason, 'rescue_telemetry_unavailable');
+  assert.equal(attempt.job.context_rescue.attempted, false);
+  attempt = await nextRescueAttempt(context, 'enlarged');
+  worker.recordContextRescue(attempt.reference, 'enlarged', { context: 20480 });
+  worker.inferenceFinished(attempt.reference, 'enlarged', { certain: true, status: 400,
+    contextOverflow: { prompt_tokens: 100000, reported_context: 20480 } });
+  worker.reportAttempt(attempt.ticket, { outcome: 'failed' });
+  context.clearTimers();
+  assert.equal(attempt.job.reason, 'rescue_request_failed');
+  assert.equal(attempt.job.context_rescue.prompt_tokens, 14407, 'never overwrite the consumed evidence to authorize more growth');
+  attempt = await nextRescueAttempt(context, 'again');
+  assert.equal(worker.contextRescuePlan(attempt.reference, 'again').blocked, 'rescue_used');
+  assert.throws(() => worker.recordContextRescue(attempt.reference, 'again', { context: 24576 }));
+});
+
+test('serial provider retries within one native attempt cannot take the larger rescue before catch-up backoff', async (t) => {
+  const context = correlated(t, { context_rescue: rescueSettings }, 1);
+  await context.worker.processJobs();
+  const ticket = context.client.calls[0].ticket;
+  const reference = context.worker.claimInference(ticket, 'first', rescueRequest);
+  context.worker.inferenceStarted(reference, 'first');
+  context.worker.inferenceFinished(reference, 'first', { certain: true, status: 400,
+    contextOverflow: { prompt_tokens: 14407, reported_context: 8192 } });
+  context.clearTimers();
+  context.worker.claimInference(ticket, 'serial', rescueRequest);
+  context.worker.inferenceStarted(reference, 'serial');
+  assert.equal(context.worker.contextRescuePlan(reference, 'serial'), null);
+});
+
+test('rescue state write failure refuses enlargement and malformed persisted rescue fails closed', async (t) => {
+  const context = await overflowJob(t);
+  const attempt = await nextRescueAttempt(context, 'write-fails');
+  const before = fs.readFileSync(context.settings.state_path, 'utf8');
+  const persist = context.worker.persist.bind(context.worker);
+  context.worker.persist = () => { context.worker.storeError = 'backlog_state_write_failed'; return false; };
+  assert.throws(() => context.worker.recordContextRescue(attempt.reference, 'write-fails', { context: 20480 }),
+    (error) => error.statusCode === 503);
+  assert.equal(context.worker.contextRescuePlan(attempt.reference, 'write-fails'), null);
+  assert.equal(fs.readFileSync(context.settings.state_path, 'utf8'), before);
+  await context.worker.stop();
+  context.worker.persist = persist;
+  const state = JSON.parse(before);
+  state.jobs[0].context_rescue.attempted = true;
+  state.jobs[0].context_rescue.target_context = null;
+  fs.writeFileSync(context.settings.state_path, JSON.stringify(state));
+  const resumed = setup(t, { context_rescue: rescueSettings }, context);
+  assert.equal(resumed.worker.storeError, 'backlog_state_invalid');
 });
 
 test('invalid duplicate tickets and terminal attempts with outstanding requests fail closed on restore', async (t) => {

@@ -386,6 +386,21 @@ export class BackendClient {
     }
   }
 
+  async modelContextLength(model, signal) {
+    const body = Buffer.from(JSON.stringify({ model }));
+    const { response, cleanup } = await this.request({ method: 'POST', path: '/api/show',
+      headers: { 'content-type': 'application/json', 'content-length': String(body.length) },
+      body, signal, timeoutMs: this.config.ollama.healthTimeoutMs });
+    try {
+      const raw = await this.readResponse(response);
+      if (response.statusCode !== 200) return null;
+      const info = JSON.parse(raw.toString('utf8')).model_info;
+      const architecture = info?.['general.architecture'];
+      const value = typeof architecture === 'string' ? info[`${architecture}.context_length`] : null;
+      return Number.isSafeInteger(value) && value > 0 ? value : null;
+    } finally { cleanup(); }
+  }
+
   async unloadModel(model, { signal, timeoutMs }) {
     const body = Buffer.from(JSON.stringify({ model, keep_alive: 0 }));
     const { response, cleanup } = await this.request({

@@ -690,6 +690,11 @@
     setText('catchup-completed', formatInteger((data.totals || {}).completed || 0));
     var support = data.capabilities || {};
     setText('catchup-capabilities', 'Objects: ' + (support.object ? 'supported' : 'not verified') + ' · Reviews: ' + (support.review ? 'supported' : 'not verified'));
+    var rescue = data.context_rescue || {};
+    setText('catchup-context-rescue', rescue.enabled
+      ? 'Error-only context rescue · ' + rescue.model + ' · Tested cap: ' + formatInteger(rescue.max_context)
+        + ' tokens · One larger attempt per retained job.' + (data.bridge_mode !== 'correlated' ? ' Waiting for the Frigate bridge.' : '')
+      : 'Error-only context rescue is disabled. Normal request context is unchanged.');
     setText('catchup-bridge', data.bridge_mode === 'correlated'
       ? 'Frigate bridge connected · One native generation at a time · Awaiting save: ' + formatInteger(data.verifying_count || 0) + ' / ' + formatInteger(data.max_verifying || 4) + ' · GPU inference remains one at a time.'
       : 'Compatibility mode · The version-pinned Frigate bridge is required for faster, correlated catch-up. Without it, one unconfirmed handoff is the safe limit.');
@@ -811,6 +816,27 @@
         if (job.state === 'retrying' && job.next_attempt_at) attempts.push('Earliest retry: ' + new Date(job.next_attempt_at).toLocaleString() + ' (when idle, not a promised start)');
         if (job.phase === 'verifying_saved' && job.next_attempt_at) attempts.push('Saved-result check deadline: ' + new Date(job.next_attempt_at).toLocaleString() + ' (not active GPU work)');
         if (attempts.length) item.appendChild(create('p', 'muted', attempts.join(' · ')));
+        if (job.context_rescue) {
+          var rescue = job.context_rescue;
+          var reasons = {
+            context_overflow: 'Overflow confirmed; the next eligible retry will check rescue safety',
+            rescue_above_cap: 'Required context exceeds the tested cap',
+            rescue_model_limit: 'Required context exceeds the model limit',
+            rescue_model_unknown: 'Cannot verify the model context limit',
+            rescue_telemetry_unavailable: 'Fresh, backend-matched GPU readings are unavailable',
+            rescue_gpu_busy: 'GPU activity or another application prevents rescue',
+            rescue_vram_headroom: 'Less than 2 GiB of free VRAM; rescue is blocked',
+            rescue_used: 'The one larger attempt has been reserved/used; no further enlargement',
+            rescue_request_succeeded: 'Larger Ollama request succeeded; Frigate still determines the saved result',
+            rescue_request_failed: 'Larger request failed; no further enlargement',
+            rescue_outcome_uncertain: 'Larger request outcome is uncertain; recovery must be verified',
+            rescue_body_limit: 'Changed request would exceed the configured memory budget'
+          };
+          item.appendChild(create('p', 'muted', 'Context rescue: ' + (reasons[rescue.reason] || titleCase(rescue.reason))
+            + ' · Input: ' + formatInteger(rescue.prompt_tokens) + ' · Rejected context: ' + formatInteger(rescue.reported_context)
+            + (rescue.target_context ? ' · Rescue context: ' + formatInteger(rescue.target_context) : '')
+            + ' · Enlarged attempts: ' + (rescue.attempted ? '1 / 1' : '0 / 1')));
+        }
         var action = job.state === 'retrying' ? 'retry' : (job.state || job.status) === 'skipped' ? 'recheck' : null;
         if (action) {
           var button = create('button', 'quiet-button catchup-job-action', action === 'retry' ? 'Retry when idle' : 'Recheck availability');

@@ -119,6 +119,13 @@ const DEFAULTS = {
     page_size: 100,
     max_jobs: 10000,
     history_limit: 1000,
+    context_rescue: {
+      enabled: false,
+      model: '',
+      max_context: 0,
+      output_reserve: 2048,
+      safety_margin: 1024,
+    },
   },
   clients: {
     default: {
@@ -329,6 +336,20 @@ function validate(config) {
   }
   if (config.frigate.maxRetryIntervalMs < config.frigate.retryIntervalMs) {
     throw new Error('frigate.max_retry_interval must be at least frigate.retry_interval');
+  }
+  const rescue = config.frigate.context_rescue;
+  if (!rescue || typeof rescue.enabled !== 'boolean' || typeof rescue.model !== 'string'
+    || rescue.model.length > 256 || /[\u0000-\u0020\u007f]/.test(rescue.model)) {
+    throw new Error('frigate.context_rescue requires a boolean enabled and an exact model tag without whitespace');
+  }
+  for (const [field, min, max] of [['max_context', 0, 1048576], ['output_reserve', 256, 32768], ['safety_margin', 256, 32768]]) {
+    if (!Number.isSafeInteger(rescue[field]) || rescue[field] < min || rescue[field] > max) {
+      throw new Error(`frigate.context_rescue.${field} must be between ${min} and ${max}`);
+    }
+  }
+  if (rescue.enabled && (!config.frigate.enabled || !config.host_helper.enabled || !rescue.model
+    || rescue.max_context <= rescue.output_reserve + rescue.safety_margin)) {
+    throw new Error('frigate.context_rescue.enabled requires catch-up, host monitoring, an exact tested model tag and a tested maximum above the output reserve plus margin');
   }
   if (!Number.isInteger(config.server.body_limit_bytes) || config.server.body_limit_bytes < 1) {
     throw new Error('server.body_limit_bytes must be a positive integer');
